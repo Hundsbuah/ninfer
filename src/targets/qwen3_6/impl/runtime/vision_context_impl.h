@@ -435,8 +435,6 @@ void VisionPrefillSession::set_preencoded(std::vector<PinnedVisionResult> result
     }
     preencoded_    = std::move(results);
     overlay_stats_ = stats;
-    // The overlay window consumed the media payload for every item.
-    final_item_encoded_ = true;
 }
 
 double VisionPrefillSession::elapsed_seconds() const {

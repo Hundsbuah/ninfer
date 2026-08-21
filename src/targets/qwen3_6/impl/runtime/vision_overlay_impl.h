@@ -275,25 +275,20 @@ encode_items_overlay(DeviceContext& device, const LoadedModelData& model,
         for (std::size_t index = first_item; index < plan.control->items.size(); ++index) {
             const qwen3_6::VisionItemControl& control = plan.control->items[index];
             const qwen3_6::VisionItem& source         = prompt.vision_items.at(index);
-            const std::size_t patch_offset =
-                control.patch_begin * static_cast<std::size_t>(VisionScheduleConfig::patch_dim);
             const std::size_t patch_elements =
                 control.patch_count * static_cast<std::size_t>(VisionScheduleConfig::patch_dim);
-            if (source.patch_begin != control.patch_begin ||
-                patch_offset > prompt.patches.size() ||
-                patch_elements > prompt.patches.size() - patch_offset) {
-                throw std::invalid_argument("overlay item patch range exceeds prepared payload");
+            const auto& payload = prompt.media_payloads.at(index);
+            if (source.patch_begin != control.patch_begin || payload == nullptr ||
+                payload->patch_elements != patch_elements) {
+                throw std::invalid_argument("overlay item patch payload has an invalid shape");
             }
             Tensor output(lease_output, DType::BF16,
                           {VisionScheduleConfig::out_hidden,
                            static_cast<std::int32_t>(control.merged_count)});
 
             if (index != first_item) { stream.reset(device.stream); }
-            context.encode(
-                VisionItemView{
-                    std::span<const float>(prompt.patches).subspan(patch_offset, patch_elements),
-                    &control},
-                output, window_workspace, &stream);
+            context.encode(VisionItemView{payload->span(), &control}, output, window_workspace,
+                           &stream);
             window_workspace.reset();
 
             const std::size_t embedding_bytes = output.bytes();
