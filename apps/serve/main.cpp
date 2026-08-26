@@ -84,7 +84,31 @@ int main(int argc, char** argv) {
                  << " headroom=" << format_bytes(memory.kv_capacity_headroom_bytes)
                  << " slack=" << format_bytes(memory.planned_slack_bytes)
                  << " graphs=" << format_bytes(memory.cuda_graph_observed_bytes) << '/'
-                 << format_bytes(memory.cuda_graph_allowance_bytes);
+                 << format_bytes(memory.cuda_graph_allowance_bytes)
+        
+                 << " sequence="
+                 << format_bytes(memory.sequence.capacity_bytes) << '/'
+                 << format_bytes(memory.sequence.used_bytes) << '/'
+                 << format_bytes(memory.sequence.peak_used_bytes)
+        
+                 << " workspace="
+                 << format_bytes(memory.workspace.capacity_bytes) << '/'
+                 << format_bytes(memory.workspace.used_bytes) << '/'
+                 << format_bytes(memory.workspace.peak_used_bytes)
+        
+                 << " request-transient="
+                 << format_bytes(memory.request_transient.capacity_bytes) << '/'
+                 << format_bytes(memory.request_transient.used_bytes) << '/'
+                 << format_bytes(memory.request_transient.peak_used_bytes)
+        
+                 << " workspace-logical-peak="
+                 << format_bytes(memory.workspace_logical_peak_bytes)
+        
+                 << " kv-payload="
+                 << format_bytes(memory.kv_payload_bytes)
+        
+                 << " kv-step="
+                 << format_bytes(memory.kv_capacity_increment_bytes);
         if (options.enable_vision) {
             const ninfer::MediaCacheSummary media = service.media_cache_summary();
             capacity << " media-workers=" << media.preprocess_threads

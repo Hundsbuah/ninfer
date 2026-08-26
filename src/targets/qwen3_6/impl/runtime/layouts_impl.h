@@ -689,8 +689,12 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                     return adaptive_mtp_graph_allowance(final_visible);
                 },
                 "MTP graph allowance");
-            impl->graph_allowance_bytes = checked_mul(per_batch_allowance, impl->max_concurrency,
-                                                      "MTP exact-b graph allowance");
+            constexpr std::size_t kMtpGraphAllowancePerBatchSize = 16ULL * kMiB;
+            const std::size_t bounded_per_batch_allowance =
+                std::min<std::size_t>(per_batch_allowance, kMtpGraphAllowancePerBatchSize);
+            impl->graph_allowance_bytes = checked_mul(
+                bounded_per_batch_allowance, impl->max_concurrency,
+                "MTP optimized exact-b graph allowance");
         } else {
             const auto class_allowance = [&](std::uint32_t batch_size) {
                 const auto profiles =
