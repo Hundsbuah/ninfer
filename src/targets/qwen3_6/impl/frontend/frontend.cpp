@@ -383,7 +383,8 @@ void append_delta(PublishedOutput& output, OutputChannel channel, std::string te
     }
 }
 
-std::size_t valid_utf8_prefix_size(std::string_view bytes) {
+std::size_t valid_utf8_prefix_size(std::string_view bytes, bool& malformed) noexcept {
+    malformed = false;
     std::size_t offset = 0;
     while (offset < bytes.size()) {
         const auto lead         = static_cast<unsigned char>(bytes[offset]);
@@ -406,20 +407,32 @@ std::size_t valid_utf8_prefix_size(std::string_view bytes) {
             codepoint = lead & 0x07U;
             minimum   = 0x10000U;
         } else {
-            throw std::invalid_argument("invalid UTF-8 leading byte in generated token stream");
+            malformed = true;
+            return offset;
         }
-        if (offset + length > bytes.size()) { return offset; }
-        for (std::size_t index = 1; index < length; ++index) {
+
+        const std::size_t available = bytes.size() - offset;
+        const std::size_t present   = std::min(length, available);
+        for (std::size_t index = 1; index < present; ++index) {
             const auto byte = static_cast<unsigned char>(bytes[offset + index]);
             if ((byte & 0xc0U) != 0x80U) {
-                throw std::invalid_argument(
-                    "invalid UTF-8 continuation byte in generated token stream");
+                malformed = true;
+                return offset;
+            }
+            if (index == 1 && ((lead == 0xe0U && byte < 0xa0U) ||
+                               (lead == 0xedU && byte > 0x9fU) ||
+                               (lead == 0xf0U && byte < 0x90U) ||
+                               (lead == 0xf4U && byte > 0x8fU))) {
+                malformed = true;
+                return offset;
             }
             codepoint = (codepoint << 6U) | (byte & 0x3fU);
         }
+        if (present < length) { return offset; }
         if (codepoint < minimum || (codepoint >= 0xd800U && codepoint <= 0xdfffU) ||
             codepoint > 0x10ffffU) {
-            throw std::invalid_argument("invalid UTF-8 codepoint in generated token stream");
+            malformed = true;
+            return offset;
         }
         offset += length;
     }
@@ -565,10 +578,23 @@ void feed_token_bytes(DecoderState& state, std::string bytes, const StopPolicy& 
                       PublishedOutput& emitted, std::uint32_t committed_tokens,
                       StopMatch* best_match) {
     state.utf8_pending += bytes;
-    const std::size_t valid = valid_utf8_prefix_size(state.utf8_pending);
-    if (valid == 0) { return; }
-    const std::string text = state.utf8_pending.substr(0, valid);
-    state.utf8_pending.erase(0, valid);
+    std::string text;
+    for (;;) {
+        bool malformed          = false;
+        const std::size_t valid = valid_utf8_prefix_size(state.utf8_pending, malformed);
+        if (valid != 0) {
+            text.append(state.utf8_pending, 0, valid);
+            state.utf8_pending.erase(0, valid);
+        }
+        if (!malformed) { break; }
+
+        // Byte-level BPE may emit an irrecoverably malformed UTF-8 byte sequence.
+        // Replace the offending byte, but keep a merely incomplete suffix pending
+        // so a following token can still complete its code point.
+        text.append("\xef\xbf\xbd");
+        state.utf8_pending.erase(0, 1);
+    }
+    if (text.empty()) { return; }
     feed_decoded_text(state, text, policy, emitted, committed_tokens, best_match);
 }
 

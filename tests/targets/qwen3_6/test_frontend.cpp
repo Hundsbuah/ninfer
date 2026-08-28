@@ -131,7 +131,7 @@ FrontendResources resources(const std::string& chat_template = thinking_toggle_t
     result.tokenizer_json = nlohmann::json{
         {"model",
          {{"type", "BPE"},
-          {"vocab", {{"x", 0}, {"ä", 10}, {"¸", 11}, {"Ń", 12}}},
+          {"vocab", {{"x", 0}, {"ä", 10}, {"¸", 11}, {"Ń", 12}, {"Ģ", 13}}},
           {"merges", nlohmann::json::array()}}},
         {"added_tokens",
          tokens}}.dump();
@@ -1079,6 +1079,18 @@ int test_utf8_and_hidden_eos(const Frontend& frontend) {
     const auto complete = session.commit_preview();
     failures += check(channel_text(complete, ninfer::OutputChannel::Content) == "中",
                       "UTF-8 codepoint was not published when complete");
+
+    auto malformed_prompt  = frontend.prepare_tokens({0});
+    auto malformed_session = frontend.make_output_session(malformed_prompt, {});
+    const std::array<ninfer::TokenId, 3> malformed_tokens{13, 10, 0};
+    const auto malformed_decision = malformed_session.preview(
+        malformed_tokens, 3, ninfer::FinishReason::OutputLimit);
+    failures += check(malformed_decision.accepted_tokens == 3 &&
+                          malformed_decision.finish_reason == ninfer::FinishReason::OutputLimit,
+                      "malformed UTF-8 bytes did not remain request-local");
+    const auto malformed = malformed_session.commit_preview();
+    failures += check(channel_text(malformed, ninfer::OutputChannel::Content) == "��x",
+                      "malformed UTF-8 bytes were not replaced lossily");
 
     auto eos_prompt         = frontend.prepare_tokens({0});
     auto eos_session        = frontend.make_output_session(eos_prompt, {});
