@@ -406,9 +406,11 @@ int run_nvfp4_target() {
     failures += run_nvfp4_target_case(parent, 4, ops::LinearPolicy::AllowA8, true);
     failures += run_nvfp4_target_case(parent, 4, ops::LinearPolicy::AllowA4);
     failures += run_nvfp4_target_case(parent, 17, ops::LinearPolicy::AllowA4);
-    // 1023, 1024 and 1025 straddle this route's floor. 1024 was the narrowest width it
-    // took before; 1025 is the first ragged one it takes now, and its last M tile holds a
-    // single real token, which is the emptiest grid this route ever runs.
+    // 767 and 769 bracket the lowered TMA route floor (three whole M tiles); 769 is the lowest
+    // width this route takes with a partial last M tile.
+    failures += run_nvfp4_target_case(parent, 769, ops::LinearPolicy::AllowA4);
+    // 1023 and 1024 are the widths this route straddled before the floor moved; 1025's last M
+    // tile holds a single real token, which is the emptiest grid this route ever runs.
     failures += run_nvfp4_target_case(parent, 1023, ops::LinearPolicy::AllowA4);
     failures += run_nvfp4_target_case(parent, 1024, ops::LinearPolicy::AllowA4);
     failures += run_nvfp4_target_case(parent, 1025, ops::LinearPolicy::AllowA4);

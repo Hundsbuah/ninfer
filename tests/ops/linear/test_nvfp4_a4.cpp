@@ -11,9 +11,12 @@ using namespace ninfer::test::linear;
 
 int run_nvfp4_a4() {
     std::vector<Invocation> invocations;
+    // 767 and 769 bracket the lowered TMA route floor (three whole M tiles); 769 is the lowest
+    // width a partial last M tile is taken at on the routes with that floor.
     for (int t :
          {1,   2,   3,   4,   5,   7,   8,   16,  17,  63,  64,   65,   95,   96,   97,   127, 128,
-          129, 191, 192, 193, 383, 384, 385, 511, 512, 513, 1023, 1024, 1025, 1280, 1500, 2048}) {
+          129, 191, 192, 193, 383, 384, 385, 511, 512, 513, 767, 769, 1023, 1024, 1025, 1280, 1500,
+          2048}) {
         invocations.push_back({t, CallForm::Policy, ops::LinearPolicy::AllowA4});
     }
     for (int t : {63, 97, 193, 385, 1023, 1024})
