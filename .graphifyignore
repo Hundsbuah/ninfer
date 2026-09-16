@@ -1,0 +1,381 @@
+# =============================================================================
+# .graphifyignore
+# Generic / language-agnostic Graphify ignore rules
+# Target: Graphify >= 0.9.61
+#
+# Principles:
+#   - Keep source code, tests, docs, schemas, CI/CD and infrastructure configs.
+#   - Ignore dependencies, generated build output, caches and transient files.
+#   - Avoid indexing secrets and machine-local state.
+#   - Do NOT ignore docs/media globally: Graphify can extract them intentionally.
+# =============================================================================
+
+
+# -----------------------------------------------------------------------------
+# Version-control internals
+# -----------------------------------------------------------------------------
+
+.git/
+.hg/
+.svn/
+
+
+# -----------------------------------------------------------------------------
+# Dependency / package-manager directories
+# -----------------------------------------------------------------------------
+
+# JavaScript / TypeScript
+node_modules/
+bower_components/
+
+# PHP / Go / vendored dependencies
+vendor/
+
+# Python virtual environments / local packages
+.venv/
+venv/
+env/
+ENV/
+__pypackages__/
+.python-version
+
+# Ruby
+.bundle/
+
+# Java / Gradle
+.gradle/
+
+# Swift
+.build/
+
+# Dart / Flutter
+.dart_tool/
+.pub-cache/
+
+# Terraform / Terragrunt
+.terraform/
+.terragrunt-cache/
+
+
+# -----------------------------------------------------------------------------
+# Build / compiler / bundler output
+# -----------------------------------------------------------------------------
+
+dist/
+build/
+out/
+target/
+bin/
+obj/
+
+# JS / TS frameworks and bundlers
+.next/
+.nuxt/
+.output/
+.svelte-kit/
+.astro/
+.vite/
+.parcel-cache/
+.turbo/
+.vercel/
+
+# Serverless / cloud build output
+.serverless/
+.aws-sam/
+cdk.out/
+
+# C / C++ / CMake
+CMakeFiles/
+cmake-build-*/
+CMakeCache.txt
+compile_commands.json
+_deps/
+
+# Swift / Xcode
+DerivedData/
+
+# Python packaging
+*.egg-info/
+.eggs/
+
+# Storybook
+storybook-static/
+
+
+# -----------------------------------------------------------------------------
+# Compiled / binary artifacts
+# -----------------------------------------------------------------------------
+
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dylib
+*.dll
+*.exe
+*.class
+*.jar
+*.war
+*.ear
+*.pyc
+*.pyo
+*.pyd
+
+# Debug symbols / native artifacts
+*.pdb
+*.dSYM/
+
+
+# -----------------------------------------------------------------------------
+# Bundled / minified / generated frontend artifacts
+# -----------------------------------------------------------------------------
+
+*.min.js
+*.min.css
+*.map
+
+# TypeScript incremental compiler cache
+*.tsbuildinfo
+
+
+# -----------------------------------------------------------------------------
+# Coverage / test output
+# -----------------------------------------------------------------------------
+
+coverage/
+htmlcov/
+lcov-report/
+.nyc_output/
+
+.pytest_cache/
+.hypothesis/
+
+playwright-report/
+test-results/
+
+allure-results/
+allure-report/
+
+# Generated snapshots are usually implementation/test output rather than
+# architecture. Remove these rules if snapshots are meaningful to your graph.
+__snapshots__/
+snapshots/
+
+# Visual-regression output
+visual-tests/
+visual-test/
+
+
+# -----------------------------------------------------------------------------
+# Language / tool caches
+# -----------------------------------------------------------------------------
+
+# Python
+__pycache__/
+.mypy_cache/
+.pyright/
+.ruff_cache/
+.tox/
+.nox/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Generic caches
+.cache/
+.cache-loader/
+.eslintcache
+.stylelintcache
+
+# Build-system caches
+.ccache/
+
+
+# -----------------------------------------------------------------------------
+# Package-manager lock files
+#
+# Manifests such as package.json, pyproject.toml, Cargo.toml, go.mod,
+# pom.xml, etc. remain indexed.
+#
+# Lock files are normally generated and often extremely large.
+# Especially pnpm-lock.yaml would otherwise be treated as YAML/document
+# content and can add substantial noise/cost.
+# -----------------------------------------------------------------------------
+
+package-lock.json
+npm-shrinkwrap.json
+pnpm-lock.yaml
+yarn.lock
+bun.lock
+bun.lockb
+
+Pipfile.lock
+poetry.lock
+uv.lock
+
+composer.lock
+Gemfile.lock
+
+Cargo.lock
+go.sum
+
+pubspec.lock
+Podfile.lock
+Package.resolved
+
+
+# -----------------------------------------------------------------------------
+# Logs / traces / profiling / runtime state
+# -----------------------------------------------------------------------------
+
+*.log
+*.trace
+*.prof
+*.pid
+*.pid.lock
+
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+.coverage
+coverage.xml
+ninfer.requests.jsonl
+
+# -----------------------------------------------------------------------------
+# Temporary / backup files
+# -----------------------------------------------------------------------------
+
+*.tmp
+*.temp
+*.swp
+*.swo
+*.bak
+*.backup
+*.orig
+*.rej
+
+*~
+.#*
+
+
+# -----------------------------------------------------------------------------
+# OS metadata
+# -----------------------------------------------------------------------------
+
+.DS_Store
+.AppleDouble
+.LSOverride
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+Desktop.ini
+
+
+# -----------------------------------------------------------------------------
+# IDE / editor machine-local state
+#
+# .vscode/ is intentionally NOT globally ignored:
+# launch.json / tasks.json / settings.json may contain useful architecture,
+# build and runtime information.
+# -----------------------------------------------------------------------------
+
+.idea/
+.vs/
+
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+
+# -----------------------------------------------------------------------------
+# Environment files / secrets
+#
+# Defense in depth. Graphify itself also has sensitive-file filtering,
+# but secrets should never depend on heuristics alone.
+# -----------------------------------------------------------------------------
+
+.env
+.env.*
+
+# Safe templates can remain useful for understanding required configuration.
+!.env.example
+!.env.sample
+!.env.template
+!.env.defaults
+
+# Private keys / certificates containing private material
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+
+id_rsa
+id_rsa.*
+id_ed25519
+id_ed25519.*
+
+# Credential stores / package registry credentials
+.npmrc
+.pypirc
+.netrc
+.git-credentials
+
+credentials.json
+service-account.json
+service_account.json
+service-account-*.json
+service_account_*.json
+
+# Common application-secret configuration
+secrets.json
+secrets.yaml
+secrets.yml
+
+
+# -----------------------------------------------------------------------------
+# Database files / dumps / backups
+#
+# .sql is intentionally NOT ignored because schemas and migrations can be
+# valuable graph inputs.
+# -----------------------------------------------------------------------------
+
+*.sqlite
+*.sqlite3
+*.db
+
+*.dump
+*.dmp
+*.sql.gz
+*.sql.bz2
+*.sql.xz
+
+
+# -----------------------------------------------------------------------------
+# Generated documentation / site output
+#
+# Source documentation itself is intentionally kept.
+# -----------------------------------------------------------------------------
+
+site/.cache/
+docs/.vitepress/cache/
+docs/.vitepress/dist/
+docs/.docusaurus/
+.docusaurus/
+
+
+# -----------------------------------------------------------------------------
+# Graphify
+#
+# IMPORTANT:
+# Do NOT add "graphify-out/" here by default.
+#
+# Current Graphify uses graphify-out/converted/ for converted Office /
+# Google Workspace sidecars. Graphify >= 0.9.60 contains special handling
+# for its own converted output.
+# -----------------------------------------------------------------------------

@@ -46,6 +46,8 @@ out/
 *.tmp
 /core
 /core.*
+graphify-out/
+ninfer.requests.jsonl
 
 # Measurement raw corpora & intermediates (large; produced by offline tooling).
 # The small final frequency stats under fixtures/ranking/ ARE tracked; the rest is ignored.
