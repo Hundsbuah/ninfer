@@ -2,6 +2,7 @@
 #include "models/qwen3_5/program/context_work.h"
 #include "models/qwen3_5/program/context.h"
 #include "models/qwen3_5/execution/linear.h"
+#include "models/qwen3_5/execution/vision_overlay.h"
 #include "core/device.h"
 #include "ninfer/ops/gdn_replay.h"
 #include "ninfer/ops/sampling.h"
@@ -1209,8 +1210,18 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                    sequence.dflash_context_frontier != prompt_tokens) {
             throw std::logic_error("staged DFlash prefill did not reach the prompt frontier");
         }
-        sequence.tail_hidden_valid      = true;
-        request.timings.vision_seconds  = vision_seconds;
+        sequence.tail_hidden_valid     = true;
+        request.timings.vision_seconds = vision_seconds;
+        if (staged.vision) {
+            const auto& overlay = staged.vision->overlay_stats();
+            if (overlay.has_value()) {
+                request.timings.vision_offload_window_seconds  = overlay->window_seconds;
+                request.timings.vision_offload_evict_seconds   = overlay->evict_seconds;
+                request.timings.vision_offload_restore_seconds = overlay->restore_seconds;
+                request.timings.vision_offload_evicted_bytes   = overlay->evicted_bytes;
+                request.timings.vision_offload_staged_bytes    = overlay->staged_bytes;
+            }
+        }
         request.timings.prefill_seconds = std::max(0.0, staged.elapsed_seconds - vision_seconds);
         staged.prompt.release_all_media_payloads();
         if (staged.vision) { staged.vision->retire_handoff(); }
