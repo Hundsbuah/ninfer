@@ -1551,9 +1551,19 @@ void ProgramImpl::ensure_sequence_kv_lease(SequenceState& sequence, std::uint32_
                            : 0U,
         };
     };
+    bool space_limited = false;
     const auto grow = [&](DeviceKVPages wanted) {
         if ((main_thin && wanted.main <= text_pages) ||
             (backend_thin && wanted.backend <= backend_pages)) {
+            return false;
+        }
+        // A saturated pool re-enters this ladder every round until the engine resumes the lease;
+        // a rung that cannot fit is found by arithmetic, not by an exception per rung, and never
+        // leaves one pool grown while the other failed.
+        if (!text_kv_addresses->can_resize_entitlement(sequence.kv->text, wanted.main) ||
+            (sequence.kv->backend &&
+             !backend_kv_addresses->can_resize_entitlement(*sequence.kv->backend, wanted.backend))) {
+            space_limited = true;
             return false;
         }
         resize_sequence_kv_entitlement(sequence, wanted.main, wanted.backend);
@@ -1564,7 +1574,6 @@ void ProgramImpl::ensure_sequence_kv_lease(SequenceState& sequence, std::uint32_
         return true;
     };
     const std::uint32_t page = static_cast<std::uint32_t>(kPagedKVPageSize);
-    bool space_limited       = false;
     for (const std::uint32_t extra_tokens :
          {kv_lease_growth_margin_tokens(), 2U * page, page}) {
         try {
