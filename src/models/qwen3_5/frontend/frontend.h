@@ -31,6 +31,10 @@ struct FrontendOptions {
     std::uint32_t vision_max_merged_tokens = 32768;
     bool ngram_sources_enabled             = false;
     bool ngram_archive_enabled             = false;
+    // Per-continuation long-anchor capacity L. When nonzero, preparation synthesizes
+    // engine-automatic PrivateLongAnchor opportunities at the last L message boundaries so a
+    // later history rewrite diverging there resumes from the retained anchor instead of root.
+    std::uint32_t max_long_anchors_per_continuation = 0;
 };
 
 struct FrontendResources;
