@@ -17,6 +17,7 @@
 #include <iostream>
 #include <limits>
 #include <optional>
+#include <random>
 #include "core/decode_graph.h"
 #include "core/device.h"
 #include <span>
@@ -133,6 +134,10 @@ struct AttentionCase {
     float value_scale       = 1.0f;
     bool fast_prompt_kernel = false;
     bool small_prefill      = false;
+    // Nonzero: the FP64 oracle evaluates this many deterministic query rows (both ends, tile
+    // edges and seeded interior rows) and only they are compared. Production-width prompt cases
+    // over long histories are otherwise too costly for a naive oracle.
+    std::uint32_t oracle_rows = 0;
 };
 
 enum class MappingPattern { Identity, Offset, Fragmented };
@@ -861,10 +866,50 @@ double cache_value(const HostCache& cache, bool key, int head, int position, int
            double(decode_e4m3fn(scales[row * kNvfp4QuantGroups + d / kNvfp4QuantGroup]));
 }
 
+// Query rows a sampled oracle evaluates: both ends, the rows either side of every 64-row tile
+// edge at a stride that leaves half the budget, and seeded interior rows for the rest.
+std::vector<std::int32_t> oracle_query_rows(std::int32_t tokens, std::uint32_t count,
+                                            std::uint32_t seed) {
+    std::vector<std::int32_t> rows{0, 1, tokens - 2, tokens - 1};
+    const std::int32_t edges       = tokens / 64;
+    const std::int32_t edge_budget = std::max<std::int32_t>(1, static_cast<std::int32_t>(count / 4));
+    const std::int32_t stride      = std::max<std::int32_t>(1, edges / edge_budget);
+    for (std::int32_t edge = 1; edge <= edges; edge += stride) {
+        rows.push_back(edge * 64 - 1);
+        if (edge * 64 < tokens) { rows.push_back(edge * 64); }
+    }
+    std::mt19937 random(seed);
+    while (rows.size() < count) {
+        rows.push_back(static_cast<std::int32_t>(random() % static_cast<std::uint32_t>(tokens)));
+    }
+    std::sort(rows.begin(), rows.end());
+    rows.erase(std::unique(rows.begin(), rows.end()), rows.end());
+    rows.erase(std::remove_if(rows.begin(), rows.end(),
+                              [&](std::int32_t row) { return row < 0 || row >= tokens; }),
+               rows.end());
+    return rows;
+}
+
+// Every head and channel of the selected query rows, in row order.
+std::vector<double> select_query_rows(const std::vector<double>& values, const Geometry& geometry,
+                                      std::span<const std::int32_t> rows) {
+    std::vector<double> selected;
+    selected.reserve(rows.size() * static_cast<std::size_t>(geometry.q_heads) * kHeadDim);
+    for (const std::int32_t row : rows)
+        for (std::int32_t head = 0; head < geometry.q_heads; ++head)
+            for (std::int32_t d = 0; d < kHeadDim; ++d)
+                selected.push_back(values[q_index(geometry, head, d, row)]);
+    return selected;
+}
+
+// With `rows`, only those query tokens are evaluated; the others are left zero.
 std::vector<double> ideal_attention(const std::vector<float>& q, const HostCache& cache,
-                                    const std::vector<std::int32_t>& positions) {
+                                    const std::vector<std::int32_t>& positions,
+                                    std::span<const std::int32_t> rows = {}) {
     const Geometry& geometry = cache.geometry;
     const int tokens = positions.size(), visible = positions.back() + 1;
+    const int evaluated = rows.empty() ? tokens : static_cast<int>(rows.size());
+    const auto token_of = [&](int query) { return rows.empty() ? query : rows[query]; };
     const bool rotate_q = cache.storage != KvCacheStorage::BFloat16;
     const bool rotate_v = cache.storage == KvCacheStorage::Nvfp4Group16 ||
                           cache.storage == KvCacheStorage::Fp8KeyNvfp4Value;
@@ -892,13 +937,15 @@ std::vector<double> ideal_attention(const std::vector<float>& q, const HostCache
                 values[index(d, head, pos)] = cache_value(cache, false, head, pos, d);
             }
     naive_dense_softmax_attention(
-        op_geometry(geometry), tokens, visible, double(kAttentionScale),
-        [&](int d, int head, int token) { return query[q_index(geometry, head, d, token)]; },
+        op_geometry(geometry), evaluated, visible, double(kAttentionScale),
+        [&](int d, int head, int query_row) {
+            return query[q_index(geometry, head, d, token_of(query_row))];
+        },
         [&](int d, int head, int pos) { return keys[index(d, head, pos)]; },
         [&](int d, int head, int pos) { return values[index(d, head, pos)]; },
-        [&](int token, int pos) { return pos <= positions[token]; },
-        [&](int d, int head, int token, double value) {
-            output[q_index(geometry, head, d, token)] = value;
+        [&](int query_row, int pos) { return pos <= positions[token_of(query_row)]; },
+        [&](int d, int head, int query_row, double value) {
+            output[q_index(geometry, head, d, token_of(query_row))] = value;
         });
     if (rotate_v)
         for (int token = 0; token < tokens; ++token)
@@ -1692,6 +1739,23 @@ std::vector<double> unit_value_scale(std::vector<double> values, const Attention
     return values;
 }
 
+// The whole output against the oracle, or only the oracle's evaluated rows when it sampled them.
+int verify_sampled_attention(const std::string& label, const std::vector<double>& output,
+                             const std::vector<double>& reference, const Geometry& geometry,
+                             std::span<const std::int32_t> rows, const AttentionCase& test_case,
+                             KvCacheStorage storage) {
+    if (rows.empty()) {
+        return verify_attention(label, unit_value_scale(output, test_case),
+                                unit_value_scale(reference, test_case),
+                                attention_criterion(storage));
+    }
+    return verify_attention(
+        label + " (" + std::to_string(rows.size()) + " oracle rows)",
+        unit_value_scale(select_query_rows(output, geometry, rows), test_case),
+        unit_value_scale(select_query_rows(reference, geometry, rows), test_case),
+        attention_criterion(storage));
+}
+
 std::string case_label(const char* entry, const Geometry& geometry, KvCacheStorage storage,
                        const AttentionCase& test_case, MappingPattern mapping) {
     return std::string(entry) + " " + geometry.name + " " + cache_name(storage) +
@@ -1775,7 +1839,11 @@ int run_a1_case(const Geometry& geometry, KvCacheStorage storage, const Attentio
         make_cache(geometry, storage, max_context, test_case.seed + 10u, test_case.value_scale);
     HostCache expected      = initial;
     append_cache(expected, k, v, positions);
-    const std::vector<double> reference = ideal_attention(q, expected, positions);
+    const std::vector<std::int32_t> rows =
+        test_case.oracle_rows == 0
+            ? std::vector<std::int32_t>{}
+            : oracle_query_rows(test_case.tokens, test_case.oracle_rows, test_case.seed + 20u);
+    const std::vector<double> reference = ideal_attention(q, expected, positions, rows);
     DeviceCache cache(initial, mapping);
 
     const std::vector<std::uint16_t> q_bits = to_bf16_bits(q);
@@ -1819,9 +1887,8 @@ int run_a1_case(const Geometry& geometry, KvCacheStorage storage, const Attentio
         case_label("causal_softmax_attention", geometry, storage, test_case, mapping);
     const std::vector<std::uint16_t> output_bits =
         copy_from_guarded<std::uint16_t>(dout, q_bits.size());
-    int failures =
-        verify_attention(label, unit_value_scale(bf16_bits_to_double(output_bits), test_case),
-                         unit_value_scale(reference, test_case), attention_criterion(storage));
+    int failures = verify_sampled_attention(label, bf16_bits_to_double(output_bits), reference,
+                                            geometry, rows, test_case, storage);
     failures += verify_cache(label, cache.snapshot(), expected,
                              storage == KvCacheStorage::BFloat16 ||
                                  storage == KvCacheStorage::Nvfp4Group16 ||
@@ -1869,7 +1936,11 @@ int run_a3_case(const Geometry& geometry, KvCacheStorage storage, const Attentio
 
     const HostCache cache_host =
         make_cache(geometry, storage, max_context, test_case.seed + 10u, test_case.value_scale);
-    const std::vector<double> reference = ideal_attention(q, cache_host, positions);
+    const std::vector<std::int32_t> rows =
+        test_case.oracle_rows == 0
+            ? std::vector<std::int32_t>{}
+            : oracle_query_rows(test_case.tokens, test_case.oracle_rows, test_case.seed + 20u);
+    const std::vector<double> reference = ideal_attention(q, cache_host, positions, rows);
     DeviceCache cache(cache_host, mapping);
 
     const std::vector<std::uint16_t> q_bits = to_bf16_bits(q);
@@ -1900,9 +1971,8 @@ int run_a3_case(const Geometry& geometry, KvCacheStorage storage, const Attentio
         case_label("causal_softmax_attention_cached", geometry, storage, test_case, mapping);
     const std::vector<std::uint16_t> output_bits =
         copy_from_guarded<std::uint16_t>(dout, q_bits.size());
-    int failures =
-        verify_attention(label, unit_value_scale(bf16_bits_to_double(output_bits), test_case),
-                         unit_value_scale(reference, test_case), attention_criterion(storage));
+    int failures = verify_sampled_attention(label, bf16_bits_to_double(output_bits), reference,
+                                            geometry, rows, test_case, storage);
     failures += verify_cache(label + " cache unchanged", cache.snapshot(), cache_host, true);
     failures += verify_input(label + " q unchanged", dq, q_bits);
     failures += verify_positions(label + " positions unchanged", dp, positions);
@@ -2502,6 +2572,19 @@ int run_int8_prompt_cases(bool fast) {
                             MappingPattern::Identity);
     failures += run_a1_case(h24, storage, with({600, 300, 900, 910u, false, true}),
                             MappingPattern::Identity);
+    // The production prefill chunk: 3584 columns, whole prompt-attention waves under the fast
+    // kernel, as a first chunk, after a long history, and at the V-scale overflow limit.
+    const auto wide = [&](std::int32_t base, std::uint32_t seed, std::uint32_t rows,
+                          float value_scale = 1.0f) {
+        AttentionCase test_case{3584, base, static_cast<std::uint32_t>(base + 3584), seed};
+        test_case.value_scale = value_scale;
+        test_case.oracle_rows = rows;
+        return with(test_case);
+    };
+    failures += run_a1_case(h24, storage, wide(0, 912u, 64), MappingPattern::Fragmented);
+    failures += run_a1_case(h24, storage, wide(8192, 913u, 64), MappingPattern::Fragmented);
+    failures += run_a1_case(h24, storage, wide(1000, 914u, 48, 2048.0f), MappingPattern::Identity);
+    failures += run_a3_case(h16, storage, wide(2000, 915u, 48), MappingPattern::Offset);
     return failures;
 }
 

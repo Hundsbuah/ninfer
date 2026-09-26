@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -40,7 +41,47 @@ int compare_bytes(const std::string& label, const T* reference, const T* fused, 
     return 1;
 }
 
-int run_case(const Weight& weight, int tokens, bool measure) {
+// The complete fused formula in FP64: the offset RMSNorm of the residual, then the naive dot
+// product with each sampled output row's decoded NVFP4 weight. The A4 activation quantization
+// the route applies is inside the A4 criterion, as for the unfused Op.
+std::vector<double> fused_oracle(const quantized_weight::PackedWeight& weight,
+                                 std::int32_t weight_row_offset, std::int32_t output_rows,
+                                 const std::vector<double>& normalized, int tokens) {
+    std::vector<double> expected;
+    for (const std::int32_t local_row : sampled_rows(output_rows, kA4SampleRows)) {
+        std::vector<double> decoded(kHidden);
+        for (int column = 0; column < kHidden; ++column) {
+            decoded[column] =
+                quantized_weight::logical_weight_fp64(weight, weight_row_offset + local_row, column);
+        }
+        for (int token = 0; token < tokens; ++token) {
+            const double* input = normalized.data() + static_cast<std::size_t>(token) * kHidden;
+            double sum          = 0.0;
+            for (int column = 0; column < kHidden; ++column) { sum += decoded[column] * input[column]; }
+            expected.push_back(sum);
+        }
+    }
+    return expected;
+}
+
+std::vector<double> offset_rmsnorm_fp64(const std::vector<float>& residual,
+                                        const std::vector<float>& gain, int tokens) {
+    std::vector<double> normalized(residual.size());
+    for (int token = 0; token < tokens; ++token) {
+        const float* x = residual.data() + static_cast<std::size_t>(token) * kHidden;
+        double squares = 0.0;
+        for (int d = 0; d < kHidden; ++d) { squares += double(x[d]) * double(x[d]); }
+        const double inverse = 1.0 / std::sqrt(squares / kHidden + double(kEps));
+        for (int d = 0; d < kHidden; ++d) {
+            normalized[static_cast<std::size_t>(token) * kHidden + d] =
+                double(x[d]) * inverse * (double(gain[d]) + 1.0);
+        }
+    }
+    return normalized;
+}
+
+int run_case(const Weight& weight, const quantized_weight::PackedWeight& host, int tokens,
+             bool measure) {
     const auto values            = make_bf16_activation(kHidden, tokens, 871U + tokens);
     auto gains                   = make_bf16_activation(kHidden, 1, 119U);
     const auto value_bits        = bf16_bits(values);
@@ -107,6 +148,24 @@ int run_case(const Weight& weight, int tokens, bool measure) {
                               static_cast<const std::uint8_t*>(fused_k.p), reference_k.bytes);
     failures += compare_bytes("v" + suffix, static_cast<const std::uint8_t*>(reference_v.p),
                               static_cast<const std::uint8_t*>(fused_v.p), reference_v.bytes);
+    {
+        // The primary verdict: the fused route against the FP64 formula. Byte parity with the
+        // unfused chain above is supplementary.
+        const std::vector<double> normalized = offset_rmsnorm_fp64(values, gains, tokens);
+        const auto verify = [&](const char* name, const DeviceBuffer& output, std::int32_t rows,
+                                std::int32_t weight_row_offset) {
+            const std::vector<double> actual = gather_rows(
+                from_device_bf16(output, static_cast<std::size_t>(rows) * tokens), rows, 0, rows,
+                tokens, kA4SampleRows);
+            return compare(std::string("fused ") + name + " FP64 oracle" + suffix, actual,
+                           fused_oracle(host, weight_row_offset, rows, normalized, tokens),
+                           kAttnInputProjA4Tolerance);
+        };
+        failures += verify("q", fused_q, kQRows, 0);
+        failures += verify("k", fused_k, kKvRows, kQRows);
+        failures += verify("gate", fused_gate, kQRows, kQRows + kKvRows);
+        failures += verify("v", fused_v, kKvRows, 2 * kQRows + kKvRows);
+    }
     if (tokens == 1500 && failures == 0) {
         DeviceContext device;
         DecodeGraphDefinition definition;
@@ -184,8 +243,9 @@ int main() {
         }
         int failures       = 0;
         const bool measure = std::getenv("NINFER_MEASURE_FUSED_STAGE") != nullptr;
-        for (const int tokens : {1024, 1500, 2048, 4096}) {
-            failures += run_case(weight, tokens, measure);
+        // 3584 is the production prefill chunk under the fast prefill kernel's wave re-basing.
+        for (const int tokens : {1024, 1500, 2048, 3584, 4096}) {
+            failures += run_case(weight, parent.host, tokens, measure);
         }
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {
