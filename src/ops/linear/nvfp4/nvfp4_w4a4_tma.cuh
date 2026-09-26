@@ -252,9 +252,9 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_w4a4
             acquire_staged_tensor_map(&descriptors.b_codes);
             acquire_staged_tensor_map(&descriptors.a_scales);
             acquire_staged_tensor_map(&descriptors.b_scales);
-            // The activation codes/scales are produced by the quantize kernel (generic proxy);
-            // make those global writes visible to the TMA (async) proxy that reads them.
-            asm volatile("fence.proxy.async.global;" : : : "memory");
+            // No generic-to-async proxy fence is needed for the activation codes/scales: the
+            // quantize kernel that writes them completes before this plain (non-PDL) launch
+            // starts, and a kernel boundary orders memory for every proxy.
 #endif
 #pragma unroll 1
             for (int k_tile = 0; k_tile < kKTiles; ++k_tile) {

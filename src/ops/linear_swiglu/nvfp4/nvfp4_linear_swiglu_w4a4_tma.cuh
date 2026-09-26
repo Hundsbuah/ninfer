@@ -102,6 +102,8 @@ __global__ __launch_bounds__(
             acquire_staged_tensor_map(&descriptors.b_codes);
             acquire_staged_tensor_map(&descriptors.a_scales);
             acquire_staged_tensor_map(&descriptors.b_scales);
+            // As in the Linear TMA kernel, the quantized activations need no proxy fence: their
+            // producer completes before this plain (non-PDL) launch starts.
 #endif
 #pragma unroll 1
             for (int k_tile = 0; k_tile < kKTiles; ++k_tile) {
