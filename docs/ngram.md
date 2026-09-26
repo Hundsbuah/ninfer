@@ -125,6 +125,9 @@ For a local single-owner server, opt in to a RAM-only archive:
 --ngram-archive-mib 512 --ngram-session-mib 128
 ```
 
+`--ngram-session-mib` (default 128) caps one conversation's share of the archive; without
+`--ngram-archive-mib` there is no archive and it has no effect.
+
 Requests identify a conversation with `X-NInfer-Draft-Session`. Without an identity,
 drafting remains request-local. Add `--ngram-native-sessions` to recognize Kilo's
 `x-session-affinity`, Codex's `client_metadata.thread_id`, and Claude's JSON-encoded

@@ -105,8 +105,8 @@ int main() {
         } catch (const std::invalid_argument&) { rejected = true; }
         failures += check(rejected, "unsupported ngram configuration admitted");
     }
-    // ngram with concurrency>1 is admitted for every backend when the width fits its batch>1
-    // graph domain (MTP 1..63, DFlash/DFlash2 1..15).
+    // ngram with concurrency>1 is admitted for every backend when the width fits the batch>1
+    // graph domain: 1..63 at concurrency one, at most 15 above it, whatever the backend.
     for (const std::string backend : {"mtp", "dflash", "dflash2"}) {
         const auto concurrent =
             parse({"ninfer-serve", "model.ninfer", "--spec", backend, "--draft-tokens", "3",

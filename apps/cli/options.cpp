@@ -140,7 +140,7 @@ std::string usage_text(const char* argv0) {
            "  --stop-token-id N...     stop token ids\n"
            "  --stop <text>...         stop on this text\n"
            "  --reasoning-stop <text>  stop reasoning on this text\n"
-           "  --reasoning-effort E     low | medium | xhigh\n"
+           "  --reasoning-effort E     none | minimal | low | medium | high | xhigh | max\n"
            "  --no-thinking            disable the thinking mode\n"
            "  --thinking-budget N      cap model-origin thinking tokens\n"
            "  --raw-output             emit raw content without framing\n"
