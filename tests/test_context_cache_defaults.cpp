@@ -1,6 +1,7 @@
 #include "runtime/engine/model_instance.h"
 
 #include <iostream>
+#include <stdexcept>
 
 namespace {
 
@@ -56,6 +57,12 @@ int main() {
         const EngineOptions normalized = normalize_engine_options(options);
         failures += check(*normalized.context_cache.max_shared_prefixes == 0,
                           "disabled context cache did not normalize shared-prefix capacity to zero");
+    }
+
+    {
+    }
+
+    {
     }
 
     if (failures == 0) { std::cout << "ok\n"; }
