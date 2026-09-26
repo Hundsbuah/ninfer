@@ -2410,6 +2410,8 @@ int run_nvfp4_cases() {
                             MappingPattern::Fragmented);
     failures += run_a3_case(kGeometries[1], KvCacheStorage::Nvfp4Group16, {1, 65535, 65536, 719u},
                             MappingPattern::Fragmented);
+    failures += run_a3_case(kGeometries[0], KvCacheStorage::Nvfp4Group16,
+                            {1, 300000, 300001, 1720u}, MappingPattern::Fragmented);
     return failures;
 }
 
@@ -2486,6 +2488,15 @@ int verify_workspace_capacity_contract() {
 }
 
 } // namespace
+
+int run_softmax_attention_extended_tests() {
+    if (cuda_unavailable()) return 77;
+    std::cout << "NVFP4 attention: 300001 visible keys, fragmented pages, independent FP64 oracle\n" << std::flush;
+    const int failures = run_a3_case(kGeometries[0], KvCacheStorage::Nvfp4Group16,
+                                     {1, 300000, 300001, 1720u}, MappingPattern::Fragmented);
+    std::cout << (failures ? "FAIL" : "PASS") << " extended attention\n";
+    return failures ? 1 : 0;
+}
 
 int run_softmax_attention_nvfp4_tests() {
     if (cuda_unavailable()) {
