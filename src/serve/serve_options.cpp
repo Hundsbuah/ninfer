@@ -108,7 +108,8 @@ std::string serve_usage_text(const char* argv0) {
            "                             VRAM, leaving " +
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
            " MiB of headroom; configurable\n"
-           "                             via --kv-headroom-mib)\n"
+           "                             via --vram-headroom-mib)\n"
+           "  --vram-headroom-mib N      VRAM headroom in MiB left by --kv-capacity auto\n"
            "                             (default " +
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
            ")\n"
@@ -237,6 +238,7 @@ std::string serve_usage_text(const char* argv0) {
            "                             strict parsers that reject choices:[] accept it\n"
            "\n"
            "NOTES\n"
+           "  --vram-headroom-mib requires --kv-capacity auto (the default with the new\n"
            "  prefix caching system).\n"
            "  Options of the two prefix caching systems cannot be mixed.\n"
            "  --vision-offload on requires --vision.\n"
@@ -274,6 +276,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     const char* hybrid_option_flag = nullptr;
     // The hybrid prefix cache is the server default; --use-original-prefix-caching selects Legacy.
     options.context_cache.mode = ContextCacheMode::Hybrid;
+    std::optional<std::size_t> vram_headroom_mib;
     if (argc >= 2 && (std::string(argv[1]) == "--help" || std::string(argv[1]) == "-h")) {
         options.help_requested = true;
         return options;
@@ -311,6 +314,13 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--kv-capacity") {
             options.kv_capacity  = parse_kv_capacity(require_value("--kv-capacity"));
             kv_capacity_explicit = true;
+        } else if (arg == "--vram-headroom-mib") {
+            const std::uint64_t mib =
+                parse_u64(require_value("--vram-headroom-mib"), "vram-headroom-mib");
+            if (mib > std::numeric_limits<std::size_t>::max() / (1ULL << 20)) {
+                throw std::invalid_argument("--vram-headroom-mib is out of range");
+            }
+            vram_headroom_mib = static_cast<std::size_t>(mib);
         } else if (arg == "--max-concurrency") {
             options.max_concurrency = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--max-concurrency"), "max-concurrency"));
@@ -575,6 +585,12 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.allow_prefix_reuse && options.context_cache.mode == ContextCacheMode::Hybrid
                 ? KvCapacityPolicy::automatic()
                 : KvCapacityPolicy::explicit_capacity(options.max_context);
+    }
+    if (vram_headroom_mib.has_value()) {
+        if (options.kv_capacity.mode != KvCapacityMode::Automatic) {
+            throw std::invalid_argument("--vram-headroom-mib requires --kv-capacity auto");
+        }
+        options.kv_capacity = KvCapacityPolicy::automatic(*vram_headroom_mib << 20);
     }
     if (!options.allow_prefix_reuse) {
         if (original_cache_selected) {
