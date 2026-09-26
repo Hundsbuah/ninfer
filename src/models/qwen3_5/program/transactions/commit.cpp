@@ -319,6 +319,8 @@ runtime::ExecutionTiming ProgramImpl::append_forced_tokens(
             }
 
             ensure_sequence_kv_mapped(sequence, end, backend_kv_cache() ? end : 0U);
+            // Forced tokens run through Prefill, which reads the shared step table-row scalars.
+            bind_sequence_kv(sequence);
 
             sequence.ledger.insert(sequence.ledger.end(), forced.begin(), forced.end());
             if (sequence.ledger.size() != static_cast<std::size_t>(end) + 1U) {
@@ -330,17 +332,7 @@ runtime::ExecutionTiming ProgramImpl::append_forced_tokens(
                     (backend_kv_cache() && !sequence.kv->backend)) {
                     throw std::logic_error("DFlash forced continuation state is incomplete");
                 }
-                *dflash_host_ingress                            = {};
-                dflash_host_ingress->active_lanes[0]            = static_cast<std::int32_t>(lane);
-                const StateImageSelectors selectors             = state_selectors(sequence);
-                dflash_host_ingress->state_source_slots[0]      = selectors.source;
-                dflash_host_ingress->state_destination_slots[0] = selectors.destination;
-                dflash_host_ingress->dflash_kv_table_rows[0] =
-                    sequence.kv->backend ? backend_kv_addresses->bound_row(*sequence.kv->backend)
-                                         : 0;
-                CUDA_CHECK(cudaMemcpyAsync(io.dflash_decode->ingress.data, dflash_host_ingress,
-                                           sizeof(qwen3_5::DFlashDecodeIngress),
-                                           cudaMemcpyHostToDevice, device.stream));
+                upload_dflash_prefill_controls(sequence);
             }
 
             std::uint32_t cursor = base;
