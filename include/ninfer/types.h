@@ -253,9 +253,10 @@ struct EngineOptions {
     std::uint32_t max_pending_requests = 16;
     std::uint32_t pending_timeout_ms   = 30000;
     std::uint32_t prefill_chunk        = 1024;
-    // Prefill with the fast INT8-KV prompt-attention kernel and round prefill_chunk down to whole
-    // prompt-attention waves. Off keeps the default kernel and the requested chunk.
-    bool fast_prefill_kernel           = false;
+    // INT8 KV prefills with the fast prompt-attention kernel and rounds prefill_chunk down to whole
+    // prompt-attention waves. True selects the original INT8 prompt kernel at the requested chunk;
+    // it requires the INT8 KV cache.
+    bool original_int8_prefill_kernel  = false;
     KvCacheStorage kv_cache            = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;
     std::size_t media_cache_bytes = kDefaultMediaCacheBytes;

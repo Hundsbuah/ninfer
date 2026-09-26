@@ -53,7 +53,7 @@ struct Options {
     int device                          = 0;
     ninfer::KvCacheStorage kv           = ninfer::KvCacheStorage::Fp8E4M3Row256;
     bool quick                          = false;
-    bool fast_prefill_kernel            = false;
+    bool original_int8_prefill_kernel   = false;
     ninfer::product::LogLevel log_level = ninfer::product::LogLevel::Info;
 };
 
@@ -62,7 +62,8 @@ std::string usage_text() {
            "(--corpus <manifest.json> [--quick] | --text <utf8-file>)\n"
            "       [--context N] [--stride N] [--device N]\n"
            "       [--rope-yarn-factor F] (startup-fixed, finite [1,4], default 1; ceiling only)\n"
-           "       [--kv-dtype bf16|int8|fp8|nvfp4|k8v4] [--fast-prefill-kernel (int8 only)]\n"
+           "       [--kv-dtype bf16|int8|fp8|nvfp4|k8v4]\n"
+           "       [--use-original-int8-prefill-kernel (int8 only; default fast kernel)]\n"
            "       [--output <directory>]\n"
            "       [--log-level trace|debug|info|warning|error|critical|off]\n";
 }
@@ -110,8 +111,8 @@ Options parse_options(int argc, char** argv) {
             out.stride = parse_integer<std::uint32_t>(value("--stride"), "stride");
         } else if (option == "--device") {
             out.device = parse_integer<int>(value("--device"), "device");
-        } else if (option == "--fast-prefill-kernel") {
-            out.fast_prefill_kernel = true;
+        } else if (option == "--use-original-int8-prefill-kernel") {
+            out.original_int8_prefill_kernel = true;
         } else if (option == "--kv-dtype") {
             const std::string_view dtype = value("--kv-dtype");
             if (dtype == "bf16") {
@@ -231,7 +232,7 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
     engine_options.max_context      = options.context;
     engine_options.rope_yarn_factor  = options.rope_yarn_factor;
     engine_options.kv_cache         = options.kv;
-    engine_options.fast_prefill_kernel = options.fast_prefill_kernel;
+    engine_options.original_int8_prefill_kernel = options.original_int8_prefill_kernel;
     engine_options.startup_observer = startup_log.observer();
     engine_options.diagnostic_observer = ninfer::product::engine_diagnostic_observer(logger);
     ninfer::Engine engine(std::move(engine_options));
@@ -403,7 +404,7 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
           {"device", options.device},
           {"context_tokens", options.context},
           {"rope_yarn_factor", options.rope_yarn_factor},
-          {"fast_prefill_kernel", options.fast_prefill_kernel},
+          {"original_int8_prefill_kernel", options.original_int8_prefill_kernel},
           {"stride_tokens", options.stride},
           {"prefill_chunk_tokens", 1024},
           {"score_tile_tokens", 1024},

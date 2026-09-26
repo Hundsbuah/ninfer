@@ -24,8 +24,8 @@ for creating NInfer!
    with a raft of fixes and improvements (as I was working on this prior to going with a new
    design – I found the upstream system to be too complex and fragile) – it is gated behind the
    launch parameter `--use-original-prefix-caching`
-4. adds an option to use a faster prefill kernel when using int8 (Hadamard rotated) for KV cache
-   (which has a slight penalty to perplexity) by using launch parameter `--fast-prefill-kernel`
+4. prefills with a faster prompt-attention kernel by default when using int8 (Hadamard rotated)
+   for KV cache; the original kernel remains available with `--use-original-int8-prefill-kernel`
 5. adds ngram-mod copy drafting (based on an implementation by
    [remesis](https://github.com/remesis)) to significantly increase the speed of copy-heavy
    workloads
@@ -80,7 +80,7 @@ copied next to it. The launch I use on a single 32 GB RTX 5090 (stop any other r
 first):
 
 ```bat
-ninfer-serve.exe qwen3_8_27b_nvfp4-nvidia.ninfer --host 127.0.0.1 --port 8080 --max-context 240000 --max-concurrency 2 --spec dflash2 --draft-tokens 7 --lm-head-draft --ngram-draft-tokens 15 --ngram-min-match 12 --kv-dtype int8 --fast-prefill-kernel --preserve-thinking --host-cache-mib 52000 --pending-timeout-ms 900000 --prefill-chunk 4096 --kv-capacity auto --vram-headroom-mib 0 --log-colours on --ngram-archive-mib 2048 --ngram-session-mib 256 --ngram-native-sessions --request-log-jsonl log.json --default-thinking-budget 16384 --thinking-budget-message "Considering the limited time available to the user, I must stop thinking now. Time to act:" --tolerant-tool-calls
+ninfer-serve.exe qwen3_8_27b_nvfp4-nvidia.ninfer --host 127.0.0.1 --port 8080 --max-context 240000 --max-concurrency 2 --spec dflash2 --draft-tokens 7 --lm-head-draft --ngram-draft-tokens 15 --ngram-min-match 12 --kv-dtype int8 --preserve-thinking --host-cache-mib 52000 --pending-timeout-ms 900000 --prefill-chunk 4096 --kv-capacity auto --vram-headroom-mib 0 --log-colours on --ngram-archive-mib 2048 --ngram-session-mib 256 --ngram-native-sessions --request-log-jsonl log.json --default-thinking-budget 16384 --thinking-budget-message "Considering the limited time available to the user, I must stop thinking now. Time to act:" --tolerant-tool-calls
 ```
 
 Add `--prefix-cache-file PATH` to keep the prefix cache across restarts (stop the server with
@@ -131,6 +131,7 @@ Settings:
   today it is the default and the original-cache arm needs `--use-original-prefix-caching`. The
   run also passed `--cuda-graph-allowance-mib 500`, an option since removed now that the
   allowance is measured, and `--vram-headroom-mib` was then named `--kv-headroom-mib`.
+  `--fast-prefill-kernel` has since become the int8 default and was removed.
 
   ```text
   --max-context 160000 --max-concurrency 2 --spec dflash2 --draft-tokens 7 --lm-head-draft
@@ -229,7 +230,7 @@ bench\agentic_ab\build_control.bat build
 ```
 
 Agentic workload (about 2.7 hours for three arms on three seeds). The runner reads the model path
-and launch flags from `AB_LAUNCH_BAT`, adds `--fast-prefill-kernel` to the fork arms, calibrates
+and launch flags from `AB_LAUNCH_BAT`, calibrates
 the largest context the control starts with, and writes `report.md` under
 `profiles\bench\agentic_ab\`. `treatment` is the fork with its default hybrid cache, `alt` the fork
 with `--use-original-prefix-caching`, and `control` upstream:
@@ -350,11 +351,14 @@ which require `--use-original-prefix-caching`. Details:
   (`ninfer_qwen3_5_prefix_real_test`, `tools/smoke/prefix_reuse_issues.py`).
   Commit: [`8759d99`][c-prefix-tests].
 
-### Faster prefill: `--fast-prefill-kernel`
+### Faster prefill: the fast INT8 prompt kernel (default for `--kv-dtype int8`)
 
 Commit: [`98b8c4c`][c-fast-prefill].
 
-Opt-in on `ninfer-serve`, `ninfer-perplexity` and `ninfer_bench`, for `--kv-dtype int8`:
+The default for `--kv-dtype int8` on `ninfer-serve`, `ninfer`, `ninfer-perplexity` and
+`ninfer_bench`; `--use-original-int8-prefill-kernel` selects the original INT8 prompt kernel at the
+requested chunk. It was first opt-in (`--fast-prefill-kernel`) and became the default after the
+perplexity comparison below:
 
 - A FlashAttention-2 style INT8 prompt-attention kernel
   (`src/ops/softmax_attention/dense/causal_cache/prompt_i8_fast.cuh`): each warp keeps its query
@@ -363,9 +367,19 @@ Opt-in on `ninfer-serve`, `ninfer-perplexity` and `ninfer_bench`, for `--kv-dtyp
 - The effective `--prefill-chunk` is rounded down to whole GPU waves (896 tokens for this model on
   170 SMs), so `4096` runs as `3584`.
 
-Against the flag off (Qwen3.8-27B NVIDIA NVFP4, int8 KV): new-prompt prefill +3.8 % at 16K,
-+14.7 % at 64K and +24.9 % at 128K; perplexity 4.1713 against 4.1679 (+0.08 %; BF16 KV scores
-4.1695).
+Against the original kernel (Qwen3.8-27B NVIDIA NVFP4, int8 KV): new-prompt prefill +3.8 % at
+16K, +14.7 % at 64K and +24.9 % at 128K. Perplexity on the full `ninfer-ppl-1m-v1` corpus (1.04M
+scored tokens), with BF16 KV as the reference:
+
+| Context | Fast kernel | Original kernel | BF16 KV |
+|---|---|---|---|
+| 4K (stride 2K) | 4.8986 | 4.9027 | 4.8948 |
+| 64K (stride 32K) | 4.8139 | 4.8722 | 4.8768 |
+
+At 4K the fast kernel is the closer of the two to BF16 KV (per-window RMS deviation 0.025 against
+0.052 nats). At 64K it scores 1.2 % lower than the original kernel; three of the 16 streams drive
+that difference, and the original kernel itself moves single long streams by up to 7 % against
+BF16 KV.
 
 ### Decode speed
 
@@ -560,8 +574,10 @@ the ones that were wrong or not worth their cost, and fixed these:
   built-in 1e7 and 1e-6 at widths up to 256 tokens, which include every decode step. Shipped
   Qwen3.x artifacts use both values and are unaffected.
   Commit: [`0f5b953`][c-rope-guard].
-- **`--fast-prefill-kernel` requires `--kv-dtype int8`** and startup says so; with another KV
-  format it used to shrink the prefill chunk to 3584 for a kernel that never ran. Both INT8 prompt
+- **`--fast-prefill-kernel` required `--kv-dtype int8`** and startup said so; with another KV
+  format it used to shrink the prefill chunk to 3584 for a kernel that never ran. INT8 KV now takes
+  the fast kernel by default, and its opt-out `--use-original-int8-prefill-kernel` has the same
+  check. Both INT8 prompt
   kernels and the fused attention input projection (#305) are now checked against the FP64 oracle
   at that 3584-token production chunk, and the oracle uses every host core (the long attention
   test that timed out now takes about six minutes).

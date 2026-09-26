@@ -1027,13 +1027,20 @@ void resolve_host_cache_budget(ContextCacheOptions& cache, std::uint32_t private
     cache.host_kv_capacity_bytes            = static_cast<std::size_t>(budget - state_bytes);
 }
 
+namespace {
+// INT8 KV prefills with the fast prompt kernel unless the original kernel was selected.
+bool uses_fast_int8_prefill(const EngineOptions& options) {
+    return options.kv_cache == KvCacheStorage::Int8Group64 && !options.original_int8_prefill_kernel;
+}
+} // namespace
+
 // Every chunk but a prompt's last one has the effective width, so with the fast prefill kernel it
 // is rounded down to whole prompt-attention waves, keeping each full chunk's attention free of a
 // partial last wave.
 std::uint32_t effective_prefill_chunk(const execution::Parameters& parameters,
                                       const EngineOptions& options) {
     const std::uint32_t requested = std::min(options.prefill_chunk, options.max_context);
-    if (!options.fast_prefill_kernel) { return requested; }
+    if (!uses_fast_int8_prefill(options)) { return requested; }
     const auto& attention = *parameters.model.config().text.attention;
     const auto wave = static_cast<std::uint32_t>(ops::causal_softmax_attention_prompt_wave_tokens(
         {static_cast<std::int32_t>(attention.head_dim),
@@ -1054,7 +1061,7 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         .capacity            = options.max_context,
         .max_concurrency     = options.max_concurrency,
         .prefill_chunk       = effective_prefill_chunk(parameters, options),
-        .fast_prefill_kernel = options.fast_prefill_kernel,
+        .fast_prefill_kernel = uses_fast_int8_prefill(options),
         .draft_window =
             std::max(options.speculative.draft_tokens, options.speculative.ngram_draft_tokens),
         .speculative_backend = options.speculative.backend,
