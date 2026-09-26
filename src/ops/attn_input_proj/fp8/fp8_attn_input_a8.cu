@@ -24,7 +24,8 @@ void run(const Weight& weight, Tensor& q, Tensor& gate, Tensor& k, Tensor& v,
         static_cast<__nv_bfloat16*>(q.data), static_cast<__nv_bfloat16*>(k.data),
         static_cast<__nv_bfloat16*>(gate.data), static_cast<__nv_bfloat16*>(v.data)};
     launch_fp8_a8_mma<Fp8ScheduleInstance<Schedule, 5120>>(
-        fp8_a8_operands(weight, workspace, tokens), output, LinearIdentityEpilogue{}, stream);
+        fp8_a8_operands(weight, workspace, tokens), output, LinearIdentityEpilogue{}, stream, {},
+        pdl::Dependency::Programmatic);
 }
 } // namespace
 

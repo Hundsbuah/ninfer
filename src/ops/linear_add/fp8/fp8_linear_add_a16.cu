@@ -26,7 +26,7 @@ void launch_exact(const Tensor& x, const Weight& weight, Tensor& residual, cudaS
     auto* output = static_cast<__nv_bfloat16*>(residual.data);
     launch_fp8_a16_simt<Fp8ScheduleInstance<Schedule, Geometry::kInputRows, ActiveTokens, true>>(
         fp8_a16_operands(x, weight), LinearBf16Output{output, weight.n},
-        LinearResidualAddEpilogue{{output, weight.n}}, stream);
+        LinearResidualAddEpilogue{{output, weight.n}}, stream, {}, pdl::Dependency::Programmatic);
 }
 
 template <class Geometry, std::size_t... Offsets>
