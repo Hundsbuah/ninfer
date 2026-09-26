@@ -379,6 +379,13 @@ Against the flag off (Qwen3.8-27B NVIDIA NVFP4, int8 KV): new-prompt prefill +3.
   greedy decode is 2.2-2.5 % faster per round (DFlash2 K=7, 16K and 60K context). Ideas tried and
   dropped are in [`RESEARCH_NOTES.md`](RESEARCH_NOTES.md).
   Commit: [`710673d`][c-pdl].
+- **Decode kernels sized for verification widths.** Measured one change at a time with DFlash2
+  K=7 decode saturation on the NVIDIA NVFP4 artifact, as time per round at 1/2/4/8 concurrent
+  requests: narrower four-stage tiles for the N=5120 FP8 residual projections up to 128 tokens
+  (`216ecc7a`) take 0/0/-7.6/-6.4 %; a third pipeline stage for the NVFP4 down projection
+  (`57be0068`) takes -1.4/-1.2/-1.1/-0.9 %; sharing each staged activation across two 16-row
+  tiles in the FP8 head and Q8 DFlash2 drafter K-splits (`07f2bad2`) takes 0/0/-0.9/-0.2 %.
+  Perplexity is unchanged bit for bit.
 - **Ngram copy drafting with more than one concurrent request.** Ngram drafting proposes the next
   tokens by copying matching text from earlier in the context, alongside MTP/DFlash/DFlash2. The
   single-request version is the original work of [remesis](https://github.com/remesis) in the
