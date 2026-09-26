@@ -65,33 +65,28 @@ void attention_projection(const Tensor& hidden, const AttentionParameters& param
     }
 }
 
-void text_rope(const Tensor& positions, const RopeConfig& config, Tensor& query,
-               cudaStream_t stream) {
+void text_rope(const Tensor& positions, const RopeConfig& config, const ops::PreparedRope& prepared,
+               Tensor& query, cudaStream_t stream) {
     require_rope_axes(positions, config);
-    ops::rope(positions, dimension(config.rotary_dim), config.rope_theta, query, stream);
-}
-
-void text_rope(const Tensor& positions, const RopeConfig& config, Tensor& query, Tensor& key,
-               cudaStream_t stream) {
-    require_rope_axes(positions, config);
-    ops::rope(positions, dimension(config.rotary_dim), config.rope_theta, query, key, stream);
+    ops::rope(positions, prepared, query, stream);
 }
 
 void text_qk_norm_rope(const Tensor& positions, const RopeConfig& rope,
                        const AttentionConfig& attention, float rms_norm_eps,
                        const Tensor& q_norm_weight, const Tensor& k_norm_weight,
+                       const ops::PreparedRope& prepared,
                        const Tensor& query, const Tensor& key, Tensor& normalized_query,
                        Tensor& normalized_key, cudaStream_t stream) {
     require_rope_axes(positions, rope);
-    if (fused_text_qk_norm_rope(positions, rope, attention, query.ne[2])) {
+    if (prepared.factor == 1.0F &&
+        fused_text_qk_norm_rope(positions, rope, attention, query.ne[2])) {
         ops::rmsnorm_rope(positions, q_norm_weight, k_norm_weight, query, key, normalized_query,
                           normalized_key, stream);
         return;
     }
     ops::rmsnorm(query, q_norm_weight, rms_norm_eps, true, normalized_query, stream);
     ops::rmsnorm(key, k_norm_weight, rms_norm_eps, true, normalized_key, stream);
-    ops::rope(positions, dimension(rope.rotary_dim), rope.rope_theta, normalized_query,
-              normalized_key, stream);
+    ops::rope(positions, prepared, normalized_query, normalized_key, stream);
 }
 
 } // namespace ninfer::models::qwen3_5::execution
