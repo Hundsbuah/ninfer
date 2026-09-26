@@ -13,7 +13,10 @@
 namespace ninfer::ops::detail {
 namespace {
 
-using M32N64            = Nvfp4W4a4MmaSchedule<32, 64, 256, 2, 4, 2, 2>;
+// Up to 64 tokens the N=5120 projections are one wave of 80 CTAs, so their time is the weight
+// stream per CTA. A third stage keeps more of it in flight: measured on RTX 5090, the K=17408
+// down projection drops from 39 to 35-37 us and K=6144 from 16-18 to 15-16 us, bit-identically.
+using M32N64            = Nvfp4W4a4MmaSchedule<32, 64, 256, 2, 4, 3, 2>;
 using M32N128           = Nvfp4W4a4MmaSchedule<32, 128, 256, 2, 4, 2, 1>;
 using M64N128           = Nvfp4W4a4MmaSchedule<64, 128, 256, 4, 2, 2, 1>;
 using M128N128Pipelined = Nvfp4W4a4MmaSchedule<128, 128, 256, 4, 2, 2, 1>;
