@@ -76,13 +76,18 @@ std::string serve_usage_text(const char* argv0) {
            "  --max-concurrency N        max concurrent sequences, 1-8 (default 1)\n"
            "  --prefill-chunk N          prefill chunk size in tokens, multiple of 128\n"
            "                             (default 1024)\n"
+           "  --fast-prefill-kernel      prefill with the fast INT8-KV prompt-attention kernel\n"
+           "                             and wave-aligned chunks (default off)\n"
            "  --no-cuda-graph            disable CUDA-graph decode rounds (on by default)\n"
            "  --default-max-tokens N     default max_tokens when a request omits it\n"
            "                             (default " +
-           std::to_string(kDefaultMaxTokens) + ")\n"
+           std::to_string(kDefaultMaxTokens) +
+           ")\n"
            "  --default-thinking-budget N  cap model-origin thinking for enabled\n"
            "                             requests; control tokens count toward the\n"
            "                             request output limit\n"
+           "                             --thinking-budget-message \"Time to stop thinking. I must "
+           "act\n"
            "  --model-id ID              override the artifact metadata.name reported by\n"
            "                             the server\n"
            "  --chat-template FILE       replace the artifact frontend chat template at\n"
@@ -115,7 +120,8 @@ std::string serve_usage_text(const char* argv0) {
            "                                         (default 2)\n"
            "  --max-shared-prefixes N          bounded shared prefix catalogs\n"
            "                                    (default = max(concurrency," +
-           std::to_string(kMaximumPreparedPromptCacheCandidatesPerRequest) + "))\n"
+           std::to_string(kMaximumPreparedPromptCacheCandidatesPerRequest) +
+           "))\n"
            "  --no-prefix-reuse          disable compatible-prefix caching\n"
            "                             (enabled by default)\n"
            "\n"
@@ -263,6 +269,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--prefill-chunk") {
             options.prefill_chunk = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--prefill-chunk"), "prefill-chunk"));
+        } else if (arg == "--fast-prefill-kernel") {
+            options.fast_prefill_kernel = true;
         } else if (arg == "--context-cost-presets") {
             options.context_cost_presets = require_value("--context-cost-presets");
             if (options.context_cost_presets.empty()) {

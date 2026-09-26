@@ -540,6 +540,14 @@ int main() {
     failures += check(!secret_present, "startup argv retained the API key");
     failures += check(redaction_present, "startup argv omitted the API-key redaction marker");
 
+    failures += check(!archive.fast_prefill_kernel, "the fast prefill kernel must default off");
+    failures += check(parse({"ninfer-serve", "model.ninfer", "--fast-prefill-kernel"})
+                          .fast_prefill_kernel,
+                      "--fast-prefill-kernel was not preserved");
+    failures += check(serve_usage_text("ninfer-serve").find("--fast-prefill-kernel") !=
+                          std::string::npos,
+                      "serve help omits --fast-prefill-kernel");
+
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }
