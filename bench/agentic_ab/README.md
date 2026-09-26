@@ -142,6 +142,8 @@ Several workload seeds (`--seeds`) show how much a result depends on the particu
 | `AB_CONTROL_EXE` | `bench\agentic_ab\control\build\apps\Release\ninfer-serve.exe` |
 | `AB_TREATMENT_EXTRA_FLAGS` | none |
 | `AB_ALT_EXTRA_FLAGS` | `--use-original-prefix-caching` (added to the treatment's flags) |
+| `AB_ALT_EXE` | the treatment executable; another build puts a second fork build in the alt arm |
+| `AB_ALT_LABEL` | none (the report calls the alt arm "This fork, original prefix cache") |
 | `AB_HOST` / `AB_PORT` | `127.0.0.1` / `8080` |
 | `AB_OUT` | `profiles\bench\agentic_ab` in this checkout |
 | `AB_CORPUS_REPO` / `AB_CORPUS_COMMIT` | this checkout / `e48a0d28` |

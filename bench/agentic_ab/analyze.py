@@ -17,11 +17,20 @@ import re
 import statistics
 import sys
 
-# Every arm is compared with the control; `alt` is the treatment build with AB_ALT_EXTRA_FLAGS.
+# Every arm is compared with the control; `alt` is AB_ALT_EXE (default the treatment build) with
+# AB_ALT_EXTRA_FLAGS, named by AB_ALT_LABEL when the run set one.
 ARMS = ("control", "treatment", "alt")
 LABEL = {"control": "Upstream + Windows port", "treatment": "This fork",
          "alt": "This fork, original prefix cache"}
 SHORT = {"control": "Upstream", "treatment": "Fork", "alt": "Fork original-cache"}
+
+
+def use_alt_label(cfg):
+    if cfg.get("alt_label"):
+        LABEL["alt"] = cfg["alt_label"]
+        SHORT["alt"] = cfg["alt_label"]
+
+
 CONTINUING = {"loop", "after_idle", "history_edit", "retry", "abort_retry", "subagent_loop"}
 NEW_LONG = {"cold_resume", "compaction", "check"}
 CLASS_DOC = [
@@ -601,6 +610,7 @@ def aggregate(out_dir, run_dirs):
     for d in run_dirs:
         with open(os.path.join(d, "summary.json"), encoding="utf-8") as f:
             runs.append((d, json.load(f)))
+    use_alt_label(runs[0][1]["config"])
     arms = [a for a in ARMS if all(a in s for _, s in runs)]
     if arms[:1] != ["control"] or len(arms) < 2:
         raise SystemExit("aggregate needs a control arm and one other arm in every run")
@@ -667,6 +677,7 @@ def main(argv):
     run_dir = argv[0]
     with open(os.path.join(run_dir, "config.json"), encoding="utf-8") as f:
         cfg = json.load(f)
+    use_alt_label(cfg)
     arms = [a for a in ARMS if os.path.exists(os.path.join(run_dir, a, "client.jsonl"))]
     if arms[:1] != ["control"] or len(arms) < 2:
         raise SystemExit("%s needs a control arm and at least one other arm" % run_dir)
@@ -693,7 +704,7 @@ def main(argv):
              "`max_tokens: %d` on agent turns, thinking on."
              % (c["n"], cfg["seed"], cfg["scale"], cfg["corpus_commit"], cfg["agent_max_tokens"]))
     exes = {"control": cfg["control_exe"], "treatment": cfg["treatment_exe"],
-            "alt": cfg["treatment_exe"]}
+            "alt": cfg.get("alt_exe") or cfg["treatment_exe"]}
     for a in arms:
         extra = (" with `%s`" % " ".join(cfg.get("alt_extra_flags") or [])) if a == "alt" else ""
         L.append("- %s: `%s`%s - %s" % (LABEL[a], exes[a], extra, server_row(A[a])))

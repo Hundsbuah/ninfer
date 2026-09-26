@@ -12,8 +12,9 @@ Sequence:
      the control serve starts; every arm runs at it;
   2. treatment arm: the launch bat's flags plus AB_TREATMENT_EXTRA_FLAGS, with the fork's
      default hybrid prefix cache;
-  3. optional alt arm: the treatment build and flags plus AB_ALT_EXTRA_FLAGS (default the
-     original prefix cache), so one run compares both fork configurations to the control;
+  3. optional alt arm: AB_ALT_EXE (default the treatment build) with the treatment's flags plus
+     AB_ALT_EXTRA_FLAGS (default the original prefix cache), so one run compares two fork
+     configurations, or two fork builds, with the control;
   4. control arm: the same flags minus those the control's --help does not advertise; the
      fork's single --host-cache-mib ceiling is translated into the control's explicit
      --host-state-slots / --host-kv-mib / catalog limits using the split the fork's original
@@ -63,8 +64,11 @@ CONTROL_EXE = os.environ.get("AB_CONTROL_EXE",
 TREATMENT_EXTRA_FLAGS = os.environ.get("AB_TREATMENT_EXTRA_FLAGS", "").split()
 # Selects the fork's original checkpoint-catalog prefix cache instead of the default hybrid one.
 ORIGINAL_CACHE_FLAG = "--use-original-prefix-caching"
-# What the alt arm adds to the treatment's flags (same build).
+# What the alt arm adds to the treatment's flags, and the build it runs (default the treatment's).
 ALT_EXTRA_FLAGS = os.environ.get("AB_ALT_EXTRA_FLAGS", ORIGINAL_CACHE_FLAG).split()
+ALT_EXE = os.environ.get("AB_ALT_EXE") or TREATMENT_EXE
+# How the report names the alt arm.
+ALT_LABEL = os.environ.get("AB_ALT_LABEL", "")
 HOST = os.environ.get("AB_HOST", "127.0.0.1")
 PORT = int(os.environ.get("AB_PORT", "8080"))
 OUT_ROOT = os.environ.get("AB_OUT", os.path.join(REPO, "profiles", "bench", "agentic_ab"))
@@ -703,8 +707,8 @@ def run_seed(seed, plan, run_dir, arms, model, flags, control_host, config, ctx)
         failures += f
     if "alt" in arms:
         config["alt_flags"] = set_flag(flags["alt"], "--max-context", str(ctx))
-        starts["alt"], f = run_arm("alt", TREATMENT_EXE, model, config["alt_flags"], plan,
-                                   run_dir, ctx)
+        starts["alt"], f = run_arm("alt", ALT_EXE, model, config["alt_flags"], plan, run_dir,
+                                   ctx)
         failures += f
     if "control" in arms:
         ctrl = set_flag(flags["control"], "--max-context", str(ctx))
@@ -778,7 +782,8 @@ def main():
             print("seed %d:\n%s" % (seed, workload.summarize(plans[seed])))
         print("control flags:", flag_str(ctrl_flags))
         return
-    for exe in ([TREATMENT_EXE] if {"treatment", "alt"} & set(arms) else []) + \
+    for exe in ([TREATMENT_EXE] if "treatment" in arms else []) + \
+               ([ALT_EXE] if "alt" in arms else []) + \
                ([CONTROL_EXE] if "control" in arms else []):
         if not os.path.exists(exe):
             raise SystemExit("missing serve executable: %s" % exe)
@@ -795,6 +800,8 @@ def main():
     config = {"launch_bat": LAUNCH_BAT, "model": model, "treatment_exe": TREATMENT_EXE,
               "control_exe": CONTROL_EXE, "treatment_flags": treat_flags,
               "alt_extra_flags": ALT_EXTRA_FLAGS if "alt" in arms else None,
+              "alt_exe": ALT_EXE if "alt" in arms else None,
+              "alt_label": ALT_LABEL or None,
               "control_flags_base": ctrl_flags, "dropped_for_control": dropped,
               "scale": args.scale, "agent_max_tokens": AGENT_MAX_TOKENS, "sampling": SAMPLING,
               "bat_max_context": bat_ctx}
