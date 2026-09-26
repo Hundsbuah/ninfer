@@ -79,7 +79,8 @@ std::string serve_usage_text(const char* argv0) {
            "  --prefill-chunk N          prefill chunk size in tokens, multiple of 128\n"
            "                             (default 1024)\n"
            "  --fast-prefill-kernel      prefill with the fast INT8-KV prompt-attention kernel\n"
-           "                             and wave-aligned chunks (default off)\n"
+           "                             and wave-aligned chunks; requires --kv-dtype int8\n"
+           "                             (default off)\n"
            "  --no-cuda-graph            disable CUDA-graph decode rounds (on by default)\n"
            "  --default-max-tokens N     default max_tokens when a request omits it\n"
            "                             (default " +

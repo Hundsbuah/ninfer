@@ -308,7 +308,8 @@ std::string usage_text(std::string_view program) {
         << "  --prefill-chunk <tokens>    multiple of " << kPrefillChunkAlignment
         << " (default: " << kDefaultPrefillChunk << ")\n"
         << "  --kv-dtype <bf16|int8|fp8|nvfp4|k8v4>  KV cache storage (default: bf16)\n"
-        << "  --fast-prefill-kernel       fast INT8-KV prompt kernel, wave-aligned chunks\n"
+        << "  --fast-prefill-kernel       fast INT8-KV prompt kernel, wave-aligned chunks;\n"
+        << "                              requires --kv-dtype int8\n"
         << "  --spec <mtp|dflash|dflash2> speculative backend (default: none)\n"
         << "  --draft-tokens <n>         MTP 1..5; DFlash/DFlash2 1..15\n"
         << "  --ngram-draft-tokens <n>   copy proposals 1..63; 0 disables (default: 0)\n"

@@ -854,7 +854,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--max-pending-requests N` | additional requests allowed to wait for admission | `16` |
 | `--pending-timeout-ms N` | maximum preparation-plus-admission wait | `30000` |
 | `--prefill-chunk N` | text-prefill chunk | `1024` |
-| `--fast-prefill-kernel` | prefill INT8-KV prompt attention with the fast kernel (FP16 per-tile PV accumulation) and round `--prefill-chunk` down to whole prompt-attention waves (896 tokens for the 24-head model on RTX 5090: `4096` runs as `3584`); other KV formats keep their kernel | off |
+| `--fast-prefill-kernel` | prefill INT8-KV prompt attention with the fast kernel (FP16 per-tile PV accumulation) and round `--prefill-chunk` down to whole prompt-attention waves (896 tokens for the 24-head model on RTX 5090: `4096` runs as `3584`); requires `--kv-dtype int8` (startup rejects it with any other KV format) | off |
 | `--log-stats-interval-ms N` | aggregate throughput report interval; `0` disables it | `5000` |
 | `--log-stats-panel on\|off` | pin the session statistics panel beneath the console log on an interactive terminal | `on` |
 | `--log-level trace\|debug\|info\|warning\|error\|critical\|off` | pretty stderr verbosity | `info` |
