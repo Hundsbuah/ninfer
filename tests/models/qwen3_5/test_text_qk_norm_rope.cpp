@@ -80,8 +80,9 @@ int main() {
         return 77;
     }
     int failures = 0;
-    for (const std::int32_t tokens : {1, 16, 256, 257}) {
-        // The native constants: the fused route through 256 tokens, the three calls above it.
+    for (const std::int32_t tokens : {1, 16, 256, 257, 3584}) {
+        // The native constants take the fused route at every width, a prefill chunk included, and
+        // must match the three calls bit for bit.
         failures += run_case(1.0e7F, 1.0e-6F, tokens, 11U + tokens);
         // Any other constant must reach the three calls at every width.
         failures += run_case(5.0e6F, 1.0e-6F, tokens, 23U + tokens);
