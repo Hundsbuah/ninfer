@@ -302,6 +302,7 @@ struct HybridPendingTap {
     std::uint32_t frontier = 0;
     StateImageHandle image;
     std::uint32_t slot = 0; // staging device snapshot slot
+    bool boundary      = false;
 };
 
 // Per-lane hybrid bookkeeping for the active sequence.
@@ -324,6 +325,10 @@ struct HybridLaneState {
     std::uint32_t last_capture = 0;
     // Deepest snapshot frontier known on this path (reused or created by this sequence).
     std::uint32_t deepest_snapshot = 0;
+    // The snapshot this sequence resumed from (invalid: root). Once the sequence publishes a
+    // deeper snapshot, its lineage resumes from that one and this one is superseded.
+    runtime::prefix_cache::SnapshotRef resume_snapshot;
+    std::uint32_t resume_frontier = 0;
     // The Host restore this sequence was admitted from (0 without one). Its first prefill pass
     // queues behind the restore's per-layer events; releasing the lane queues behind the whole
     // restore if it may still be landing.
@@ -1138,8 +1143,9 @@ private:
     // Inserts every newly committed full block of the lane's sequence into the tree, then
     // publishes the pending taps those blocks complete.
     void hybrid_publish_blocks(SequenceState& sequence);
-    // Snapshots the lane's committed state at the prefill frontier `frontier`.
-    void hybrid_capture_tap(SequenceState& sequence, std::uint32_t frontier);
+    // Snapshots the lane's committed state at the prefill frontier `frontier`; a boundary tap is
+    // published as SnapshotKind::Boundary.
+    void hybrid_capture_tap(SequenceState& sequence, std::uint32_t frontier, bool boundary);
     // Realizes the planned taps a completed prefill chunk reached.
     void hybrid_after_prefill_chunk(SequenceState& sequence, std::uint32_t cursor,
                                     std::uint32_t prompt_tokens);
@@ -1149,12 +1155,15 @@ private:
     // Copies a tail bundle into cache-owned pages; absent when no Device page can be freed.
     [[nodiscard]] std::optional<std::uint32_t> hybrid_copy_tail(const HybridBlockPages& source,
                                                                 std::uint32_t columns);
-    // Terminal publication: committed blocks and, when useful, an endpoint snapshot. Then the
-    // lane's sequence is released. Returns false when the lane could not be released strictly.
+    // Terminal publication: committed blocks and, when useful, an endpoint snapshot; the snapshot
+    // the lane resumed from is superseded once a deeper one exists. Then the lane's sequence is
+    // released. Returns false when the lane could not be released strictly.
     [[nodiscard]] bool hybrid_finish_lane(SequenceState& sequence, RequestControl& request,
                                           std::uint32_t lane, bool endpoint) noexcept;
     // Drops the lane's index pins. Safe on any lane state.
     void hybrid_release_lane(std::uint32_t lane) noexcept;
+    // Supersedes the snapshot the lane resumed from once the lane has published a deeper one.
+    void hybrid_supersede_resume(HybridLaneState& lane);
 
     [[nodiscard]] std::optional<AdmissionCandidate>
     inspect_lane(std::uint32_t lane, const PreparedPromptData& prompt, const RequestBasePlan& base,

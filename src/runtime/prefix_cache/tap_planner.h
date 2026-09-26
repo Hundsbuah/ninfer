@@ -40,6 +40,9 @@ enum class TapPlacement : std::uint8_t {
 struct PlannedTap {
     std::uint32_t position = 0;
     TapPlacement placement = TapPlacement::Exact;
+    // A boundary later prompts share across conversations (a client breakpoint or a structural
+    // boundary): its snapshot is published as SnapshotKind::Boundary and never superseded.
+    bool boundary = false;
 
     [[nodiscard]] friend bool operator==(PlannedTap, PlannedTap) noexcept = default;
 };

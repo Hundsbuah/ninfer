@@ -227,7 +227,30 @@ void PrefixCacheIndex::note_hit(SnapshotRef snapshot) {
     ++entry.hits;
     ++counters_.snapshot_hits;
     entry.last_hit_tick = ++tick_;
-    update_priority(snapshot.index);
+    entry.priority_base = inflation_;
+    if (!entry.superseded) {
+        update_priority(snapshot.index);
+        return;
+    }
+    // Resumed from again (a retry, or a second branch): retained until this lineage moves on.
+    entry.superseded      = false;
+    entry.superseded_tick = 0;
+    adjust_retained(entry.anchor, +1);
+    std::vector<std::uint32_t> dependents;
+    collect_retained_dependents(snapshot.index, dependents);
+    revalue_around(snapshot.index, dependents);
+}
+
+void PrefixCacheIndex::supersede(SnapshotRef snapshot) {
+    Snapshot& entry = require(snapshot);
+    if (entry.superseded || entry.kind == SnapshotKind::Boundary) { return; }
+    std::vector<std::uint32_t> dependents;
+    collect_retained_dependents(snapshot.index, dependents);
+    entry.superseded      = true;
+    entry.superseded_tick = ++tick_;
+    adjust_retained(entry.anchor, -1);
+    // Its retained dependents now value what lies between them and the retained ancestor above.
+    revalue_around(snapshot.index, dependents);
 }
 
 // ---- pins --------------------------------------------------------------------------------------
@@ -462,10 +485,11 @@ InsertResult PrefixCacheIndex::insert_block(NodeRef parent, std::uint64_t lookup
     node.device_id = device_id;
     node.device    = CopyState::Absent;
     set_device(node, CopyState::Resident);
-    node.host_slab  = kNoId;
-    node.host       = CopyState::Absent;
-    node.pins       = 1;
-    node.live_below = 0;
+    node.host_slab      = kNoId;
+    node.host           = CopyState::Absent;
+    node.pins           = 1;
+    node.live_below     = 0;
+    node.retained_below = 0;
     if (parent.valid()) {
         nodes_[parent_index].children.push_back(index);
     } else {
@@ -605,22 +629,18 @@ bool PrefixCacheIndex::allocate_slabs(std::uint32_t count, std::vector<std::uint
             }
             continue;
         }
-        std::uint32_t victim = kNoId;
-        for (std::uint32_t i = 0; i < snapshots_.size(); ++i) {
-            const Snapshot& snapshot = snapshots_[i];
-            if (!snapshot.occupied || i == protect_snapshot || snapshot.pins != 0 ||
-                snapshot.host != CopyState::Resident) {
-                continue;
-            }
-            if (victim == kNoId || snapshot.priority < snapshots_[victim].priority ||
-                (snapshot.priority == snapshots_[victim].priority &&
-                 snapshot.last_hit_tick < snapshots_[victim].last_hit_tick)) {
-                victim = i;
-            }
-        }
+        const std::uint32_t victim = pick_victim(true, protect_snapshot);
         if (victim == kNoId) { return false; }
-        inflation_       = std::max(inflation_, snapshots_[victim].priority);
         Snapshot& chosen = snapshots_[victim];
+        if (chosen.superseded) {
+            // Only requests diverging before its lineage's newer snapshot could use it: both
+            // copies go, and GDSF time does not advance.
+            remove_snapshot(victim);
+            ++counters_.superseded_evictions;
+            ++counters_.host_snapshot_evictions;
+            continue;
+        }
+        inflation_ = std::max(inflation_, chosen.priority);
         if (chosen.device_slot != kNoId &&
             (chosen.tail_len == 0 || chosen.tail_device_copy == CopyState::Resident)) {
             // Still complete on the Device: only its host copy yields its slabs.
@@ -758,7 +778,24 @@ std::optional<std::uint32_t> PrefixCacheIndex::acquire_device_slot(bool allow_un
         }
         return best;
     };
-    std::uint32_t slot = pick(true);
+    // A superseded owner goes first, backed or not: its lineage resumes from a newer snapshot.
+    std::uint32_t slot = kNoId;
+    for (std::uint32_t candidate = 0; candidate < slot_state_.size(); ++candidate) {
+        if (slot_state_[candidate] != SlotState::Owned) { continue; }
+        const Snapshot& owner = snapshots_[slot_owner_[candidate]];
+        if (owner.pins != 0 || !owner.superseded) { continue; }
+        if (slot == kNoId ||
+            owner.superseded_tick < snapshots_[slot_owner_[slot]].superseded_tick) {
+            slot = candidate;
+        }
+    }
+    if (slot != kNoId && snapshots_[slot_owner_[slot]].host != CopyState::Resident) {
+        remove_snapshot(slot_owner_[slot]);
+        ++counters_.device_slot_evictions;
+        set_slot(slot, SlotState::Staging);
+        return slot;
+    }
+    if (slot == kNoId) { slot = pick(true); }
     if (slot != kNoId) {
         const std::uint32_t owner = slot_owner_[slot];
         backend_->drop_snapshot_device_image(ref_of_snapshot(owner));
@@ -812,21 +849,18 @@ PublishResult PrefixCacheIndex::publish_snapshot(NodeRef anchor, std::uint32_t f
         }
     }
     if (free_snapshots_.empty()) {
-        // Make room by evicting the lowest-priority unpinned snapshot.
-        std::uint32_t victim = kNoId;
-        for (std::uint32_t i = 0; i < snapshots_.size(); ++i) {
-            const Snapshot& snapshot = snapshots_[i];
-            if (!snapshot.occupied || snapshot.pins != 0 || snapshot.host == CopyState::Filling) {
-                continue;
-            }
-            if (victim == kNoId || snapshot.priority < snapshots_[victim].priority) { victim = i; }
-        }
+        // Make room by evicting a superseded snapshot, otherwise the GDSF minimum.
+        const std::uint32_t victim = pick_victim(false, kNoId);
         if (victim == kNoId) {
             set_slot(device_slot, SlotState::Free);
             if (tail_device_id) { backend_->release_device_block(*tail_device_id); }
             return PublishResult{};
         }
-        inflation_ = std::max(inflation_, snapshots_[victim].priority);
+        if (snapshots_[victim].superseded) {
+            ++counters_.superseded_evictions;
+        } else {
+            inflation_ = std::max(inflation_, snapshots_[victim].priority);
+        }
         remove_snapshot(victim);
         ++counters_.host_snapshot_evictions;
     }
@@ -842,44 +876,44 @@ PublishResult PrefixCacheIndex::publish_snapshot(NodeRef anchor, std::uint32_t f
     snapshot.tail_device_copy = tail.empty() ? CopyState::Absent : CopyState::Resident;
     snapshot.device_slot      = device_slot;
     snapshot.host_slabs.clear();
-    snapshot.host          = CopyState::Absent;
-    snapshot.pins          = 0;
-    snapshot.kind          = kind;
-    snapshot.hits          = 0;
-    snapshot.last_hit_tick = ++tick_;
+    snapshot.host            = CopyState::Absent;
+    snapshot.pins            = 0;
+    snapshot.kind            = kind;
+    snapshot.hits            = 0;
+    snapshot.last_hit_tick   = ++tick_;
+    snapshot.priority_base   = inflation_;
+    snapshot.superseded      = false;
+    snapshot.superseded_tick = 0;
     set_slot(device_slot, SlotState::Owned);
     slot_owner_[device_slot] = index;
     anchored.push_back(index);
     ++snapshot_count_;
-    if (anchor.valid()) { adjust_live(anchor_index, +1); }
-    update_priority(index);
+    if (anchor.valid()) {
+        adjust_live(anchor_index, +1);
+        adjust_retained(anchor_index, +1);
+    }
+    link_snapshot(index);
+    std::vector<std::uint32_t> dependents;
+    collect_retained_dependents(index, dependents);
+    revalue_around(index, dependents);
     refresh_tail(index);
     return PublishResult{ref_of_snapshot(index), true};
 }
 
 void PrefixCacheIndex::update_priority(std::uint32_t index) {
-    Snapshot& snapshot              = snapshots_[index];
-    std::uint32_t ancestor_frontier = 0;
-    std::uint64_t exclusive_blocks  = 0;
-    bool exclusive                  = true;
-    for (std::uint32_t current = snapshot.anchor; current != kNoId;
-         current               = nodes_[current].parent) {
-        const Node& node = nodes_[current];
-        if (exclusive && node.live_below <= 1U) {
-            ++exclusive_blocks;
-        } else {
-            exclusive = false;
-        }
-        bool found = false;
-        for (const std::uint32_t other : node.snapshots) {
-            const Snapshot& candidate = snapshots_[other];
-            if (other != index && candidate.tail_len == 0 &&
-                candidate.frontier < snapshot.frontier) {
-                ancestor_frontier = std::max(ancestor_frontier, candidate.frontier);
-                found             = true;
-            }
-        }
-        if (found && !exclusive) { break; }
+    // GDSF value of keeping this snapshot, given that superseded snapshots go first: without it,
+    // a request continuing its lineage resumes from the nearest retained snapshot above it and
+    // prefills the rest, and evicting it frees its image, its tail and the blocks no other
+    // retained snapshot keeps.
+    Snapshot& snapshot                    = snapshots_[index];
+    const std::uint32_t ancestor          = retained_ancestor(index);
+    const std::uint32_t ancestor_frontier = ancestor == kNoId ? 0U : snapshots_[ancestor].frontier;
+    const std::uint32_t own               = snapshot.superseded ? 0U : 1U;
+    std::uint64_t exclusive_blocks        = 0;
+    for (std::uint32_t current = snapshot.anchor;
+         current != kNoId && nodes_[current].retained_below <= own;
+         current = nodes_[current].parent) {
+        ++exclusive_blocks;
     }
     const double saved =
         config_.cost.prefill_seconds(ancestor_frontier, snapshot.frontier - ancestor_frontier) -
@@ -890,13 +924,173 @@ void PrefixCacheIndex::update_priority(std::uint32_t index) {
         static_cast<double>(snapshot.tail_len != 0 ? config_.block_bytes : 0ULL) +
         static_cast<double>(exclusive_blocks) * static_cast<double>(config_.block_bytes);
     const double frequency = 1.0 + static_cast<double>(snapshot.hits);
-    snapshot.priority      = inflation_ + frequency * cost / std::max(size, 1.0);
+    snapshot.priority      = snapshot.priority_base + frequency * cost / std::max(size, 1.0);
+}
+
+// ---- snapshot ancestry -------------------------------------------------------------------------
+
+bool PrefixCacheIndex::on_path(const Snapshot& above, const Snapshot& below) const noexcept {
+    if (above.frontier >= below.frontier) { return false; }
+    const std::uint32_t above_blocks = above.anchor == kNoId ? 0U : nodes_[above.anchor].depth + 1U;
+    const std::uint32_t below_blocks = below.anchor == kNoId ? 0U : nodes_[below.anchor].depth + 1U;
+    if (above_blocks > below_blocks) { return false; }
+    // `tail_block` is the node of `below`'s path holding `above`'s tail tokens (absent when both
+    // share an anchor); the node above it must be `above`'s anchor.
+    std::uint32_t tail_block = kNoId;
+    std::uint32_t current    = below.anchor;
+    while (current != kNoId && nodes_[current].depth >= above_blocks) {
+        tail_block = current;
+        current    = nodes_[current].parent;
+    }
+    if (current != above.anchor) { return false; }
+    const auto tail = above.tail.begin();
+    if (tail_block == kNoId) { return std::equal(tail, tail + above.tail_len, below.tail.begin()); }
+    return std::equal(tail, tail + above.tail_len, nodes_[tail_block].tokens.begin());
+}
+
+std::uint32_t PrefixCacheIndex::find_ancestor(std::uint32_t index) const noexcept {
+    // Walk up the anchor path; the first node anchoring a snapshot on this path holds the nearest.
+    const Snapshot& snapshot = snapshots_[index];
+    std::uint32_t best       = kNoId;
+    std::uint32_t previous   = kNoId;
+    std::uint32_t current    = snapshot.anchor;
+    for (;;) {
+        const std::vector<std::uint32_t>& anchored =
+            current != kNoId ? nodes_[current].snapshots : root_snapshots_;
+        // Tokens right after this node on the path: the snapshot's own tail at its anchor.
+        const TokenId* next =
+            previous == kNoId ? snapshot.tail.data() : nodes_[previous].tokens.data();
+        for (const std::uint32_t other : anchored) {
+            const Snapshot& candidate = snapshots_[other];
+            if (other == index || candidate.frontier >= snapshot.frontier ||
+                !std::equal(candidate.tail.begin(), candidate.tail.begin() + candidate.tail_len,
+                            next)) {
+                continue;
+            }
+            if (best == kNoId || candidate.frontier > snapshots_[best].frontier) { best = other; }
+        }
+        if (best != kNoId || current == kNoId) { return best; }
+        previous = current;
+        current  = nodes_[current].parent;
+    }
+}
+
+std::vector<std::uint32_t>& PrefixCacheIndex::dependents_of(std::uint32_t snapshot) noexcept {
+    return snapshot == kNoId ? top_snapshots_ : snapshots_[snapshot].dependents;
+}
+
+void PrefixCacheIndex::link_snapshot(std::uint32_t index) {
+    Snapshot& snapshot = snapshots_[index];
+    snapshot.ancestor  = find_ancestor(index);
+    snapshot.dependents.clear();
+    // Snapshots below the new one had its ancestor as their nearest; they now hang from it.
+    std::vector<std::uint32_t>& siblings = dependents_of(snapshot.ancestor);
+    for (std::size_t i = 0; i < siblings.size();) {
+        const std::uint32_t other = siblings[i];
+        if (on_path(snapshot, snapshots_[other])) {
+            snapshots_[other].ancestor = index;
+            snapshot.dependents.push_back(other);
+            siblings[i] = siblings.back();
+            siblings.pop_back();
+        } else {
+            ++i;
+        }
+    }
+    siblings.push_back(index);
+}
+
+void PrefixCacheIndex::unlink_snapshot(std::uint32_t index) {
+    Snapshot& snapshot                   = snapshots_[index];
+    std::vector<std::uint32_t>& siblings = dependents_of(snapshot.ancestor);
+    siblings.erase(std::find(siblings.begin(), siblings.end(), index));
+    for (const std::uint32_t other : snapshot.dependents) {
+        snapshots_[other].ancestor = snapshot.ancestor;
+        siblings.push_back(other);
+    }
+    snapshot.dependents.clear();
+    snapshot.ancestor = kNoId;
+}
+
+std::uint32_t PrefixCacheIndex::retained_ancestor(std::uint32_t index) const noexcept {
+    std::uint32_t current = snapshots_[index].ancestor;
+    while (current != kNoId && snapshots_[current].superseded) {
+        current = snapshots_[current].ancestor;
+    }
+    return current;
+}
+
+void PrefixCacheIndex::collect_retained_dependents(std::uint32_t index,
+                                                   std::vector<std::uint32_t>& out) const {
+    std::vector<std::uint32_t> stack(snapshots_[index].dependents);
+    while (!stack.empty()) {
+        const std::uint32_t current = stack.back();
+        stack.pop_back();
+        if (snapshots_[current].superseded) {
+            stack.insert(stack.end(), snapshots_[current].dependents.begin(),
+                         snapshots_[current].dependents.end());
+        } else {
+            out.push_back(current);
+        }
+    }
+}
+
+void PrefixCacheIndex::adjust_retained(std::uint32_t anchor, int delta) {
+    for (std::uint32_t current = anchor; current != kNoId; current = nodes_[current].parent) {
+        Node& node = nodes_[current];
+        if (delta < 0 && node.retained_below == 0) {
+            invariant("prefix cache retained snapshot count underflow");
+        }
+        node.retained_below = delta < 0 ? node.retained_below - 1U : node.retained_below + 1U;
+    }
+}
+
+void PrefixCacheIndex::revalue_around(std::uint32_t index,
+                                      std::span<const std::uint32_t> dependents) {
+    update_priority(index);
+    for (const std::uint32_t other : dependents) { update_priority(other); }
+    const std::uint32_t ancestor = retained_ancestor(index);
+    if (ancestor != kNoId) { update_priority(ancestor); }
+}
+
+std::uint32_t PrefixCacheIndex::pick_victim(bool host_resident, std::uint32_t protect) const {
+    std::uint32_t superseded = kNoId;
+    std::uint32_t retained   = kNoId;
+    for (std::uint32_t i = 0; i < snapshots_.size(); ++i) {
+        const Snapshot& snapshot = snapshots_[i];
+        if (!snapshot.occupied || i == protect || snapshot.pins != 0 ||
+            (host_resident ? snapshot.host != CopyState::Resident
+                           : snapshot.host == CopyState::Filling)) {
+            continue;
+        }
+        if (snapshot.superseded) {
+            if (superseded == kNoId ||
+                snapshot.superseded_tick < snapshots_[superseded].superseded_tick) {
+                superseded = i;
+            }
+        } else if (retained == kNoId || snapshot.priority < snapshots_[retained].priority ||
+                   (snapshot.priority == snapshots_[retained].priority &&
+                    snapshot.last_hit_tick < snapshots_[retained].last_hit_tick)) {
+            retained = i;
+        }
+    }
+    return superseded != kNoId ? superseded : retained;
 }
 
 void PrefixCacheIndex::remove_snapshot(std::uint32_t index) {
     Snapshot& snapshot = snapshots_[index];
     if (!snapshot.occupied) { invariant("prefix cache removes a free snapshot"); }
     if (snapshot.pins != 0) { invariant("prefix cache removes a pinned snapshot"); }
+    // Snapshots valued against this one are revalued once it is gone.
+    std::vector<std::uint32_t> dependents;
+    std::uint32_t retained_above = kNoId;
+    if (!snapshot.superseded) {
+        collect_retained_dependents(index, dependents);
+        retained_above = retained_ancestor(index);
+        adjust_retained(snapshot.anchor, -1);
+    }
+    unlink_snapshot(index);
+    snapshot.superseded      = false;
+    snapshot.superseded_tick = 0;
     backend_->release_snapshot(ref_of_snapshot(index));
     std::vector<std::uint32_t>& anchored =
         snapshot.anchor != kNoId ? nodes_[snapshot.anchor].snapshots : root_snapshots_;
@@ -922,6 +1116,8 @@ void PrefixCacheIndex::remove_snapshot(std::uint32_t index) {
     --snapshot_count_;
     if (anchor != kNoId) { adjust_live(anchor, -1); }
     if (release_tail) { backend_->release_device_block(tail_device); }
+    for (const std::uint32_t other : dependents) { update_priority(other); }
+    if (retained_above != kNoId) { update_priority(retained_above); }
 }
 
 void PrefixCacheIndex::release_node_storage(std::uint32_t index) {
@@ -968,9 +1164,10 @@ void PrefixCacheIndex::remove_subtree(std::uint32_t root) {
             }
         }
         node.children.clear();
-        node.occupied   = false;
-        node.parent     = kNoId;
-        node.live_below = 0;
+        node.occupied       = false;
+        node.parent         = kNoId;
+        node.live_below     = 0;
+        node.retained_below = 0;
         ++node.generation;
         free_nodes_.push_back(index);
         --node_count_;
@@ -1007,6 +1204,7 @@ SnapshotView PrefixCacheIndex::snapshot(SnapshotRef ref) const {
     view.pins             = snapshot.pins;
     view.kind             = snapshot.kind;
     view.hits             = snapshot.hits;
+    view.superseded       = snapshot.superseded;
     view.tail             = std::span<const TokenId>(snapshot.tail.data(), snapshot.tail_len);
     return view;
 }
@@ -1030,7 +1228,10 @@ void PrefixCacheIndex::collect_persistable(std::vector<NodeRef>& nodes,
     std::vector<bool> keep(nodes_.size(), false);
     for (std::uint32_t index = 0; index < snapshots_.size(); ++index) {
         const Snapshot& snapshot = snapshots_[index];
-        if (!snapshot.occupied || snapshot.host != CopyState::Resident) { continue; }
+        // Superseded snapshots are the first to go and rarely resumed from: not worth saving.
+        if (!snapshot.occupied || snapshot.host != CopyState::Resident || snapshot.superseded) {
+            continue;
+        }
         bool backed = true;
         for (std::uint32_t current = snapshot.anchor; current != kNoId && backed;
              current               = nodes_[current].parent) {
@@ -1087,11 +1288,12 @@ std::optional<RestoredBlock> PrefixCacheIndex::restore_host_block(NodeRef parent
     std::copy(tokens.begin(), tokens.end(), node.tokens.begin());
     node.children.clear();
     node.snapshots.clear();
-    node.device_id  = kNoId;
-    node.host_slab  = slab.front();
-    node.host       = CopyState::Resident;
-    node.pins       = 0;
-    node.live_below = 0;
+    node.device_id      = kNoId;
+    node.host_slab      = slab.front();
+    node.host           = CopyState::Resident;
+    node.pins           = 0;
+    node.live_below     = 0;
+    node.retained_below = 0;
     if (parent.valid()) {
         nodes_[parent_index].children.push_back(index);
     } else {
@@ -1149,10 +1351,19 @@ std::optional<SnapshotRef> PrefixCacheIndex::restore_host_snapshot(NodeRef ancho
     snapshot.kind             = kind;
     snapshot.hits             = hits;
     snapshot.last_hit_tick    = ++tick_;
+    snapshot.priority_base    = inflation_;
+    snapshot.superseded       = false;
+    snapshot.superseded_tick  = 0;
     anchored.push_back(index);
     ++snapshot_count_;
-    if (anchor.valid()) { adjust_live(anchor_index, +1); }
-    update_priority(index);
+    if (anchor.valid()) {
+        adjust_live(anchor_index, +1);
+        adjust_retained(anchor_index, +1);
+    }
+    link_snapshot(index);
+    std::vector<std::uint32_t> dependents;
+    collect_retained_dependents(index, dependents);
+    revalue_around(index, dependents);
     refresh_tail(index);
     return ref_of_snapshot(index);
 }
@@ -1222,14 +1433,34 @@ void PrefixCacheIndex::check_invariants() const {
         invariant("free device slot count mismatch");
     }
     std::uint32_t occupied_snapshots = 0;
+    std::vector<std::uint32_t> retained(nodes_.size(), 0);
+    std::uint32_t top_level = 0;
     for (std::uint32_t i = 0; i < snapshots_.size(); ++i) {
         const Snapshot& snapshot = snapshots_[i];
         if (!snapshot.occupied) { continue; }
         ++occupied_snapshots;
         if (!snapshot_valid(snapshot)) { invariant("indexed snapshot is not valid"); }
+        if (snapshot.superseded && snapshot.kind == SnapshotKind::Boundary) {
+            invariant("a boundary snapshot is superseded");
+        }
         for (std::uint32_t current = snapshot.anchor; current != kNoId;
              current               = nodes_[current].parent) {
             ++live[current];
+            if (!snapshot.superseded) { ++retained[current]; }
+        }
+        if (snapshot.ancestor != find_ancestor(i)) {
+            invariant("snapshot ancestor is not the nearest snapshot above it");
+        }
+        const std::vector<std::uint32_t>& siblings =
+            snapshot.ancestor == kNoId ? top_snapshots_ : snapshots_[snapshot.ancestor].dependents;
+        if (std::count(siblings.begin(), siblings.end(), i) != 1) {
+            invariant("snapshot is not listed once under its ancestor");
+        }
+        if (snapshot.ancestor == kNoId) { ++top_level; }
+        for (const std::uint32_t other : snapshot.dependents) {
+            if (!snapshots_[other].occupied || snapshots_[other].ancestor != i) {
+                invariant("snapshot dependent does not name it as its ancestor");
+            }
         }
         for (const std::uint32_t slab : snapshot.host_slabs) {
             if (slab >= config_.host_slabs) { invariant("snapshot slab out of range"); }
@@ -1242,9 +1473,15 @@ void PrefixCacheIndex::check_invariants() const {
         }
     }
     if (occupied_snapshots != snapshot_count_) { invariant("snapshot count mismatch"); }
+    if (top_level != top_snapshots_.size()) {
+        invariant("top-level snapshot list is inconsistent");
+    }
     for (std::uint32_t i = 0; i < nodes_.size(); ++i) {
         if (nodes_[i].occupied && nodes_[i].live_below != live[i]) {
             invariant("live snapshot count is inconsistent");
+        }
+        if (nodes_[i].occupied && nodes_[i].retained_below != retained[i]) {
+            invariant("retained snapshot count is inconsistent");
         }
     }
     for (const std::uint32_t slab : free_slabs_) { ++slab_uses[slab]; }

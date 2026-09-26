@@ -401,18 +401,24 @@ bool ProgramImpl::hybrid_await_sibling(const PreparedPromptData& prompt, std::ui
         }
     }
     if (!best) { return false; }
-    if (best->plan_tap) {
-        HybridLaneState& state = hybrid_lanes_[best->lane];
-        const auto first       = state.taps.begin() + static_cast<std::ptrdiff_t>(state.next_tap);
-        const auto at = std::upper_bound(first, state.taps.end(), best->target,
-                                         [](std::uint32_t position, const pc::PlannedTap& planned) {
-                                             return position < planned.position;
-                                         });
-        if (at == first || std::prev(at)->position != best->target ||
-            std::prev(at)->placement != pc::TapPlacement::Exact) {
-            state.taps.insert(
-                at, pc::PlannedTap{.position = best->target, .placement = pc::TapPlacement::Exact});
-        }
+    // The snapshot the waiting request resumes from is where two conversations diverge: it is
+    // published as a boundary, so neither lineage supersedes it.
+    HybridLaneState& state = hybrid_lanes_[best->lane];
+    const auto first       = state.taps.begin() + static_cast<std::ptrdiff_t>(state.next_tap);
+    const auto at = std::upper_bound(first, state.taps.end(), best->target,
+                                     [](std::uint32_t position, const pc::PlannedTap& planned) {
+                                         return position < planned.position;
+                                     });
+    if (at != first && std::prev(at)->position == best->target &&
+        std::prev(at)->placement == pc::TapPlacement::Exact) {
+        std::prev(at)->boundary = true;
+    } else if (best->plan_tap) {
+        state.taps.insert(at, pc::PlannedTap{.position  = best->target,
+                                             .placement = pc::TapPlacement::Exact,
+                                             .boundary  = true});
+    }
+    for (HybridPendingTap& tap : state.pending) {
+        if (tap.frontier == best->target) { tap.boundary = true; }
     }
     return true;
 }
@@ -934,6 +940,8 @@ StartResult ProgramImpl::hybrid_activate(HybridMaterializationTransaction& trans
         lane_state.path_hash              = path_hash;
         lane_state.trailing_extra         = trailing;
         lane_state.deepest_snapshot       = reuse;
+        lane_state.resume_snapshot        = reuse != 0 ? quote.snapshot : pc::SnapshotRef{};
+        lane_state.resume_frontier        = reuse;
         lane_state.last_capture           = reuse;
         lane_state.restore_ticket         = transaction.restore_ticket;
         lane_state.restore_layers_pending = transaction.restore_ticket != 0;
@@ -1083,7 +1091,8 @@ void ProgramImpl::hybrid_publish_pending(SequenceState& sequence, bool finishing
             sequence.ledger.data() + static_cast<std::size_t>(full) * kBlock, tail);
         // publish_snapshot consumes the staging slot and the tail id on every outcome.
         const pc::PublishResult published = index.publish_snapshot(
-            anchor, tap.frontier, tail_tokens, tail_id, tap.slot, pc::SnapshotKind::Tap);
+            anchor, tap.frontier, tail_tokens, tail_id, tap.slot,
+            tap.boundary ? pc::SnapshotKind::Boundary : pc::SnapshotKind::Tap);
         if (!published.created) {
             (void)state_store->release(tap.image);
             ++counters.taps_skipped;
@@ -1097,7 +1106,8 @@ void ProgramImpl::hybrid_publish_pending(SequenceState& sequence, bool finishing
     }
 }
 
-void ProgramImpl::hybrid_capture_tap(SequenceState& sequence, std::uint32_t frontier) {
+void ProgramImpl::hybrid_capture_tap(SequenceState& sequence, std::uint32_t frontier,
+                                     bool boundary) {
     HybridLaneState& lane         = hybrid_lanes_[sequence.lane];
     pc::PrefixCacheIndex& index   = hybrid_->index();
     HybridCacheCounters& counters = hybrid_->counters();
@@ -1120,8 +1130,8 @@ void ProgramImpl::hybrid_capture_tap(SequenceState& sequence, std::uint32_t fron
         state_images->copy_slot(state_store->physical_slot(sequence.state.write),
                                 state_store->physical_slot(*image), device.stream);
         state_store->publish_copied_checkpoint(*image);
-        lane.pending.push_back(
-            HybridPendingTap{.frontier = frontier, .image = *image, .slot = *slot});
+        lane.pending.push_back(HybridPendingTap{
+            .frontier = frontier, .image = *image, .slot = *slot, .boundary = boundary});
     } catch (...) {
         (void)state_store->release(*image);
         index.release_device_slot(*slot);
@@ -1140,11 +1150,13 @@ void ProgramImpl::hybrid_after_prefill_chunk(SequenceState& sequence, std::uint3
     const bool final_chunk_next = prompt_tokens - cursor <= prefill_chunk;
     bool exact                  = false;
     bool flexible               = false;
+    bool boundary               = false;
     while (lane.next_tap < lane.taps.size()) {
         const pc::PlannedTap& tap = lane.taps[lane.next_tap];
         if (tap.placement == pc::TapPlacement::Exact) {
             if (tap.position > cursor) { break; }
-            exact = exact || tap.position == cursor;
+            exact    = exact || tap.position == cursor;
+            boundary = boundary || (tap.position == cursor && tap.boundary);
         } else if (tap.position > cursor && !final_chunk_next) {
             break;
         } else {
@@ -1158,7 +1170,17 @@ void ProgramImpl::hybrid_after_prefill_chunk(SequenceState& sequence, std::uint3
         ++hybrid_->counters().taps_skipped;
         return;
     }
-    hybrid_capture_tap(sequence, cursor);
+    hybrid_capture_tap(sequence, cursor, boundary);
+}
+
+void ProgramImpl::hybrid_supersede_resume(HybridLaneState& lane) {
+    pc::PrefixCacheIndex& index = hybrid_->index();
+    if (!lane.resume_snapshot.valid() || lane.deepest_snapshot <= lane.resume_frontier ||
+        !index.valid(lane.resume_snapshot)) {
+        return;
+    }
+    index.supersede(lane.resume_snapshot);
+    lane.resume_snapshot = {};
 }
 
 std::span<const cudaEvent_t> ProgramImpl::hybrid_take_restore_layers(std::uint32_t lane) {
@@ -1257,11 +1279,17 @@ bool ProgramImpl::hybrid_finish_lane(SequenceState& sequence, RequestControl& re
                         anchor_blocks == 0 ? pc::NodeRef{} : lane_state.path[anchor_blocks - 1U];
                     const pc::PublishResult published = index.publish_snapshot(
                         anchor, frontier, tail_tokens, tail_id, *slot, pc::SnapshotKind::Endpoint);
+                    if (published.snapshot.valid()) {
+                        lane_state.deepest_snapshot =
+                            std::max(lane_state.deepest_snapshot, frontier);
+                    }
                     if (published.created) {
                         hybrid_->attach_image(published.snapshot, image);
                         image_moved    = true;
                         sequence.state = {};
                         ++hybrid_->counters().endpoints_created;
+                        // Superseded first, so the Host write below can take its slabs.
+                        hybrid_supersede_resume(lane_state);
                         (void)hybrid_->start_snapshot_host_write(published.snapshot, device.stream,
                                                                  device.transfer_stream);
                     } else {
@@ -1269,6 +1297,7 @@ bool ProgramImpl::hybrid_finish_lane(SequenceState& sequence, RequestControl& re
                     }
                 }
             }
+            hybrid_supersede_resume(lane_state);
         }
     } catch (...) {
         // Terminal publication is optional; a failure keeps whatever was published and releases

@@ -38,7 +38,7 @@ every other value is derived from the rest of the configuration (§14.2).
 
 | area | state |
 |---|---|
-| §5 index, §9 eviction (device LRU, host GDSF, dead KV), §7.1 tap planner | done; host-only unit tests (`ninfer_prefix_cache_index_test`) |
+| §5 index, §9 eviction (device LRU, host superseded-first then GDSF, dead KV), §7.1 tap planner | done; host-only unit tests (`ninfer_prefix_cache_index_test`) |
 | §5.4 automatic Device sizing | done: in Hybrid mode the Main pool is not clamped to `C·L`, and `ninfer-serve` defaults `--kv-capacity` to `auto`, so free VRAM becomes Device block cache |
 | §5.4 unified Host slab pool | done: KV blocks, snapshot images (split over slabs) and snapshot tails share one pinned pool; GDSF and the dead-KV sweep decide the split at run time |
 | §6 admission as the Engine's materialization transaction | done: staging reserves every Device page and the state slot, Host restores run on a dedicated restore stream, and activation forks the lane at once; its Device work queues behind the copies it reads, layer by layer (§6.4, §6.5, §12.1) |
@@ -376,7 +376,8 @@ struct Snapshot {
     SlabList host_slabs;                // ceil(image_bytes / slab_bytes) slabs, or empty
     Residency device_state, host_state;
     uint32_t restore_pins;
-    SnapshotKind kind;                  // Tap | Endpoint | OutputBoundary (telemetry only)
+    SnapshotKind kind;                  // Tap | Endpoint | OutputBoundary | Boundary (§9.3)
+    bool superseded;                    // §9.3
     // Host eviction (GDSF)
     double   gdsf_h; uint32_t freq;
     uint64_t last_hit_tick;
@@ -432,9 +433,10 @@ directory, or `--host-cache-mib 0`, so an unusable location fails before any cac
   close, and an unfinished save leaves the previous file in place).
   `Program::shutdown_cleanup` releases every lane first, so requests still in flight write their
   committed blocks through, and saves before the cleanup drops the cache. Every Host write
-  lands, then every Host-resident snapshot whose anchor path is Host-resident, and exactly those
-  paths, are written parents first with their slab bytes (a temporary file renamed into place).
-  Dead KV and Device-only content are not saved. A worker that ended on a fatal error saves
+  lands, then every retained (not superseded, §9.3) Host-resident snapshot whose anchor path is
+  Host-resident, and exactly those paths, are written parents first with their slab bytes (a
+  temporary file renamed into place). Dead KV, superseded snapshots and Device-only content are
+  not saved. A worker that ended on a fatal error saves
   nothing, so the previous file stays in place. A worker recovery (OOM or recoverable logic
   error) empties the cache like every cleanup, so a later save holds only what was cached after it.
 - **Load**, at Engine construction before any request: the file is used only when its fingerprint
@@ -615,6 +617,8 @@ Candidates, in priority order:
   the prompt tail in chat traffic, leaving one split per request.
 - Only markers with explicit evidence (a client-named breakpoint) are priority 1. Protocol-automatic
   markers (OpenAI default caching, Anthropic automatic `cache_control`) are structural boundaries.
+- Explicit and structural taps are published as `Boundary` snapshots: conversations share them,
+  so a lineage moving past them never supersedes them (§9.3).
 - A request that resumed from an endpoint snapshot proves its client echoes generated turns token
   for token (agent loops, preserved reasoning), so its own endpoint serves the next turn and the
   generation opener is not tapped. Measured on a tool-calling agent trace (27B NVFP4, INT8 KV,
@@ -840,37 +844,62 @@ Two lists are kept, *backed* and *unbacked*, and backed entries are always consu
 
 ### 9.2 Device snapshot slots
 
-Slots hold at most `D` images. A slot is reusable when its snapshot is host-backed; the victim is
-the least recently hit such slot. A slot whose snapshot is not backed is evicted only when no
-backed slot exists and a tap or endpoint needs it. The snapshot then loses its image and is
-deleted, unless it is host-backed.
+Slots hold at most `D` images. A slot owned by a superseded snapshot (§9.3) is taken first, oldest
+supersession first; the snapshot keeps its host copy or, without one, is deleted. Otherwise a slot
+is reusable when its snapshot is host-backed; the victim is the least recently hit such slot. A
+slot whose snapshot is not backed is evicted only when no backed slot exists and a tap or endpoint
+needs it. The snapshot then loses its image and is deleted, unless it is host-backed.
 
-### 9.3 Host (GDSF over snapshots, dead-KV first)
+### 9.3 Host (superseded snapshots first, then GDSF; dead-KV first)
+
+**Supersession.** In a conversation the next request resumes from the newest snapshot of its
+lineage, not from the one the current request resumed from. When a sequence that resumed from
+snapshot `a` publishes a deeper snapshot on the same path (its endpoint or a tap), `a` becomes
+*superseded*: only a request diverging before the newer snapshot (a retry, an edit) can still use
+it. A hit on a superseded snapshot retains it again, until that lineage moves on. A `Boundary`
+snapshot (a tap at a client breakpoint or structural boundary, or at the divergence of coalesced
+requests, §12.2) is shared by conversations by design and is never superseded.
 
 Allocation of `k` slabs:
 
 1. **Dead KV sweep**: pop host-resident nodes with `live_snapshots_below == 0`,
    `active_refs == 0` and no pins, leaves first. These can never produce a hit.
-2. Otherwise, evict the snapshot with minimum `H`, then repeat step 1 (its exclusive path has just
-   become dead). Update `L := H(victim)`. A victim still complete on the Device (image in a device
-   slot and tail resident) only gives up its host copy and stays restorable.
+2. Otherwise evict the oldest superseded snapshot entirely (both copies; `L` is unchanged), then
+   repeat step 1.
+3. Otherwise evict the retained snapshot with minimum `H`, then repeat step 1 (its exclusive path
+   has just become dead). Update `L := H(victim)`. A victim still complete on the Device (image in
+   a device slot and tail resident) only gives up its host copy and stays restorable.
 
 ```text
-H(s)  = L + F(s) · C(s) / Z(s)
-C(s)  = prefill_seconds(base=F_a, tokens=F_s−F_a) − restore_seconds(s)   // clamp ≥ 0
-        where a = nearest valid ancestor snapshot on path(s) (or root, F_a = 0)
+H(s)  = L_s + F(s) · C(s) / Z(s)                // L_s: L when s was published or last hit
+C(s)  = prefill_seconds(base=F_a, tokens=F_s−F_a) − restore_seconds(image)   // clamp ≥ 0
+        where a = nearest retained (not superseded) snapshot above s on its path, whatever its
+        tail (or root, F_a = 0)
 Z(s)  = image_bytes + tail_bytes + exclusive_path_bytes(s)
-        exclusive_path_bytes: host bytes of nodes on path(s) whose live_snapshots_below == 1
-F(s)  = 1 + hits(s)                          // hits since publication
-H is recomputed when s is published or hit, and when a scan needs a fresh C/Z
+        exclusive_path_bytes: host bytes of the nodes on path(s) below which s is the only
+        retained snapshot
+F(s)  = 1 + hits(s)                             // hits since publication
 ```
 
+- Each snapshot records its nearest snapshot above it on its path (`ancestor`) and the snapshots
+  that record it (`dependents`); a new snapshot between them takes over the dependents below it,
+  and a removed one hands its dependents to its ancestor. `C` and `Z` are recomputed for the
+  snapshot and for those whose nearest retained ancestor or exclusive path it changes, when it is
+  published, hit, superseded, retained again or removed.
+- Valuing against the nearest *retained* ancestor makes a conversation's newest endpoint carry the
+  whole conversation-specific prefill (its superseded predecessors go first), and a shared
+  boundary its own prefix. Valuing only against aligned (`tail_len == 0`) ancestors, as before,
+  priced every tailed endpoint as a full re-prefill from the root: stale endpoints of long
+  conversations crowded out shared boundaries and fresh endpoints, which were evicted before the
+  next turn (the production agent log of 2026-09-26: 68 turns re-prefilled 758K tokens behind a
+  stuck resume point, 24 subagent turns prefilled from the root beside a cached 19.8K-token
+  shared prefix).
 - `C` uses the same calibrated model as §6.2, so eviction and admission agree about value.
 - Aging comes from `L`, so snapshots that are no longer hit fall behind new ones without timers.
-- The scan is O(snapshots × path depth) in the worst case: about 300 snapshots × 3,750 blocks
-  gives about 1 M simple steps (≈1 ms). The typical case is microseconds, because `C` and `Z` are
-  cached per snapshot and invalidated only along a changed path. Snapshot count is bounded by
-  `host_cache_bytes / image_bytes`.
+- Victim selection scans the snapshot table, O(snapshots); valuation walks at most one path per
+  affected snapshot. Snapshot count is bounded by `host_cache_bytes / image_bytes` (about 1,300
+  for a 230 GiB Host tier with 27B DFlash2 images), so the policy is independent of the tier size:
+  a small tier reaches step 2 and 3 often, a large one rarely.
 - Pinned objects (`restore_pins`, `active_refs`, in-flight fills) are never evicted.
 
 ### 9.4 Losing the last copy

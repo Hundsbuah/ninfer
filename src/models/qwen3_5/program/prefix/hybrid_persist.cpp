@@ -26,7 +26,7 @@ namespace {
 
 constexpr std::array<char, 8> kMagic  = {'N', 'I', 'N', 'F', 'H', 'P', 'C', '1'};
 constexpr std::array<char, 8> kFooter = {'N', 'I', 'N', 'F', 'E', 'N', 'D', '1'};
-constexpr std::uint32_t kVersion      = 1;
+constexpr std::uint32_t kVersion      = 2;
 constexpr std::int32_t kRootIndex     = -1;
 
 struct Geometry {
@@ -272,7 +272,11 @@ HybridPersistResult HybridPrefixCache::load(const std::filesystem::path& path,
                 throw std::runtime_error("prefix cache file snapshot is damaged");
             }
             reader.bytes(tokens.data(), static_cast<std::size_t>(tail_len) * sizeof(TokenId));
-            const auto kind           = static_cast<pc::SnapshotKind>(reader.value<std::uint8_t>());
+            const auto kind_byte = reader.value<std::uint8_t>();
+            if (kind_byte > static_cast<std::uint8_t>(pc::SnapshotKind::Boundary)) {
+                throw std::runtime_error("prefix cache file snapshot kind is damaged");
+            }
+            const auto kind           = static_cast<pc::SnapshotKind>(kind_byte);
             const auto hits           = reader.value<std::uint32_t>();
             const std::uint32_t slabs = host_layout_.image_slabs + (tail_len != 0 ? 1U : 0U);
             std::optional<pc::SnapshotRef> snapshot;

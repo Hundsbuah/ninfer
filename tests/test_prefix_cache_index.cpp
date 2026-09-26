@@ -99,6 +99,27 @@ SnapshotRef publish_tap(PrefixCacheIndex& index, NodeRef anchor) {
     return result.snapshot;
 }
 
+// Publishes a snapshot at `frontier` of `tokens`, whose full blocks are `path`; a frontier inside
+// a block takes its tail from that block's tokens.
+SnapshotRef publish_at(PrefixCacheIndex& index, RecordingBackend& backend,
+                       const std::vector<NodeRef>& path, const std::vector<TokenId>& tokens,
+                       std::uint32_t frontier, SnapshotKind kind) {
+    const std::uint32_t full = frontier / kBlockTokens;
+    const std::uint32_t tail = frontier % kBlockTokens;
+    const auto slot          = index.acquire_device_slot(false);
+    require(slot.has_value(), "no device slot for a snapshot");
+    std::optional<std::uint32_t> tail_id;
+    if (tail != 0) { tail_id = backend.allocate(); }
+    const PublishResult result = index.publish_snapshot(
+        full == 0 ? NodeRef{} : path[full - 1], frontier,
+        std::span<const TokenId>(tokens.data() + static_cast<std::size_t>(full) * kBlockTokens,
+                                 tail),
+        tail_id, *slot, kind);
+    require(result.created, "snapshot not created");
+    index.check_invariants();
+    return result.snapshot;
+}
+
 void backup_node(PrefixCacheIndex& index, NodeRef node) {
     index.pin_node(node);
     const auto slab = index.begin_host_fill(node);
@@ -571,6 +592,101 @@ void test_device_slots() {
     index.check_invariants();
 }
 
+void test_supersession() {
+    RecordingBackend backend;
+    // 20 slabs: a tail-less image takes 4, an image with a tail 5.
+    PrefixCacheIndex index(small_config(20, 8), backend);
+    const auto tokens = make_tokens(64 * 12 + 1, 30);
+    const auto path   = insert_sequence(index, backend, tokens);
+    const SnapshotRef shared =
+        publish_at(index, backend, path, tokens, 64 * 2, SnapshotKind::Boundary);
+    const SnapshotRef first =
+        publish_at(index, backend, path, tokens, 64 * 3 + 10, SnapshotKind::Endpoint);
+    const SnapshotRef second =
+        publish_at(index, backend, path, tokens, 64 * 7 + 20, SnapshotKind::Endpoint);
+    index.supersede(shared);
+    require(!index.snapshot(shared).superseded, "a boundary snapshot must never be superseded");
+    index.supersede(first);
+    require(index.snapshot(first).superseded, "the resumed snapshot must be superseded");
+    index.note_hit(first);
+    require(!index.snapshot(first).superseded, "a hit must retain a superseded snapshot again");
+    // Hits make `first` the most valuable snapshot by GDSF; superseding it must still put it first.
+    for (int hit = 0; hit < 4; ++hit) { index.note_hit(first); }
+    index.supersede(first);
+    index.check_invariants();
+
+    // A second branch sharing five blocks hangs below `first`, whose tail lies in a shared block.
+    std::vector<TokenId> other(tokens.begin(), tokens.begin() + 64 * 5);
+    const auto suffix = make_tokens(64 * 4 + 1, 31);
+    other.insert(other.end(), suffix.begin(), suffix.end());
+    const auto other_path = insert_sequence(index, backend, other);
+    const SnapshotRef branch =
+        publish_at(index, backend, other_path, other, 64 * 6 + 3, SnapshotKind::Endpoint);
+
+    for (const SnapshotRef snapshot : {shared, first, second, branch}) {
+        backup_snapshot(index, snapshot);
+    }
+    require(index.stats().host_free_slabs == 1, "the Host tier must be nearly full");
+    const SnapshotRef tip = publish_at(index, backend, path, tokens, 64 * 11, SnapshotKind::Tap);
+    backup_snapshot(index, tip);
+    require(!index.valid(first), "the superseded snapshot must be evicted first, entirely");
+    require(index.stats().superseded_evictions == 1 && index.stats().host_snapshot_evictions == 1,
+            "exactly one superseded eviction");
+    require(index.valid(shared) && index.valid(second) && index.valid(branch) && index.valid(tip),
+            "retained snapshots must survive");
+    index.release_path(path);
+    index.release_path(other_path);
+    index.check_invariants();
+}
+
+// The production failure: a conversation resuming turn after turn under Host pressure, next to a
+// deep stale conversation. Each turn resumes from the previous turn's endpoint and publishes a
+// deeper one; the new endpoint must always survive to serve the next turn.
+void test_lineage_under_pressure() {
+    RecordingBackend backend;
+    PrefixCacheIndex index(small_config(16, 4), backend);
+    const auto stale_tokens = make_tokens(64 * 40 + 1, 40);
+    const auto stale_path   = insert_sequence(index, backend, stale_tokens);
+    const SnapshotRef stale =
+        publish_at(index, backend, stale_path, stale_tokens, 64 * 40 - 7, SnapshotKind::Endpoint);
+    backup_snapshot(index, stale);
+    index.release_path(stale_path);
+
+    const auto tokens = make_tokens(64 * 30 + 1, 41);
+    const auto path   = insert_sequence(index, backend, tokens);
+    // An aligned tap early in the conversation (the Legacy valuation anchored every later
+    // endpoint to it and kept evicting them).
+    SnapshotRef resume = publish_at(index, backend, path, tokens, 64 * 4, SnapshotKind::Tap);
+    backup_snapshot(index, resume);
+    for (std::uint32_t turn = 1; turn <= 8; ++turn) {
+        const std::uint32_t frontier = 64 * 4 + turn * 200 + 13;
+        index.note_hit(resume);
+        const SnapshotRef tip =
+            publish_at(index, backend, path, tokens, frontier, SnapshotKind::Endpoint);
+        index.supersede(resume);
+        backup_snapshot(index, tip);
+        // Other traffic writes to the Host tier before this conversation's next turn arrives (a
+        // short new conversation here): that allocation used to evict the newest endpoint.
+        const auto noise_tokens = make_tokens(64 * 2 + 1, 100 + turn);
+        const auto noise_path   = insert_sequence(index, backend, noise_tokens);
+        backup_snapshot(index, publish_at(index, backend, noise_path, noise_tokens, 64 * 2 - 5,
+                                          SnapshotKind::Endpoint));
+        index.release_path(noise_path);
+        require(index.valid(tip) && index.snapshot(tip).host == CopyState::Resident,
+                "the newest endpoint must keep its Host copy");
+        const std::vector<TokenId> next(tokens.begin(), tokens.begin() + frontier + 50);
+        const auto hashes = block_lookup_hashes(next, {});
+        const MatchResult match =
+            index.match(next, hashes, {}, static_cast<std::uint32_t>(next.size()));
+        require(!match.candidates.empty() && match.candidates.front().snapshot == tip,
+                "the next turn must resume from the newest endpoint");
+        resume = tip;
+    }
+    require(index.stats().superseded_evictions >= 6, "superseded endpoints must make the room");
+    index.release_path(path);
+    index.check_invariants();
+}
+
 void test_image_only_host_tier() {
     RecordingBackend backend;
     PrefixIndexConfig config = small_config(8, 1);
@@ -624,6 +740,7 @@ void test_random_stress() {
             prompts.push_back(std::move(tokens));
         }
         std::vector<std::vector<NodeRef>> held;
+        std::vector<SnapshotRef> published_snapshots;
         for (int step = 0; step < 300; ++step) {
             const int op = static_cast<int>(rng() % 6U);
             if (op <= 1 && held.size() < 3) {
@@ -670,7 +787,11 @@ void test_random_stress() {
                         if (const auto slot = index.acquire_device_slot(rng() % 2U)) {
                             const PublishResult published = index.publish_snapshot(
                                 result.node, (index.node(result.node).depth + 1U) * kBlockTokens,
-                                {}, std::nullopt, *slot, SnapshotKind::Tap);
+                                {}, std::nullopt, *slot,
+                                rng() % 4U == 0 ? SnapshotKind::Boundary : SnapshotKind::Tap);
+                            if (published.created) {
+                                published_snapshots.push_back(published.snapshot);
+                            }
                             if (published.created && rng() % 2U) {
                                 index.pin_snapshot(published.snapshot);
                                 if (index.begin_snapshot_host_fill(published.snapshot)) {
@@ -687,6 +808,16 @@ void test_random_stress() {
                 const std::size_t which = rng() % held.size();
                 index.release_path(held[which]);
                 held.erase(held.begin() + static_cast<std::ptrdiff_t>(which));
+            } else if (op == 4 && !published_snapshots.empty()) {
+                const SnapshotRef snapshot =
+                    published_snapshots[rng() % published_snapshots.size()];
+                if (index.valid(snapshot)) {
+                    if (rng() % 2U) {
+                        index.supersede(snapshot);
+                    } else {
+                        index.note_hit(snapshot);
+                    }
+                }
             } else {
                 (void)index.evict_device_blocks(1 + rng() % 8U);
             }
@@ -739,6 +870,9 @@ void test_tap_planner() {
             "the generation opener must be tapped exactly");
     require(find(taps, 100) && find(taps, 100)->placement == TapPlacement::Exact,
             "a structural hint must be tapped exactly");
+    require(find(taps, 100)->boundary && find(taps, 12345)->boundary &&
+                !find(taps, 30010)->boundary,
+            "structural and explicit taps are boundaries, the generation opener is not");
     require(!find(taps, 30019),
             "the prompt tail next to the generation opener covers nothing and must be dropped");
     // n - 8192 = 21828: the boundary 28 tokens below is within the gap, so the ladder snaps.
@@ -815,6 +949,8 @@ int main() {
         test_backed_before_unbacked();
         test_host_dead_and_gdsf();
         test_device_slots();
+        test_supersession();
+        test_lineage_under_pressure();
         test_host_only_reattach();
         test_tail_device_fill();
         test_persistence_roundtrip();

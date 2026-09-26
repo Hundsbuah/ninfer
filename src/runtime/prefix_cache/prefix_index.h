@@ -56,6 +56,10 @@ enum class SnapshotKind : std::uint8_t {
     Tap,
     Endpoint,
     OutputBoundary,
+    // A tap at a boundary that later prompts share across conversations: a client-named
+    // breakpoint, the end of the tools or leading System/Developer block, or the divergence of
+    // concurrent requests. A lineage continuing past it does not supersede it.
+    Boundary,
 };
 
 struct PrefixIndexConfig {
@@ -148,6 +152,7 @@ struct SnapshotView {
     std::uint32_t pins = 0;
     SnapshotKind kind  = SnapshotKind::Tap;
     std::uint32_t hits = 0;
+    bool superseded    = false;
     std::span<const TokenId> tail;
 };
 
@@ -175,6 +180,7 @@ struct PrefixIndexStats {
     std::uint64_t unbacked_node_losses    = 0;
     std::uint64_t host_dead_reclaims      = 0;
     std::uint64_t host_snapshot_evictions = 0;
+    std::uint64_t superseded_evictions    = 0; // of host_snapshot_evictions
     std::uint64_t device_slot_evictions   = 0;
     std::uint64_t snapshot_hits           = 0;
     double gdsf_inflation                 = 0.0;
@@ -202,8 +208,15 @@ public:
                                     std::uint32_t prompt_tokens) const;
     [[nodiscard]] AdmissionChoice choose(const MatchResult& match,
                                          std::uint32_t prompt_tokens) const;
-    // Records a hit on the snapshot selected for an admission.
+    // Records a hit on the snapshot selected for an admission. A hit on a superseded snapshot
+    // shows it still serves requests: it is retained again until its new lineage moves on.
     void note_hit(SnapshotRef snapshot);
+    // A lineage that resumed from `snapshot` has published a deeper snapshot on the same path, so
+    // its next request resumes from that one: `snapshot` now serves only requests that diverge
+    // before it. Superseded snapshots are evicted before every retained one, oldest supersession
+    // first, and retained snapshots are valued against their nearest retained ancestor. A
+    // Boundary snapshot is never superseded.
+    void supersede(SnapshotRef snapshot);
 
     // ---- pins -----------------------------------------------------------------------------
     // `path` is a root path (path[i] is the parent of path[i+1], path[0] a root child).
@@ -320,9 +333,11 @@ private:
         CopyState host           = CopyState::Absent;
         std::uint32_t pins       = 0;
         std::uint32_t live_below = 0;
-        std::uint32_t dead_prev  = kNoId;
-        std::uint32_t dead_next  = kNoId;
-        bool in_dead             = false;
+        // Retained (not superseded) snapshots anchored at or below this node.
+        std::uint32_t retained_below = 0;
+        std::uint32_t dead_prev      = kNoId;
+        std::uint32_t dead_next      = kNoId;
+        bool in_dead                 = false;
     };
 
     struct Snapshot {
@@ -336,12 +351,19 @@ private:
         CopyState tail_device_copy = CopyState::Absent;
         std::uint32_t device_slot  = kNoId;
         std::vector<std::uint32_t> host_slabs;
-        CopyState host              = CopyState::Absent;
-        std::uint32_t pins          = 0;
-        SnapshotKind kind           = SnapshotKind::Tap;
-        std::uint32_t hits          = 0;
-        double priority             = 0.0; // GDSF H
-        std::uint64_t last_hit_tick = 0;
+        CopyState host                = CopyState::Absent;
+        std::uint32_t pins            = 0;
+        SnapshotKind kind             = SnapshotKind::Tap;
+        std::uint32_t hits            = 0;
+        double priority               = 0.0; // GDSF H = priority_base + F * C / Z
+        double priority_base          = 0.0; // GDSF inflation at the last publication or hit
+        std::uint64_t last_hit_tick   = 0;
+        bool superseded               = false;
+        std::uint64_t superseded_tick = 0;
+        // Nearest snapshot above this one on its path (kNoId: none), whatever its state, and the
+        // snapshots whose nearest one this is.
+        std::uint32_t ancestor = kNoId;
+        std::vector<std::uint32_t> dependents;
     };
 
     enum class SlotState : std::uint8_t { Free, Staging, Owned };
@@ -390,6 +412,21 @@ private:
     void free_slab(std::uint32_t slab);
 
     void remove_snapshot(std::uint32_t snapshot);
+    // Snapshot ancestry: `above` lies on `below`'s path at a smaller frontier.
+    [[nodiscard]] bool on_path(const Snapshot& above, const Snapshot& below) const noexcept;
+    [[nodiscard]] std::uint32_t find_ancestor(std::uint32_t snapshot) const noexcept;
+    void link_snapshot(std::uint32_t snapshot);
+    void unlink_snapshot(std::uint32_t snapshot);
+    [[nodiscard]] std::vector<std::uint32_t>& dependents_of(std::uint32_t snapshot) noexcept;
+    [[nodiscard]] std::uint32_t retained_ancestor(std::uint32_t snapshot) const noexcept;
+    // Retained snapshots whose nearest retained ancestor is `snapshot` (through superseded ones).
+    void collect_retained_dependents(std::uint32_t snapshot, std::vector<std::uint32_t>& out) const;
+    void adjust_retained(std::uint32_t anchor, int delta);
+    // Revalues the snapshots whose value depends on `snapshot` being retained.
+    void revalue_around(std::uint32_t snapshot, std::span<const std::uint32_t> dependents);
+    // Next snapshot to give up its Host slabs (host_only) or its index entry: the oldest
+    // superseded one, otherwise the GDSF minimum. kNoId when every candidate is protected.
+    [[nodiscard]] std::uint32_t pick_victim(bool host_resident, std::uint32_t protect) const;
     void remove_subtree(std::uint32_t node);
     void release_node_storage(std::uint32_t node);
     void drop_node_device_copy(std::uint32_t node);
@@ -409,6 +446,8 @@ private:
     std::unordered_multimap<std::uint64_t, std::uint32_t> children_;
     std::vector<std::uint32_t> root_children_;
     std::vector<std::uint32_t> root_snapshots_;
+    // Snapshots with no snapshot above them.
+    std::vector<std::uint32_t> top_snapshots_;
 
     std::vector<Snapshot> snapshots_;
     std::vector<std::uint32_t> free_snapshots_;

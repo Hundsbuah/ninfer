@@ -171,6 +171,8 @@ std::vector<PlannedTap> plan_taps(std::uint32_t prompt_tokens, std::uint32_t bas
         accepted.push_back(PlannedTap{
             .position  = position,
             .placement = flexible ? TapPlacement::Flexible : TapPlacement::Exact,
+            .boundary  = candidate.priority == Priority::Explicit ||
+                         candidate.priority == Priority::Structural,
         });
     }
     std::sort(accepted.begin(), accepted.end(),
