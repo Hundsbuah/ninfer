@@ -1761,6 +1761,7 @@ private:
         projected_checkpoints.reserve(prefix_index_.size() + shared_candidates.size());
         const auto append_existing = [&](PlanningOwnerId owner, const auto& handle,
                                          const auto& checkpoint) {
+                                         const auto& checkpoint,
             const std::uint64_t rebuild  = cost_model_.prefill_ns(checkpoint.rebuild_work);
             const std::uint64_t recovery = price_checkpoint_recovery_work(
                 cost_model_, program.checkpoint_recovery_work(handle, checkpoint.ref));

@@ -116,8 +116,8 @@ std::string serve_usage_text(const char* argv0) {
            "  --host-kv-mib N            host KV cache in MiB (default 8192)\n"
            "  --max-private-continuations N          bounded private catalogs\n"
            "                                         (default 2x concurrency)\n"
-           "  --max-long-anchors-per-continuation N  long anchors per continuation\n"
-           "                                         (default 2)\n"
+           "  --max-long-anchors-per-continuation N  long anchors per continuation; the engine\n"
+           "                                         anchors the last N message boundaries (default 4)\n"
            "  --max-shared-prefixes N          bounded shared prefix catalogs\n"
            "                                    (default = max(concurrency," +
            std::to_string(kMaximumPreparedPromptCacheCandidatesPerRequest) +
