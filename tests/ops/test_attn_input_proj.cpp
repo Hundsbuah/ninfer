@@ -1,3 +1,5 @@
+#include <array>
+
 #include "core/weight.h"
 #include "ninfer/ops/attn_input_proj.h"
 #include "ninfer/ops/weight_input.h"
@@ -10,6 +12,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <optional>
 #include <iostream>
