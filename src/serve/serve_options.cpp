@@ -218,6 +218,9 @@ std::string serve_usage_text(const char* argv0) {
            "                             suffix output, keep a final call cut by the output\n"
            "                             budget and an undeclared name (strict all-or-nothing\n"
            "                             by default)\n"
+           "  --stream-tool-args         stream in-progress tool-call arguments as preview\n"
+           "                             deltas during generation (OpenAI Responses protocol\n"
+           "                             only; display-only, final state unchanged; default off)\n"
            "\n"
            "NETWORKING & RESOURCES\n"
            "  --host H                   listen address (default 127.0.0.1)\n"
@@ -566,6 +569,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.preserve_thinking = true;
         } else if (arg == "--tolerant-tool-calls") {
             options.tolerant_tool_calls = true;
+        } else if (arg == "--stream-tool-args") {
+            options.stream_tool_args = true;
         } else if (arg == "--cors") {
             options.enable_cors = true;
         } else if (arg == "--usage-chunk-choice") {

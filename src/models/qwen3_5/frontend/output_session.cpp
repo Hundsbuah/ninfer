@@ -712,6 +712,11 @@ std::vector<GeneratedToolCall> OutputSession::take_tool_calls() noexcept {
     return impl_ != nullptr ? std::move(impl_->tool_calls) : std::vector<GeneratedToolCall>{};
 }
 
+std::optional<ninfer::ToolCallPreviewSnapshot> OutputSession::tool_call_preview_snapshot() {
+    if (impl_ == nullptr) { return std::nullopt; }
+    return impl_->tool_call_output.partial_view();
+}
+
 ToolCallParseDiagnostics OutputSession::tool_call_parse_diagnostics() const noexcept {
     return impl_ != nullptr ? impl_->tool_call_parse : ToolCallParseDiagnostics{};
 }

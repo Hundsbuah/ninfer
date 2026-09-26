@@ -997,6 +997,399 @@ int test_claude_code_plan_and_task_create_exact_repro() {
     return failures;
 }
 
+// ---- Streaming tool-call preview (partial_view) tests, matrix P1-P12 ------------------------
+
+// The decoder's region is exactly the fed text once the first marker has been seen; every test
+// below feeds marker-first text, so `fed` tracks the region.
+struct PreviewHarness {
+    std::shared_ptr<const fi::ToolCallOutputContract> contract;
+    fi::ToolCallOutputDecoder decoder;
+    std::string fed;
+
+    explicit PreviewHarness(std::shared_ptr<const fi::ToolCallOutputContract> contract_,
+                            std::size_t max_name = 64, bool tolerant = true)
+        : contract(std::move(contract_)), decoder(contract, max_name, tolerant) {}
+
+    void feed(const std::string& text) {
+        fed += text;
+        (void)decoder.feed(text);
+    }
+
+    [[nodiscard]] std::optional<ninfer::ToolCallPreviewSnapshot> view() {
+        return decoder.partial_view();
+    }
+};
+
+bool is_prefix_of(const std::string& prefix, const std::string& text) {
+    return text.size() >= prefix.size() && text.compare(0, prefix.size(), prefix) == 0;
+}
+
+// The partial arguments of a display-only snapshot must be a JSON object prefix: closing the
+// trailing open string (when the last parameter value is still open) and the object itself
+// yields a value that a JSON parser accepts.
+bool is_json_object_prefix(const std::string& partial, bool trailing_string_open) {
+    std::string closed = partial;
+    if (trailing_string_open) { closed += '"'; }
+    closed += '}';
+    return Json::accept(closed.begin(), closed.end());
+}
+
+std::shared_ptr<const fi::ToolCallOutputContract> string_tool_contract(const char* tool,
+                                                                       const char* parameter) {
+    return output_contract_for(tool, Json{{parameter, Json{{"type", "string"}}}});
+}
+
+// The raw tool-call marker tags are split across adjacent string literals so that this source
+// never contains a complete opening marker: assistant tool-call output while editing this file
+// is itself parsed by the very markup under test.
+std::string tc_begin(std::string_view function) {
+    return "<" "tool_call>\n<" "function=" + std::string(function) + ">\n";
+}
+
+std::string tc_end() {
+    return "</" "function>\n</" "tool_call>";
+}
+
+std::string param_open(std::string_view name) {
+    return "<" "parameter=" + std::string(name) + ">\n";
+}
+
+std::string param_close() { return "</" "parameter>\n"; }
+// P1: no marker seen -> no preview, visible text untouched.
+int test_partial_view_no_marker() {
+    auto harness = PreviewHarness(string_tool_contract("write", "path"));
+    harness.feed("Just some plain prose, no markup in sight.");
+    int failures = 0;
+    failures += check(harness.fed == "Just some plain prose, no markup in sight.",
+                      "P1: marker-less text must stay visible");
+    failures += check(!harness.view().has_value(),
+                      "P1: partial_view without a marker must be nullopt");
+    return failures;
+}
+
+// P2: a call name without any parameter yields no items (BUG-8), while the gate keeps the view
+// hidden below 64 bytes and returns an empty view beyond it.
+int test_partial_view_name_only_yields_no_calls() {
+    auto harness = PreviewHarness(string_tool_contract("write", "path"));
+    int failures = 0;
+    harness.feed(tc_begin("write"));
+    failures += check(!harness.view().has_value(),
+                      "P2: name-only region below the gate must be nullopt");
+    harness.feed(std::string(80, 'j')); // junk after the name, region now >= 64 bytes
+    auto view = harness.view();
+    failures += check(view.has_value() && view->calls.empty(),
+                      "P2: name-only region beyond the gate must yield zero calls");
+    return failures;
+}
+// P3: the first parameter value grows over three rounds; every view is a strict prefix of the
+// next (M1) and the name is stable.
+int test_partial_arguments_grow_monotonically() {
+    auto harness = PreviewHarness(string_tool_contract("write", "path"));
+    int failures = 0;
+    harness.feed(tc_begin("write") + param_open("path"));
+    std::optional<ninfer::ToolCallPreviewSnapshot> previous;
+    const std::vector<std::string> chunks = {"aaaaaaaaaa", "bbbbbbbbbb", "cccccccccc"};
+    std::size_t round = 0;
+    for (const std::string& chunk : chunks) {
+        harness.feed(std::string(64, '0') + chunk); // >= 64 bytes of region growth per round
+        auto view = harness.view();
+        ++round;
+        failures += check(view.has_value(),
+                          std::string("P3: round ") + std::to_string(round) +
+                              " must pass the growth gate");
+        if (!view) { break; }
+        failures += check(view->calls.size() == 1,
+                          std::string("P3: round ") + std::to_string(round) +
+                              " must show exactly one call");
+        if (view->calls.size() != 1) { break; }
+        failures += check(view->calls[0].name == "write",
+                          "P3: the call name must be stable across rounds");
+        if (previous) {
+            failures += check(
+                is_prefix_of(previous->calls[0].partial_arguments, view->calls[0].partial_arguments),
+                "P3: partial_arguments must grow as a strict prefix (M1)");
+        }
+        failures += check(is_json_object_prefix(view->calls[0].partial_arguments, true),
+                          "P3: an open parameter value must stay a valid JSON prefix");
+        previous = std::move(view);
+    }
+    return failures;
+}
+
+// P4: a completed first parameter plus an open second parameter; the object never closes.
+int test_partial_arguments_mixed_closed_and_open() {
+    auto contract = output_contract_for(
+        "write", Json{{"path", Json{{"type", "string"}}},
+                      {"content", Json{{"type", "string"}}}});
+    auto harness = PreviewHarness(contract);
+    harness.feed(tc_begin("write") + param_open("path") + "/tmp/ninfer/preview.txt\n" +
+                 param_close() + param_open("content") + "# heading\n" +
+                 "first line of file content, long enough to pass the gate\n");
+    int failures = 0;
+    auto view = harness.view();
+    failures += check(view.has_value() && view->calls.size() == 1,
+                      "P4: mixed closed/open parameters must yield one call");
+    if (!view || view->calls.size() != 1) { return failures; }
+    const std::string expected_closed =
+        std::string("{\"path\":") + Json("\n/tmp/ninfer/preview.txt\n").dump() + ",";
+    failures += check(is_prefix_of(expected_closed, view->calls[0].partial_arguments),
+                      "P4: the closed first parameter must use the raw framed value");
+    failures += check(view->calls[0].partial_arguments.find('}') == std::string::npos,
+                      "P4: the object must never close mid-stream");
+    failures += check(is_json_object_prefix(view->calls[0].partial_arguments, true),
+                      "P4: the open second parameter must stay a valid JSON prefix");
+    return failures;
+}
+// P5: a fully closed call stays a stable open object; region growth after the close does not
+// change the previewed arguments.
+int test_partial_arguments_stable_after_complete_call() {
+    auto harness = PreviewHarness(string_tool_contract("read", "path"));
+    const std::string complete = tc_begin("read") + param_open("path") + "/a.txt\n" +
+                                 param_close() + tc_end();
+    int failures = 0;
+    harness.feed(complete);
+    auto first = harness.view();
+    failures += check(first.has_value() && first->calls.size() == 1,
+                      "P5: a complete call must appear in the preview");
+    if (!first || first->calls.size() != 1) { return failures; }
+    failures += check(first->calls[0].partial_arguments ==
+                          std::string("{\"path\":") + Json("\n/a.txt\n").dump(),
+                      "P5: complete parameters must be closed JSON strings in an open object");
+    failures += check(is_json_object_prefix(first->calls[0].partial_arguments, false),
+                      "P5: a closed parameter set must be a JSON object prefix");
+    harness.feed(std::string(80, 'x')); // trailing junk after the complete call
+    auto second = harness.view();
+    failures += check(second.has_value() && second->calls.size() == 1 &&
+                          second->calls[0].partial_arguments == first->calls[0].partial_arguments,
+                      "P5: growth after a complete call must not change its arguments");
+    return failures;
+}
+
+// P6: truncation mid parameter value (output-limit simulation): the partial value is the raw
+// value up to the cut and the object stays open.
+int test_partial_arguments_truncated_value() {
+    auto harness = PreviewHarness(string_tool_contract("write", "content"));
+    const std::string cut_value = std::string(72, 'Z') + "tail cut mid-line";
+    harness.feed(tc_begin("write") + param_open("content") + cut_value);
+    int failures = 0;
+    auto view = harness.view();
+    failures += check(view.has_value() && view->calls.size() == 1,
+                      "P6: a value-cut call must appear in the preview");
+    if (!view || view->calls.size() != 1) { return failures; }
+    const std::string raw     = "\n" + cut_value;
+    const std::string encoded = Json(raw).dump();
+    failures += check(view->calls[0].partial_arguments ==
+                          std::string("{\"content\":") +
+                              encoded.substr(0, encoded.size() - 1),
+                      "P6: the partial value must be the raw value up to the cut (open string)");
+    const auto strict = fi::parse_qwen_tool_call_output(harness.fed, 64, *harness.contract);
+    failures += check(!strict.is_tool_call_response && strict.tool_calls.empty(),
+                      "P6: the strict terminal parse must reject the truncated call");
+    return failures;
+}
+
+// P7: duplicate parameters (last wins) reproduce the non-prefix sequence that the encoder
+// suppresses.
+int test_partial_arguments_duplicate_parameter_non_prefix() {
+    auto harness = PreviewHarness(string_tool_contract("configure", "value"));
+    int failures = 0;
+    const std::string dup_value = "sec" + std::string(50, 'o') + "nd value";
+    harness.feed(tc_begin("configure") + param_open("value") + "first value\n" +
+                 param_close());
+    auto first = harness.view();
+    failures += check(first.has_value() && first->calls.size() == 1 &&
+                          first->calls[0].partial_arguments ==
+                              std::string("{\"value\":") + Json("\nfirst value\n").dump(),
+                      "P7: the first complete value must be previewed");
+    if (!first || first->calls.size() != 1) { return failures; }
+    harness.feed(param_open("value") + "sec" + std::string(50, 'o'));
+    auto second = harness.view();
+    failures += check(second.has_value() && second->calls.size() == 1,
+                      "P7: the opened duplicate must replace the value in the preview");
+    if (!second || second->calls.size() != 1) { return failures; }
+    failures += check(!is_prefix_of(first->calls[0].partial_arguments,
+                                     second->calls[0].partial_arguments) &&
+                          !is_prefix_of(second->calls[0].partial_arguments,
+                                         first->calls[0].partial_arguments),
+                      "P7: duplicate last-wins must break the prefix property");
+    harness.feed("nd value\n" + param_close() + tc_end() + std::string(32, 'k'));
+    auto third = harness.view();
+    failures += check(third.has_value() && third->calls.size() == 1,
+                      "P7: the completed duplicate region must yield one call");
+    const auto terminal = fi::parse_qwen_tool_call_output(harness.fed, 64, *harness.contract,
+                                                          /*tolerant=*/true);
+    failures += check(terminal.is_tool_call_response && terminal.tool_calls.size() == 1 &&
+                          terminal.tool_calls[0].arguments_json ==
+                              std::string("{\"value\":") + Json(dup_value).dump() + "}",
+                      "P7: the terminal parse must keep the last duplicate value");
+    return failures;
+}
+// P8: a CRLF framing newline split across a round boundary must not break monotonicity
+// (raw-value encoding performs no framing strip).
+int test_partial_arguments_crlf_round_boundary() {
+    auto harness = PreviewHarness(string_tool_contract("write", "path"));
+    int failures = 0;
+    harness.feed(tc_begin("write") + param_open("path") + "\r");
+    auto first = harness.view();
+    failures += check(first.has_value() && first->calls.size() == 1,
+                      "P8: the value must appear although the framing CRLF is split");
+    if (!first || first->calls.size() != 1) { return failures; }
+    harness.feed("\n" + std::string(64, 'c') + "path.txt");
+    auto second = harness.view();
+    failures += check(second.has_value() && second->calls.size() == 1,
+                      "P8: the grown region must pass the gate");
+    if (!second) { return failures; }
+    failures += check(
+        is_prefix_of(first->calls[0].partial_arguments, second->calls[0].partial_arguments),
+        "P8: a split CRLF must not break the prefix property (M1)");
+    return failures;
+}
+
+// P9: escape edge cases in values (quotes, a round boundary directly after a lone backslash,
+// a later escape sequence) must keep every snapshot a valid JSON prefix.
+int test_partial_arguments_escape_boundaries() {
+    auto harness = PreviewHarness(string_tool_contract("configure", "value"));
+    int failures = 0;
+    harness.feed(tc_begin("configure") + param_open("value"));
+    const std::vector<std::string> steps = {
+        std::string(64, 'a') + "\"quote\" here",  // embedded quotes
+        "padding " + std::string(48, 'x') +
+            " backslash \\",                      // round boundary after a lone backslash
+        " padding " + std::string(48, 'y') + " \\u0041 unicode tail", // escape grows in
+    };
+    std::optional<ninfer::ToolCallPreviewSnapshot> previous;
+    for (const std::string& step : steps) {
+        harness.feed(step);
+        auto view = harness.view();
+        failures += check(view.has_value() && view->calls.size() == 1,
+                          "P9: each escape step must pass the gate");
+        if (!view || view->calls.size() != 1) { break; }
+        if (previous) {
+            failures += check(
+                is_prefix_of(previous->calls[0].partial_arguments, view->calls[0].partial_arguments),
+                "P9: escape growth must stay a strict prefix");
+        }
+        failures += check(is_json_object_prefix(view->calls[0].partial_arguments, true),
+                          "P9: the open value must stay a valid JSON prefix");
+        previous = std::move(view);
+    }
+    return failures;
+}
+// P9b: a parameter close tag split across a round boundary shifts the find_parameter_close
+// depth boundary when the region grows, so an earlier parameter value changes and the prefix
+// property breaks (BUG-13); the terminal parse must still be authoritative.
+int test_partial_arguments_boundary_shift_non_prefix() {
+    auto contract = output_contract_for(
+        "configure", Json{{"a", Json{{"type", "string"}}},
+                          {"b", Json{{"type", "string"}}}});
+    auto harness = PreviewHarness(contract);
+    int failures = 0;
+    const std::string value_a = std::string(60, 'A');
+    harness.feed(tc_begin("configure") + param_open("a") + value_a +
+                 "</" "parameter"); // region ends mid close tag
+    auto first = harness.view();
+    failures += check(first.has_value() && first->calls.size() == 1 &&
+                          is_json_object_prefix(first->calls[0].partial_arguments, true),
+                      "P9b: a split close tag must leave the first parameter open");
+    if (!first) { return failures; }
+    harness.feed(">\n" + param_open("b") + std::string(64, 'B') + "\n" +
+                 param_close() + tc_end());
+    auto second = harness.view();
+    failures += check(second.has_value() && second->calls.size() == 1,
+                      "P9b: the shifted region must pass the gate");
+    if (!second) { return failures; }
+    failures += check(!is_prefix_of(first->calls[0].partial_arguments,
+                                    second->calls[0].partial_arguments),
+                      "P9b: the boundary shift must break the prefix property");
+    const auto terminal = fi::parse_qwen_tool_call_output(harness.fed, 64, *contract, true);
+    failures += check(terminal.is_tool_call_response && terminal.tool_calls.size() == 1 &&
+                          terminal.tool_calls[0].arguments_json ==
+                              std::string("{\"a\":") + Json(value_a).dump() + ",\"b\":" +
+                              Json(std::string(64, 'B')).dump() + "}",
+                      "P9b: the terminal parse must win with the shifted boundary");
+    return failures;
+}
+
+// P10: parallel calls; the first call's arguments stay stable while the second grows.
+int test_partial_arguments_parallel_calls() {
+    auto contract = output_contract_for(
+        "write", Json{{"path", Json{{"type", "string"}}},
+                      {"content", Json{{"type", "string"}}}});
+    auto harness = PreviewHarness(contract);
+    int failures = 0;
+    harness.feed(tc_begin("read") + param_open("path") + "/stable.txt\n" +
+                 param_close() + tc_end() + tc_begin("write") + param_open("content") +
+                 std::string(72, 'C'));
+    auto first = harness.view();
+    failures += check(first.has_value() && first->calls.size() == 2,
+                      "P10: both calls must appear in region order");
+    if (!first || first->calls.size() != 2) { return failures; }
+    failures += check(first->calls[0].name == "read" && first->calls[1].name == "write",
+                      "P10: the call order must follow the region");
+    harness.feed(std::string(64, 'D'));
+    auto second = harness.view();
+    failures += check(second.has_value() && second->calls.size() == 2,
+                      "P10: the grown region must pass the gate");
+    if (!second) { return failures; }
+    failures += check(second->calls[0].partial_arguments == first->calls[0].partial_arguments,
+                      "P10: a complete call must not drift after the region grows");
+    failures += check(
+        is_prefix_of(first->calls[1].partial_arguments, second->calls[1].partial_arguments),
+        "P10: the open second call must grow as a strict prefix");
+    return failures;
+}
+// P11: the preview is tolerant even for a strict request; the terminal path stays strict
+// (all-or-nothing).
+int test_partial_view_tolerant_for_strict_request() {
+    auto contract = output_contract_for("configure", Json{{"value", Json{{"type", "string"}}}});
+    auto harness = PreviewHarness(contract, 64, /*tolerant=*/false);
+    const std::string suffixed = tool_call("configure", {{"value", "x"}}) + "\nextra answer" +
+                                 std::string(40, 'y');
+    harness.feed(suffixed);
+    int failures = 0;
+    auto view = harness.view();
+    failures += check(view.has_value() && view->calls.size() == 1 &&
+                          view->calls[0].name == "configure",
+                      "P11: the strict-request preview must still show the partial call");
+    auto terminal = harness.decoder.finish();
+    failures += check(terminal.tool_calls.empty() && !terminal.content.empty(),
+                      "P11: the strict terminal parse must degrade to text");
+    failures += check(
+        terminal.diagnostics.fallback_reason == ninfer::ToolCallParseFallbackReason::TrailingContent,
+        "P11: the strict terminal reason must stay TrailingContent");
+    return failures;
+}
+
+// P12: the growth gate skips views (without updating) until the region grew by 64 bytes since
+// the last returned view or the call count changed.
+int test_partial_view_growth_gate() {
+    auto contract = output_contract_for(
+        "configure", Json{{"a", Json{{"type", "string"}}},
+                          {"b", Json{{"type", "string"}}}});
+    auto harness = PreviewHarness(contract);
+    int failures = 0;
+    harness.feed(tc_begin("configure") + param_open("a") + std::string(70, 'a'));
+    auto first = harness.view();
+    failures += check(first.has_value() && first->calls.size() == 1,
+                      "P12: the first view must pass the gate");
+    harness.feed(std::string(30, 'b')); // sub-gate growth, count unchanged
+    failures += check(!harness.view().has_value(),
+                      "P12: sub-gate growth with unchanged count must be nullopt");
+    harness.feed(std::string(35, 'c')); // accumulated 65 bytes since the last view
+    failures += check(harness.view().has_value(),
+                      "P12: accumulated sub-gate growth must eventually pass");
+    harness.feed(std::string(20, 'd'));
+    failures += check(!harness.view().has_value(),
+                      "P12: the gate must restart after a returned view");
+    harness.feed(param_close() + tc_end() +
+                 tc_begin("configure") + param_open("b") + "x\n" + param_close() +
+                 tc_end()); // new call: count change
+    auto final = harness.view();
+    failures += check(final.has_value() && final->calls.size() == 2,
+                      "P12: a new call must pass the gate regardless of growth");
+    return failures;
+}
+
 } // namespace
 
 int test_duplicate_parameter_keeps_last_value() {
@@ -1242,6 +1635,19 @@ int main() {
     failures += test_tolerant_truncated_final_call();
     failures += test_tolerant_missing_function_close_bracket();
     failures += test_tolerant_undeclared_and_value_cut();
+    failures += test_partial_view_no_marker();
+    failures += test_partial_view_name_only_yields_no_calls();
+    failures += test_partial_arguments_grow_monotonically();
+    failures += test_partial_arguments_mixed_closed_and_open();
+    failures += test_partial_arguments_stable_after_complete_call();
+    failures += test_partial_arguments_truncated_value();
+    failures += test_partial_arguments_duplicate_parameter_non_prefix();
+    failures += test_partial_arguments_crlf_round_boundary();
+    failures += test_partial_arguments_escape_boundaries();
+    failures += test_partial_arguments_boundary_shift_non_prefix();
+    failures += test_partial_arguments_parallel_calls();
+    failures += test_partial_view_tolerant_for_strict_request();
+    failures += test_partial_view_growth_gate();
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }

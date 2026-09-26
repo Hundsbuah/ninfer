@@ -224,6 +224,11 @@ public:
         }
     }
 
+    void publish_tool_call_preview(ninfer::ToolCallPreviewSnapshot snapshot) override {
+        if (snapshot.calls.empty()) { return; }
+        if (sink_->on_tool_call_preview) { sink_->on_tool_call_preview(snapshot); }
+    }
+
 private:
     const StreamSink* sink_ = nullptr;
 };

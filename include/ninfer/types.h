@@ -692,6 +692,17 @@ struct OutputDelta {
     std::string text;
 };
 
+// Display-only view of in-progress tool calls. Never feeds execution or the
+// final response; the terminal decoder result stays the single source of truth.
+struct ToolCallPreviewSnapshot {
+    // One entry per call the tolerant partial parse yields, in region order.
+    struct Call {
+        std::string name;              // vollständig (Header-Tag abgeschlossen)
+        std::string partial_arguments; // wachsendes offenes JSON-Präfix, nie leer
+    };
+    std::vector<Call> calls; // leer wenn kein Marker / noch kein Call
+};
+
 // Exact prompt accounting selected at admission. Streaming consumers receive this once before any
 // OutputDelta, after the prefix choice and materialization reservation are committed and before
 // transfer/prefill execution.
@@ -726,6 +737,9 @@ public:
     virtual void progress(PromptProgress progress)          = 0;
     virtual void timing(GenerationTimingObservation timing) = 0;
     virtual void publish(OutputDelta delta)                 = 0;
+    // Display-only tool-call preview snapshots; protocols without a live preview leave the
+    // default in place.
+    virtual void publish_tool_call_preview(ToolCallPreviewSnapshot snapshot) {}
 };
 
 enum class OutputConsumerMode : std::uint8_t {

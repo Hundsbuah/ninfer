@@ -110,7 +110,8 @@ struct RequestRecord {
     using OutputSession  = typename ModelContract::OutputSession;
     using BasePlan       = typename ModelContract::RequestBasePlan;
     using SequenceHandle = typename ModelContract::SequenceHandle;
-    using StreamEvent    = std::variant<GenerationTimingObservation, OutputDelta>;
+    using StreamEvent    =
+        std::variant<GenerationTimingObservation, OutputDelta, ToolCallPreviewSnapshot>;
 
     RequestRecord(std::uint64_t request_identity, std::uint64_t publication_sequence,
                   PreparedPrompt input, OutputSession output_session, PromptSummary summary,
@@ -207,5 +208,31 @@ struct RequestRecord {
     bool consumer_released = false;
     bool capacity_released = false;
 };
+
+// Dispatches one drained streaming event batch to a consumer sink. Returns the sink handler's
+// failure, if any, so the caller stops further sink calls; the batch is consumed either way.
+inline std::exception_ptr
+dispatch_stream_events(std::vector<std::variant<GenerationTimingObservation, OutputDelta,
+                                                ToolCallPreviewSnapshot>>& events,
+                       OutputSink* sink) {
+    if (sink == nullptr) {
+        return nullptr;
+    }
+    try {
+        for (auto& event : events) {
+            if (auto* timing = std::get_if<GenerationTimingObservation>(&event)) {
+                sink->timing(std::move(*timing));
+            } else if (auto* delta = std::get_if<OutputDelta>(&event)) {
+                sink->publish(std::move(*delta));
+            } else {
+                sink->publish_tool_call_preview(
+                    std::move(std::get<ToolCallPreviewSnapshot>(event)));
+            }
+        }
+    } catch (...) {
+        return std::current_exception();
+    }
+    return nullptr;
+}
 
 } // namespace ninfer::runtime

@@ -639,12 +639,8 @@ private:
                 try {
                     if (start) { sink->start(std::move(*start)); }
                     if (progress) { sink->progress(std::move(*progress)); }
-                    for (auto& event : events) {
-                        if (auto* timing = std::get_if<GenerationTimingObservation>(&event)) {
-                            sink->timing(std::move(*timing));
-                        } else {
-                            sink->publish(std::move(std::get<OutputDelta>(event)));
-                        }
+                    if (auto sink_error = dispatch_stream_events(events, sink)) {
+                        std::rethrow_exception(sink_error);
                     }
                 } catch (...) {
                     caller_error = std::current_exception();
@@ -742,6 +738,16 @@ private:
             }
         }
         if (streaming) { request->cv.notify_one(); }
+    }
+
+    void append_tool_call_preview(const std::shared_ptr<Request>& request,
+                                  ToolCallPreviewSnapshot snapshot) {
+        if (request->consumer_mode != OutputConsumerMode::Streaming) { return; }
+        {
+            std::lock_guard lock(request->mutex);
+            request->events.emplace_back(std::move(snapshot));
+        }
+        request->cv.notify_one();
     }
 
     void publish_prompt_progress(const std::shared_ptr<Request>& request) {
@@ -1311,6 +1317,11 @@ private:
                 auto published = request->output.commit_preview();
                 auto timing    = record_committed_output(request, accepted);
                 append_output(request, std::move(published), std::move(timing));
+                if (request->consumer_mode == OutputConsumerMode::Streaming) {
+                    if (auto snapshot = request->output.tool_call_preview_snapshot()) {
+                        append_tool_call_preview(request, std::move(*snapshot));
+                    }
+                }
                 if (decisions[row].terminal) {
                     if (cancelled[row]) {
                         terminal_requests[terminal_count] = request;
@@ -2100,6 +2111,11 @@ private:
             cumulative_stats_.committed_decode_tokens += membership.row_stride;
             auto timing = record_committed_output(request, membership.row_stride);
             append_output(request, request->output.commit_preview(), std::move(timing));
+            if (request->consumer_mode == OutputConsumerMode::Streaming) {
+                if (auto snapshot = request->output.tool_call_preview_snapshot()) {
+                    append_tool_call_preview(request, std::move(*snapshot));
+                }
+            }
             request->model_state = EngineRequestState::DecodeReady;
         }
         publish_runtime_stats();

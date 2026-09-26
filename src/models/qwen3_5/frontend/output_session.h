@@ -77,6 +77,9 @@ public:
     [[nodiscard]] runtime::OutputDecision preview_terminal(FinishReason reason);
     [[nodiscard]] PublishedOutput commit_preview();
     [[nodiscard]] std::vector<GeneratedToolCall> take_tool_calls() noexcept;
+    // Display-only in-progress tool-call arguments; nullopt before the first marker, after the
+    // terminal commit, or while the growth gate suppresses a refresh.
+    [[nodiscard]] std::optional<ninfer::ToolCallPreviewSnapshot> tool_call_preview_snapshot();
     [[nodiscard]] ToolCallParseDiagnostics tool_call_parse_diagnostics() const noexcept;
     [[nodiscard]] std::uint32_t reasoning_tokens() const noexcept;
     [[nodiscard]] ThinkingBudgetStats thinking_stats() const noexcept;

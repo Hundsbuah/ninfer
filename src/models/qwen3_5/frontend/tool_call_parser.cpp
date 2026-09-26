@@ -538,9 +538,10 @@ NormalizedParameter normalize_parameter(std::string_view encoded_value,
 class QwenToolRegionParser {
 public:
     QwenToolRegionParser(std::string_view text, std::size_t max_name_length,
-                         const Contract& contract, bool tolerant)
+                         const Contract& contract, bool tolerant,
+                         bool retain_partial_tail = false)
         : text_(text), max_name_length_(max_name_length), contract_(contract),
-          tolerant_(tolerant) {}
+          tolerant_(tolerant), retain_partial_tail_(retain_partial_tail) {}
 
     [[nodiscard]] std::uint32_t duplicate_parameters_repaired() const noexcept {
         return duplicate_parameters_repaired_;
@@ -605,21 +606,29 @@ private:
 
     // Applies tolerant recovery to a sub-parse result and reports whether parse() should
     // terminate. In tolerant mode, a malformed suffix after one or more complete calls is
-    // discarded, and a single truncated final call whose name and at least one parameter are
-    // complete is retained; the recovered calls are never demoted to text. The strict parser
-    // returns the raw failure unchanged.
+    // discarded, and a truncated call whose name and at least one parameter are present is
+    // retained when it is the only call; a call cut before its first parameter carries
+    // nothing to recover. retain_partial_tail_ (preview path only) additionally retains a
+    // truncated final call after one or more complete calls so the display can show it in
+    // progress; the terminal path (retain_partial_tail_ == false) keeps the master
+    // semantics, so truncated arguments never enter the final response and are never
+    // executed. The recovered calls are never demoted to text. The strict parser returns
+    // the raw failure unchanged.
     FallbackReason finish_call(std::vector<RawToolCall>& calls, RawToolCall& call,
                                FallbackReason failure) {
         if (failure == FallbackReason::None) {
             calls.push_back(std::move(call));
             return FallbackReason::None;
         }
-        if (tolerant_ && !calls.empty()) { return FallbackReason::TruncatedTail; }
-        if (tolerant_ && failure == FallbackReason::TruncatedTail && calls.empty() &&
-            !call.parameters.empty()) {
+        if (tolerant_ && failure == FallbackReason::TruncatedTail && !call.parameters.empty() &&
+            (calls.empty() || retain_partial_tail_)) {
+            // A truncated call with at least one parameter is retained in region order.
+            // After complete calls it is retained only in the preview path; a call cut
+            // before its first parameter stays discarded in both paths.
             calls.push_back(std::move(call));
             return FallbackReason::TruncatedTail;
         }
+        if (tolerant_ && !calls.empty()) { return FallbackReason::TruncatedTail; }
         return failure;
     }
 
@@ -821,6 +830,7 @@ private:
     const Contract& contract_;
     std::uint32_t duplicate_parameters_repaired_ = 0;
     bool tolerant_ = false;
+    bool retain_partial_tail_ = false;
 };
 
 GeneratedToolCall normalize_raw_tool_call(const RawToolCall& raw, const Contract& contract,
@@ -878,64 +888,110 @@ build_tool_call_output_contract(std::span<const std::string> tool_jsons, bool en
     return contract;
 }
 
+// Encode one in-progress call as the growing JSON object prefix of spec 3.2: each parameter
+// value is the JSON string of the raw unprocessed value (no framing strip, no type
+// normalization), so the per-byte escape keeps every snapshot a strict prefix of the next
+// while parameter boundaries are stable. Parameters with an empty (trimmed) raw value are
+// omitted; a parameter whose value reaches the region end is still open, so its JSON string
+// is emitted without the closing quote. The object itself never closes mid-stream: the
+// terminal parse delivers the authoritative arguments once.
+std::string partial_arguments_json(const RawToolCall& raw, std::string_view region) {
+    const char* region_end = region.data() + region.size();
+    std::string arguments  = "{";
+    bool first             = true;
+    for (const RawParameter& parameter : raw.parameters) {
+        if (trim_format_whitespace(parameter.value).empty()) { continue; }
+        const bool open = parameter.value.data() + parameter.value.size() == region_end;
+        if (!first) { arguments.push_back(','); }
+        first = false;
+        arguments += encode_json_string(parameter.name);
+        arguments.push_back(':');
+        std::string value = encode_json_string(parameter.value);
+        if (open) { value.pop_back(); }
+        arguments += std::move(value);
+    }
+    return arguments;
+}
+
+// Raw result of the marker-retry scan: the first region that parses (tolerant recovery
+// included) with its raw calls. Parameter values are string_views into the scanned source.
+struct RawToolCallRegion {
+    bool marker_seen                        = false;
+    bool accepted                           = false;
+    std::size_t candidate                   = std::string_view::npos;
+    FallbackReason accepted_reason          = FallbackReason::None;
+    FallbackReason first_failure            = FallbackReason::MalformedStructure;
+    std::uint32_t duplicate_repairs         = 0;
+    std::vector<RawToolCall> calls;
+};
+
+// Generated prose can quote a tool-call marker before the real turn. Try the first marker, then
+// each later `<tool_call>` wrapper, and accept the first region that parses; earlier markers
+// stay ordinary content. A truncated tail that still kept a complete call (tolerant mode) is a
+// recovered region, not a failure. retain_partial_tail (preview path) keeps a truncated final
+// call after complete calls for display; the default false is the terminal/authoritative
+// behavior.
+RawToolCallRegion parse_tool_call_region(std::string_view source, std::size_t max_tool_name_length,
+                                         const Contract& contract, bool tolerant,
+                                         bool retain_partial_tail = false) {
+    RawToolCallRegion out;
+    std::size_t candidate = find_first_tool_marker(source);
+    if (candidate == std::string_view::npos) { return out; }
+    out.marker_seen = true;
+    bool first_failure_recorded = false;
+    while (candidate != std::string_view::npos) {
+        std::vector<RawToolCall> calls;
+        QwenToolRegionParser parser(source.substr(candidate), max_tool_name_length, contract,
+                                    tolerant, retain_partial_tail);
+        const FallbackReason failure = parser.parse(calls);
+        if (failure == FallbackReason::None ||
+            (failure == FallbackReason::TruncatedTail && !calls.empty())) {
+            out.accepted          = true;
+            out.candidate         = candidate;
+            out.accepted_reason   = failure;
+            out.duplicate_repairs = parser.duplicate_parameters_repaired();
+            out.calls             = std::move(calls);
+            return out;
+        }
+        if (!first_failure_recorded) {
+            out.first_failure      = failure;
+            first_failure_recorded = true;
+        }
+        // Retries move only to a later `<tool_call>` wrapper: the markup nested inside a failed
+        // region (its `<function=...>` or `<invoke>`) must not re-read a truncated call.
+        candidate = source.find(kToolOpen, candidate + 1);
+    }
+    return out;
+}
+
 ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text,
                                                  std::size_t max_tool_name_length,
                                                  const ToolCallOutputContract& contract,
                                                  bool tolerant) {
     const std::string_view source(text);
-    std::size_t candidate = find_first_tool_marker(source);
-    if (candidate == std::string::npos) { return fallback(text); }
+    const RawToolCallRegion region =
+        parse_tool_call_region(source, max_tool_name_length, contract, tolerant);
+    if (!region.marker_seen) { return fallback(text); }
 
     ParsedToolCallOutput out;
     out.diagnostics.marker_seen = true;
 
-    // Generated prose can quote a tool-call marker before the real turn. Try the first marker, then
-    // each later `<tool_call>` wrapper, and accept the first region that parses; earlier markers
-    // stay ordinary content. A truncated tail that still kept a complete call (tolerant mode) is a
-    // recovered region, not a failure.
-    std::vector<RawToolCall> raw_calls;
-    std::size_t accepted                   = std::string::npos;
-    FallbackReason accepted_reason         = FallbackReason::None;
-    std::uint32_t duplicate_repairs        = 0;
-    FallbackReason first_failure           = FallbackReason::MalformedStructure;
-    bool first_failure_recorded            = false;
-    while (candidate != std::string::npos) {
-        std::vector<RawToolCall> calls;
-        QwenToolRegionParser parser(source.substr(candidate), max_tool_name_length, contract,
-                                    tolerant);
-        const FallbackReason failure = parser.parse(calls);
-        if (failure == FallbackReason::None ||
-            (failure == FallbackReason::TruncatedTail && !calls.empty())) {
-            accepted          = candidate;
-            accepted_reason   = failure;
-            duplicate_repairs = parser.duplicate_parameters_repaired();
-            raw_calls         = std::move(calls);
-            break;
-        }
-        if (!first_failure_recorded) {
-            first_failure          = failure;
-            first_failure_recorded = true;
-        }
-        // Retries move only to a later `<tool_call>` wrapper: the markup nested inside a failed
-        // region (its `<function=...>` or `<invoke>`) must not re-read a truncated call.
-        candidate = text.find(kToolOpen, candidate + 1);
-    }
-    if (accepted == std::string::npos) {
+    if (!region.accepted) {
         // No region parsed. A truncated tail that kept no call carries no arguments either, so
         // the response is returned as text with the first region's reason recorded.
-        out.diagnostics.fallback_reason = first_failure;
+        out.diagnostics.fallback_reason = region.first_failure;
         return fallback(text, out.diagnostics);
     }
     // A recovered truncated tail keeps its reason for transparency without demoting the output.
-    out.diagnostics.fallback_reason = accepted_reason;
+    out.diagnostics.fallback_reason = region.accepted_reason;
 
-    out.content = rtrim_format_whitespace(source.substr(0, accepted));
-    out.tool_calls.reserve(raw_calls.size());
-    for (const RawToolCall& raw : raw_calls) {
+    out.content = rtrim_format_whitespace(source.substr(0, region.candidate));
+    out.tool_calls.reserve(region.calls.size());
+    for (const RawToolCall& raw : region.calls) {
         out.tool_calls.push_back(normalize_raw_tool_call(raw, contract, out.diagnostics));
     }
 
-    out.diagnostics.duplicate_parameters_repaired = duplicate_repairs;
+    out.diagnostics.duplicate_parameters_repaired = region.duplicate_repairs;
     out.diagnostics.structured_call_count = static_cast<std::uint32_t>(out.tool_calls.size());
     out.is_tool_call_response             = true;
     return out;
@@ -1017,6 +1073,39 @@ ToolCallOutputDecoder::Terminal ToolCallOutputDecoder::finish() {
     tool_region_.clear();
     return Terminal{
         .content = std::move(tail), .tool_calls = {}, .diagnostics = parsed.diagnostics};
+}
+
+std::optional<ninfer::ToolCallPreviewSnapshot> ToolCallOutputDecoder::partial_view() {
+    if (finished_) { return std::nullopt; }
+    if (!contract_ || !saw_tool_marker_ || tool_region_.empty()) { return std::nullopt; }
+
+    // Tolerant by definition: the preview is display-only and shows partial calls even for a
+    // strict request whose terminal parse will degrade them to text. retain_partial_tail keeps
+    // a truncated final call after complete calls visible in the display. No strict re-parse
+    // here (design d): the terminal parse in finish() stays the single authority.
+    const RawToolCallRegion region =
+        parse_tool_call_region(tool_region_, max_tool_name_length_, *contract_,
+                               /*tolerant=*/true, /*retain_partial_tail=*/true);
+
+    // Growth gate: skip the view (and the gate update) unless the region grew by at least 64
+    // bytes or the call count changed since the last returned view.
+    if (region.calls.size() == last_snapshot_call_count_ &&
+        tool_region_.size() < last_snapshot_region_size_ + 64) {
+        return std::nullopt;
+    }
+    last_snapshot_region_size_ = tool_region_.size();
+    last_snapshot_call_count_  = region.calls.size();
+
+    ninfer::ToolCallPreviewSnapshot snapshot;
+    snapshot.calls.reserve(region.calls.size());
+    for (const RawToolCall& raw : region.calls) {
+        // The raw parameter views live only during the parse; partial_arguments_json copies them
+        // into owned strings before the view is returned.
+        snapshot.calls.push_back(
+            {.name            = std::string(raw.name),
+             .partial_arguments = partial_arguments_json(raw, std::string_view(tool_region_))});
+    }
+    return snapshot;
 }
 
 } // namespace ninfer::models::qwen3_5::frontend

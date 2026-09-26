@@ -348,6 +348,7 @@ int main() {
                                            "--no-prefix-reuse",
                                            "--vision",
                                            "--usage-chunk-choice",
+                                           "--stream-tool-args",
                                            "--max-concurrency",
                                            "4",
                                            "--max-pending-requests",
@@ -377,6 +378,8 @@ int main() {
     failures += check(configured.enable_vision, "--vision did not enable Vision");
     failures += check(configured.usage_chunk_choice,
                       "--usage-chunk-choice did not reach serving options");
+    failures += check(configured.stream_tool_args,
+                      "--stream-tool-args did not reach serving options");
     failures += check(configured.preserve_thinking == true,
                       "--preserve-thinking did not reach serving options");
     failures +=
@@ -699,6 +702,9 @@ int main() {
     failures += check(serve_usage_text("ninfer-serve").find("--usage-chunk-choice") !=
                           std::string::npos,
                       "serve help omits --usage-chunk-choice");
+    failures += check(serve_usage_text("ninfer-serve").find("--stream-tool-args") !=
+                          std::string::npos,
+                      "serve help omits --stream-tool-args");
     failures +=
         check(serve_usage_text("ninfer-serve").find("--log-stats-interval-ms") != std::string::npos,
               "serve help omits --log-stats-interval-ms");

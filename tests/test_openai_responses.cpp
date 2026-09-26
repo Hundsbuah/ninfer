@@ -1211,6 +1211,627 @@ int test_input_tokens_uses_shared_state_path() {
     return failures;
 }
 
+// ---- Streaming tool-call preview encoder tests (E1-E12) ------------------------------------
+
+OpenAIResponsesCreateRequest plain_stream_request() {
+    return parse_openai_responses_create_request(
+        Json{{"model", "m"}, {"input", "hi"}, {"stream", true}}, limits());
+}
+
+GenerationOutcome call_outcome(
+    std::initializer_list<std::pair<const char*, const char*>> calls,
+    ninfer::FinishReason reason = ninfer::FinishReason::StopToken) {
+    GenerationOutcome outcome;
+    for (const auto& [name, arguments] : calls) {
+        outcome.tool_calls.push_back(
+            ninfer::GeneratedToolCall{.name = name, .arguments_json = arguments});
+    }
+    outcome.finish_reason = reason;
+    return outcome;
+}
+
+// Parser-boundary snapshot simulation: partial_arguments carry the raw framing form the
+// preview emits (invariant C1), while terminal arguments use the normalized form.
+ninfer::ToolCallPreviewSnapshot
+preview_of(std::initializer_list<std::pair<std::string, std::string>> calls) {
+    ninfer::ToolCallPreviewSnapshot snapshot;
+    for (const auto& [name, partial] : calls) {
+        snapshot.calls.push_back(ninfer::ToolCallPreviewSnapshot::Call{
+            .name              = name,
+            .partial_arguments = partial});
+    }
+    return snapshot;
+}
+
+struct PreviewStream {
+    OpenAIResponsesEventStream encoder;
+    std::vector<Json> events;
+
+    explicit PreviewStream(const char* response_id, OpenAIResponsesCreateRequest request)
+        : encoder(response_id, 1, std::move(request), {}) {
+        for (auto& wire : encoder.start()) { events.push_back(parse_event(wire)); }
+    }
+
+    void feed(std::vector<std::string> wire) {
+        for (auto& text : wire) { events.push_back(parse_event(text)); }
+    }
+
+    void feed_terminal(OpenAIResponsesStreamFinish finish) {
+        feed(finish.events_before_terminal);
+        feed({encoder.terminal(finish.response)});
+    }
+
+    std::vector<std::string> types(std::size_t from = 0, std::size_t to = SIZE_MAX) const {
+        std::vector<std::string> out;
+        for (std::size_t index = from; index < to && index < events.size(); ++index) {
+            out.push_back(events[index].at("type").get<std::string>());
+        }
+        return out;
+    }
+
+    std::size_t count(std::size_t from, std::size_t to, const char* type,
+                      const char* item_type = nullptr) const {
+        std::size_t found = 0;
+        for (std::size_t index = from; index < to && index < events.size(); ++index) {
+            const Json& event = events[index];
+            if (event.at("type") != type) { continue; }
+            if (item_type != nullptr &&
+                event.at("item").at("type").get<std::string>() != item_type) {
+                continue;
+            }
+            ++found;
+        }
+        return found;
+    }
+
+    const Json* at_type(std::size_t from, std::size_t to, const char* type,
+                        const char* item_type = nullptr) const {
+        for (std::size_t index = from; index < to && index < events.size(); ++index) {
+            const Json& event = events[index];
+            if (event.at("type") != type) { continue; }
+            if (item_type != nullptr &&
+                event.at("item").at("type").get<std::string>() != item_type) {
+                continue;
+            }
+            return &event;
+        }
+        return nullptr;
+    }
+
+    std::string joined_deltas(const char* item_id) const {
+        std::string out;
+        for (const Json& event : events) {
+            if (event.at("type") == "response.function_call_arguments.delta" &&
+                event.at("item_id") == item_id) {
+                out += event.at("delta").get<std::string>();
+            }
+        }
+        return out;
+    }
+};
+
+// E1: preview disabled (default): a call stream is bit-identical to the canonical fc batch.
+int test_e1_flag_off_stream_unchanged() {
+    PreviewStream stream("resp_e1", plain_stream_request());
+    GenerationOutcome e1_outcome;
+    e1_outcome.text            = "answer";
+    e1_outcome.tool_calls.push_back(ninfer::GeneratedToolCall{
+        .name           = "write",
+        .arguments_json = R"({"path":"/tmp/x"})"});
+    e1_outcome.finish_reason   = ninfer::FinishReason::StopToken;
+    const OpenAIResponsesStreamFinish finish = stream.encoder.finish(e1_outcome);
+    stream.feed_terminal(finish);
+    int failures = 0;
+    const std::vector<std::string> expected = {"response.created",
+                                               "response.in_progress",
+                                               "response.output_item.added",
+                                               "response.content_part.added",
+                                               "response.output_text.delta",
+                                               "response.output_text.done",
+                                               "response.content_part.done",
+                                               "response.output_item.done",
+                                               "response.output_item.added",
+                                               "response.function_call_arguments.delta",
+                                               "response.function_call_arguments.done",
+                                               "response.output_item.done",
+                                               "response.completed"};
+    failures += check(stream.types() == expected,
+                      "E1: a preview-less stream keeps the canonical fc batch in order");
+    const Json* done = stream.at_type(0, stream.events.size(),
+                                      "response.function_call_arguments.done");
+    const Json* item = stream.at_type(0, stream.events.size(), "response.output_item.done",
+                                      "function_call");
+    const Json& body_call = finish.response.body.at("output")[1];
+    failures += check(done != nullptr && item != nullptr &&
+                          json_unordered_eq(done->at("arguments"), body_call.at("arguments")) &&
+                          item->at("item").at("id") == body_call.at("id"),
+                      "E1: the terminal fc events match the body bit-identically");
+    return failures;
+}
+
+// E2: preview path: live adds/deltas, no mid-stream done; the finish batch closes the live
+// item with the terminal arguments, which match the body bit-identically (C1/S2/AC6).
+int test_e2_preview_then_finish() {
+    PreviewStream stream("resp_e2", plain_stream_request());
+    const std::string partial_1 = R"({"path":"\n/tmp)";
+    const std::string partial_2 = R"({"path":"\n/tmp/x\n"})";
+    stream.feed(stream.encoder.function_call_preview(preview_of({{"write", partial_1}})));
+    stream.feed(stream.encoder.function_call_preview(preview_of({{"write", partial_2}})));
+    const std::size_t live_size = stream.events.size();
+    const OpenAIResponsesStreamFinish finish =
+        stream.encoder.finish(call_outcome({{"write", R"({"path":"/tmp/x"})"}}));
+    stream.feed_terminal(finish);
+    int failures = 0;
+    failures += check(stream.count(0, live_size, "response.output_item.added",
+                                   "function_call") == 1 &&
+                          stream.count(0, live_size, "response.function_call_arguments.done") ==
+                              0 &&
+                          stream.count(0, live_size, "response.output_item.done",
+                                       "function_call") == 0,
+                      "E2: the live phase emits only adds and deltas (S2)");
+    const Json* added = stream.at_type(0, live_size, "response.output_item.added",
+                                       "function_call");
+    const std::string item_id    = added->at("item").at("id").get<std::string>();
+    const std::string call_id    = added->at("item").at("call_id").get<std::string>();
+    const int output_index       = added->at("output_index").get<int>();
+    failures += check(stream.joined_deltas(item_id.c_str()) == partial_2,
+                      "E2: live deltas reconstruct the last partial (raw framing, C1)");
+    const Json* done = stream.at_type(live_size, stream.events.size(),
+                                      "response.function_call_arguments.done");
+    const Json* item_done = stream.at_type(live_size, stream.events.size(),
+                                           "response.output_item.done", "function_call");
+    const std::string terminal_args = R"({"path":"/tmp/x"})";
+    failures += check(
+        done != nullptr && item_done != nullptr && done->at("item_id") == item_id &&
+            done->at("output_index") == output_index && done->at("arguments") == terminal_args &&
+            item_done->at("item").at("id") == item_id &&
+            item_done->at("item").at("call_id") == call_id &&
+            item_done->at("item").at("status") == "completed" &&
+            item_done->at("item").at("arguments") == terminal_args,
+        "E2: the finish batch closes the live item with the terminal arguments");
+    const Json& body_call = finish.response.body.at("output")[0];
+    failures += check(
+        body_call.at("id") == item_id && body_call.at("call_id") == call_id &&
+            body_call.at("arguments") == terminal_args && partial_2 != terminal_args,
+        "E2: stream ids and arguments match the body; raw framing diverges (C1)");
+    failures += check(stream.count(0, stream.events.size(), "response.output_item.added",
+                                   "function_call") == 1,
+                      "E2: the fc item is added exactly once");
+    return failures;
+}
+// E3: truncation mid-args: the open live call is closed as an incomplete display-only item;
+// the terminal body contains no call (AC4).
+int test_e3_truncated_call_not_in_body() {
+    PreviewStream stream("resp_e3", plain_stream_request());
+    const std::string partial = R"({"path":"/tmp/x")";
+    stream.feed(stream.encoder.function_call_preview(preview_of({{"write", partial}})));
+    const std::size_t live_size = stream.events.size();
+    const OpenAIResponsesStreamFinish finish = stream.encoder.finish(call_outcome({}));
+    stream.feed_terminal(finish);
+    int failures = 0;
+    failures += check(stream.count(0, live_size, "response.output_item.added",
+                                   "function_call") == 1,
+                      "E3: the truncated call appears in the live phase");
+    failures += check(stream.count(live_size, stream.events.size(),
+                                   "response.function_call_arguments.done") == 0,
+                      "E3: no arguments-done is emitted for a truncated call");
+    const Json* item_done = stream.at_type(live_size, stream.events.size(),
+                                           "response.output_item.done", "function_call");
+    failures += check(item_done != nullptr &&
+                          item_done->at("item").at("status") == "incomplete" &&
+                          item_done->at("item").at("arguments") == partial,
+                      "E3: the live call closes as an incomplete item with the last partial");
+    bool body_has_call = false;
+    for (const auto& output : finish.response.body.at("output")) {
+        if (output.at("type") == "function_call") { body_has_call = true; }
+    }
+    failures += check(!body_has_call && finish.response.body.at("status") == "completed",
+                      "E3: the body contains no call and the response completes");
+    return failures;
+}
+
+// E4: a complete first call plus a truncated second; none of the live items is promoted to
+// completed (S2, BUG-12 regression).
+int test_e4_dual_truncation_no_promotion() {
+    PreviewStream stream("resp_e4", plain_stream_request());
+    stream.feed(stream.encoder.function_call_preview(
+        preview_of({{"read", R"({"path":"/a.txt\n"")"}, {"write", R"({"content":"x")"}})));
+    const std::size_t live_size = stream.events.size();
+    const OpenAIResponsesStreamFinish finish = stream.encoder.finish(call_outcome({}));
+    stream.feed_terminal(finish);
+    int failures = 0;
+    failures += check(stream.count(0, live_size, "response.output_item.added",
+                                   "function_call") == 2 &&
+                          stream.count(0, live_size, "response.function_call_arguments.delta") ==
+                              2,
+                      "E4: both live calls are added with deltas");
+    std::size_t incomplete = 0;
+    for (std::size_t index = live_size; index < stream.events.size(); ++index) {
+        const Json& event = stream.events[index];
+        if (event.at("type") != "response.output_item.done" ||
+            event.at("item").at("type") != "function_call") {
+            continue;
+        }
+        failures += check(event.at("item").at("status") == "incomplete",
+                          "E4: no stream item is completed that the body lacks (S2)");
+        if (event.at("item").at("status") == "incomplete") { ++incomplete; }
+    }
+    failures += check(
+        stream.count(live_size, stream.events.size(), "response.function_call_arguments.done") ==
+            0 &&
+            incomplete == 2,
+        "E4: the finish batch closes both live calls as incomplete without arguments-done");
+    bool body_has_call = false;
+    for (const auto& output : finish.response.body.at("output")) {
+        if (output.at("type") == "function_call") { body_has_call = true; }
+    }
+    failures += check(!body_has_call, "E4: the body contains no calls");
+    return failures;
+}
+
+// E5: parallel complete calls: the finish batch closes both live items in stream order with
+// the terminal arguments; the body order matches the stream order.
+int test_e5_parallel_calls_complete() {
+    PreviewStream stream("resp_e5", plain_stream_request());
+    stream.feed(stream.encoder.function_call_preview(
+        preview_of({{"read", R"({"path":"/a.txt\n"")"}, {"write", R"({"content":"x")"}})));
+    const std::size_t live_size = stream.events.size();
+    const OpenAIResponsesStreamFinish finish = stream.encoder.finish(
+        call_outcome({{"read", R"({"path":"/a.txt"})"}, {"write", R"({"content":"x"})"}}));
+    stream.feed_terminal(finish);
+    int failures = 0;
+    const Json* added_1 = stream.at_type(0, live_size, "response.output_item.added",
+                                         "function_call");
+    failures += check(added_1 != nullptr && added_1->at("output_index") == 0 &&
+                          added_1->at("item").at("name") == "read",
+                      "E5: the first live call owns output index 0");
+    failures += check(stream.count(live_size, stream.events.size(),
+                                   "response.function_call_arguments.done") == 2 &&
+                          stream.count(live_size, stream.events.size(), "response.output_item.done",
+                                       "function_call") == 2,
+                      "E5: both live calls close with done events");
+    bool both_completed = true;
+    for (std::size_t index = live_size; index < stream.events.size(); ++index) {
+        const Json& event = stream.events[index];
+        if (event.at("type") != "response.output_item.done" ||
+            event.at("item").at("type") != "function_call") {
+            continue;
+        }
+        if (event.at("item").at("status") != "completed") { both_completed = false; }
+    }
+    failures += check(both_completed, "E5: both terminal items are completed");
+    const Json& body = finish.response.body.at("output");
+    failures += check(
+        body.size() == 2 && body[0].at("type") == "function_call" &&
+            body[0].at("name") == "read" && body[0].at("arguments") == R"({"path":"/a.txt"})" &&
+            body[1].at("name") == "write",
+        "E5: the body order and arguments follow the stream");
+    return failures;
+}
+
+// E6: retraction: a call that disappears from the snapshots receives no mid-stream event; the
+// finish batch closes it once as incomplete.
+int test_e6_retraction_no_midstream_close() {
+    PreviewStream stream("resp_e6", plain_stream_request());
+    const std::string partial = R"({"path":"/tmp/x")";
+    stream.feed(stream.encoder.function_call_preview(preview_of({{"write", partial}})));
+    const std::size_t after_add = stream.events.size();
+    stream.feed(stream.encoder.function_call_preview(preview_of({})));
+    int failures = 0;
+    failures += check(stream.events.size() == after_add,
+                      "E6: a retracted call produces no mid-stream event (BUG-12)");
+    const std::size_t live_size = stream.events.size();
+    const OpenAIResponsesStreamFinish finish = stream.encoder.finish(call_outcome({}));
+    stream.feed_terminal(finish);
+    const Json* item_done = stream.at_type(live_size, stream.events.size(),
+                                           "response.output_item.done", "function_call");
+    failures += check(item_done != nullptr &&
+                          item_done->at("item").at("status") == "incomplete" &&
+                          item_done->at("item").at("arguments") == partial &&
+                          stream.count(live_size, stream.events.size(), "response.output_item.done",
+                                       "function_call") == 1,
+                      "E6: the retracted call closes exactly once as incomplete");
+    return failures;
+}
+
+// E7: duplicate-parameter last-wins: the non-prefix snapshot round is suppressed; the terminal
+// done event carries the terminal arguments bit-identically to the body.
+int test_e7_duplicate_parameter_suppression() {
+    PreviewStream stream("resp_e7", plain_stream_request());
+    stream.feed(stream.encoder.function_call_preview(
+        preview_of({{"configure", R"({"value":"first\n"")"}})));
+    stream.feed(stream.encoder.function_call_preview(
+        preview_of({{"configure", R"({"value":"second\n"")"}})));
+    const std::size_t live_size = stream.events.size();
+    const OpenAIResponsesStreamFinish finish = stream.encoder.finish(
+        call_outcome({{"configure", R"({"value":"second"})"}}));
+    stream.feed_terminal(finish);
+    int failures = 0;
+    const Json* added = stream.at_type(0, live_size, "response.output_item.added",
+                                       "function_call");
+    failures += check(stream.joined_deltas(added->at("item").at("id").get<std::string>().c_str()) ==
+                          R"({"value":"first\n"")",
+                      "E7: the non-prefix duplicate round is suppressed (M1)");
+    const Json* done = stream.at_type(live_size, stream.events.size(),
+                                      "response.function_call_arguments.done");
+    const Json& body_call = finish.response.body.at("output")[0];
+    failures += check(done != nullptr && done->at("arguments") == R"({"value":"second"})" &&
+                          body_call.at("arguments") == done->at("arguments"),
+                      "E7: the terminal done event matches the body bit-identically");
+    return failures;
+}
+
+// E7b: boundary shift (BUG-13): an earlier parameter value changes when the region grows; the
+// shift round is suppressed and the terminal parse wins.
+int test_e7b_boundary_shift_suppression() {
+    PreviewStream stream("resp_e7b", plain_stream_request());
+    stream.feed(stream.encoder.function_call_preview(
+        preview_of({{"configure", R"({"a":"x"})"}})));
+    stream.feed(stream.encoder.function_call_preview(
+        preview_of({{"configure", R"({"a":"xy","b":"z"})"}})));
+    const std::size_t live_size = stream.events.size();
+    const OpenAIResponsesStreamFinish finish = stream.encoder.finish(
+        call_outcome({{"configure", R"({"a":"xy","b":"z"})"}}));
+    stream.feed_terminal(finish);
+    int failures = 0;
+    const Json* added = stream.at_type(0, live_size, "response.output_item.added",
+                                       "function_call");
+    failures += check(stream.joined_deltas(added->at("item").at("id").get<std::string>().c_str()) ==
+                          R"({"a":"x"})",
+                      "E7b: the shifted boundary round is suppressed");
+    const Json* done = stream.at_type(live_size, stream.events.size(),
+                                      "response.function_call_arguments.done");
+    const Json& body_call = finish.response.body.at("output")[0];
+    failures += check(done != nullptr && done->at("arguments") ==
+                          body_call.at("arguments") &&
+                          body_call.at("arguments") == R"({"a":"xy","b":"z"})",
+                      "E7b: the terminal parse wins with the shifted boundary");
+    return failures;
+}
+
+// E8: a snapshot round without growth emits no empty delta (BUG-9).
+int test_e8_no_empty_delta() {
+    PreviewStream stream("resp_e8", plain_stream_request());
+    const std::string partial = R"({"path":"/tmp/x")";
+    stream.feed(stream.encoder.function_call_preview(preview_of({{"write", partial}})));
+    const std::size_t after_first = stream.events.size();
+    stream.feed(stream.encoder.function_call_preview(preview_of({{"write", partial}})));
+    int failures = 0;
+    failures += check(stream.events.size() == after_first,
+                      "E8: an unchanged snapshot emits no events");
+    const std::size_t live_size = stream.events.size();
+    const OpenAIResponsesStreamFinish finish =
+        stream.encoder.finish(call_outcome({{"write", R"({"path":"/tmp/x"})"}}));
+    stream.feed_terminal(finish);
+    failures += check(
+        stream.count(live_size, stream.events.size(), "response.function_call_arguments.done") ==
+            1,
+        "E8: the finish batch still closes the live call");
+    return failures;
+}
+// E9: ID-reuse cross-check (BUG-3): a live-opened call that reaches the final body reuses its
+// stream ids and output index; added/delta are skipped in the finish batch.
+int test_e9_live_id_reuse() {
+    PreviewStream stream("resp_e9", plain_stream_request());
+    const std::string partial = R"({"path":"/tmp/x")";
+    stream.feed(stream.encoder.function_call_preview(preview_of({{"write", partial}})));
+    const Json* added = stream.at_type(0, stream.events.size(), "response.output_item.added",
+                                       "function_call");
+    const std::string item_id    = added->at("item").at("id").get<std::string>();
+    const std::string call_id    = added->at("item").at("call_id").get<std::string>();
+    const int output_index       = added->at("output_index").get<int>();
+    const std::size_t live_size  = stream.events.size();
+    const OpenAIResponsesStreamFinish finish =
+        stream.encoder.finish(call_outcome({{"write", R"({"path":"/tmp/x"})"}}));
+    stream.feed_terminal(finish);
+    int failures = 0;
+    failures += check(stream.count(live_size, stream.events.size(),
+                                   "response.output_item.added") == 0 &&
+                          stream.count(live_size, stream.events.size(),
+                                       "response.function_call_arguments.delta") == 0,
+                      "E9: no duplicate added/delta in the finish batch");
+    const Json* done = stream.at_type(live_size, stream.events.size(),
+                                      "response.function_call_arguments.done");
+    const Json* item_done = stream.at_type(live_size, stream.events.size(),
+                                           "response.output_item.done", "function_call");
+    failures += check(
+        done != nullptr && item_done != nullptr && done->at("item_id") == item_id &&
+            done->at("output_index") == output_index &&
+            item_done->at("item").at("id") == item_id &&
+            item_done->at("item").at("call_id") == call_id &&
+            item_done->at("output_index") == output_index,
+        "E9: done events carry the live ids and live output index");
+    const Json& body_call = finish.response.body.at("output")[0];
+    failures += check(body_call.at("id") == item_id && body_call.at("call_id") == call_id &&
+                          stream.count(0, stream.events.size(), "response.output_item.added",
+                                       "function_call") == 1,
+                      "E9: stream ids equal body ids with one added per item");
+    return failures;
+}
+
+// E10: preview after the finish batch is built (or before start) is an illegal state.
+int test_e10_preview_state_guard() {
+    OpenAIResponsesEventStream encoder("resp_e10", 1, plain_stream_request(), {});
+    const auto snapshot = preview_of({{"write", R"({"path":"/a"})"}});
+    int failures = 0;
+    bool threw_before_start = false;
+    try {
+        (void)encoder.function_call_preview(snapshot);
+    } catch (const std::logic_error&) {
+        threw_before_start = true;
+    }
+    failures += check(threw_before_start,
+                      "E10: a preview before start must throw logic_error");
+    encoder.start();
+    const OpenAIResponsesStreamFinish finish = encoder.finish(call_outcome({}));
+    bool threw_after_finish = false;
+    try {
+        (void)encoder.function_call_preview(snapshot);
+    } catch (const std::logic_error&) {
+        threw_after_finish = true;
+    }
+    failures += check(threw_after_finish,
+                      "E10: a preview after finish must throw logic_error");
+    (void)encoder.terminal(finish.response);
+    return failures;
+}
+
+// E11: wire identity: live preview events restore the MCP namespace identity exactly like the
+// terminal batch.
+int test_e11_namespace_identity_in_preview() {
+    const Json clock_namespace = {
+        {"type", "namespace"},
+        {"name", "mcp__clock"},
+        {"description", "Clock service"},
+        {"tools", Json::array({Json{{"type", "function"},
+                                    {"name", "now"},
+                                    {"description", "Read the current time"},
+                                    {"parameters", Json{{"type", "object"}}},
+                                    {"strict", false},
+                                    {"allowed_callers", Json::array({"direct"})},
+                                    {"defer_loading", false}}})}};
+    const OpenAIResponsesCreateRequest request = parse_openai_responses_create_request(
+        Json{{"model", "m"},
+             {"input", "time"},
+             {"tools", Json::array({clock_namespace})},
+             {"tool_choice", Json{{"type", "allowed_tools"},
+                                  {"mode", "auto"},
+                                  {"tools", Json::array({Json{{"type", "function"},
+                                                              {"namespace", "mcp__clock"},
+                                                              {"name", "now"}}})}}},
+             {"stream", true}},
+        limits());
+    PreviewStream stream("resp_e11", request);
+    stream.feed(stream.encoder.function_call_preview(
+        preview_of({{"mcp__clock__now", R"({"timezone":"U"})"}})));
+    const OpenAIResponsesStreamFinish finish = stream.encoder.finish(
+        call_outcome({{"mcp__clock__now", R"({"timezone":"UTC"})"}}));
+    stream.feed_terminal(finish);
+    int failures = 0;
+    for (const Json& event : stream.events) {
+        if (event.at("type") == "response.output_item.added" &&
+            event.at("item").at("type") == "function_call") {
+            failures += check(event.at("item").at("name") == "now" &&
+                                  event.at("item").at("namespace") == "mcp__clock",
+                              "E11: the live added event restores the namespace identity");
+        } else if (event.at("type") == "response.function_call_arguments.done") {
+            failures += check(event.at("name") == "now" &&
+                                  event.at("namespace") == "mcp__clock",
+                              "E11: the live done event restores the namespace identity");
+        } else if (event.at("type") == "response.output_item.done" &&
+                   event.at("item").at("type") == "function_call") {
+            failures += check(event.at("item").at("name") == "now" &&
+                                  event.at("item").at("namespace") == "mcp__clock",
+                              "E11: the live item-done restores the namespace identity");
+        }
+    }
+    return failures;
+}
+
+// E12: a complete call with an incomplete terminal (output limit after the call): the live
+// item closes completed with live ids, so the call stays promotable in the body.
+int test_e12_output_limit_after_complete_call() {
+    PreviewStream stream("resp_e12", plain_stream_request());
+    const std::string partial = R"({"path":"/tmp/x")";
+    stream.feed(stream.encoder.function_call_preview(preview_of({{"write", partial}})));
+    const Json* added = stream.at_type(0, stream.events.size(), "response.output_item.added",
+                                       "function_call");
+    const std::string item_id = added->at("item").at("id").get<std::string>();
+    const std::size_t live_size = stream.events.size();
+    const OpenAIResponsesStreamFinish finish = stream.encoder.finish(
+        call_outcome({{"write", R"({"path":"/tmp/x"})"}}, ninfer::FinishReason::OutputLimit));
+    stream.feed_terminal(finish);
+    int failures = 0;
+    const Json* item_done = stream.at_type(live_size, stream.events.size(),
+                                           "response.output_item.done", "function_call");
+    failures += check(item_done != nullptr &&
+                          item_done->at("item").at("status") == "completed" &&
+                          item_done->at("item").at("id") == item_id,
+                      "E12: the complete call closes as completed with the live id");
+    const Json& body_call = finish.response.body.at("output")[0];
+    failures += check(body_call.at("type") == "function_call" &&
+                          body_call.at("id") == item_id &&
+                          body_call.at("arguments") == R"({"path":"/tmp/x"})" &&
+                          finish.response.body.at("status") == "incomplete",
+                      "E12: the body keeps the call promotable under an incomplete terminal");
+    return failures;
+}
+
+// E13: ambiguous name match: two unmatched live calls share the final call's name, so the
+// final call gets fresh ids (no live match); all three live items phantom-close as
+// incomplete with their last emitted partials.
+int test_e13_ambiguous_name_match_fresh_ids() {
+    PreviewStream stream("resp_e13", plain_stream_request());
+    stream.feed(stream.encoder.function_call_preview(
+        preview_of({{"read", R"({"path":"/a.txt\n"")"},
+                    {"write", R"({"content":"x"")"},
+                    {"write", R"({"path":"/b"")"}})));
+    const std::size_t live_size = stream.events.size();
+    const OpenAIResponsesStreamFinish finish =
+        stream.encoder.finish(call_outcome({{"write", R"({"content":"x"})"}}));
+    stream.feed_terminal(finish);
+    int failures = 0;
+    failures += check(stream.count(0, live_size, "response.output_item.added",
+                                   "function_call") == 3,
+                      "E13: all three live calls are added");
+    std::vector<std::string> live_item_ids;
+    for (std::size_t index = 0; index < live_size; ++index) {
+        const Json& event = stream.events[index];
+        if (event.at("type") == "response.output_item.added" &&
+            event.at("item").at("type") == "function_call") {
+            live_item_ids.push_back(event.at("item").at("id").get<std::string>());
+        }
+    }
+    std::size_t completed  = 0;
+    std::size_t incomplete = 0;
+    std::string completed_item_id;
+    int completed_output_index = -1;
+    std::vector<std::pair<std::string, std::string>> incomplete_items;
+    for (std::size_t index = live_size; index < stream.events.size(); ++index) {
+        const Json& event = stream.events[index];
+        if (event.at("type") != "response.output_item.done" ||
+            event.at("item").at("type") != "function_call") {
+            continue;
+        }
+        if (event.at("item").at("status") == "completed") {
+            ++completed;
+            completed_item_id      = event.at("item").at("id").get<std::string>();
+            completed_output_index = event.at("output_index").get<int>();
+        } else {
+            ++incomplete;
+            incomplete_items.emplace_back(event.at("item").at("name").get<std::string>(),
+                                           event.at("item").at("arguments").get<std::string>());
+        }
+    }
+    failures += check(completed == 1 && incomplete == 3,
+                      "E13: one completed item and all three live items incomplete");
+    bool completed_id_is_live = false;
+    for (const std::string& live_id : live_item_ids) {
+        if (live_id == completed_item_id) { completed_id_is_live = true; }
+    }
+    failures += check(!completed_id_is_live && completed_output_index == 3,
+                      "E13: the ambiguous final call gets fresh ids at the next output index");
+    const Json* arguments_done = stream.at_type(live_size, stream.events.size(),
+                                                "response.function_call_arguments.done");
+    failures += check(stream.count(live_size, stream.events.size(),
+                                   "response.function_call_arguments.done") == 1 &&
+                         arguments_done != nullptr &&
+                         arguments_done->at("item_id") == completed_item_id,
+                      "E13: exactly one arguments-done event, on the fresh id");
+    failures += check(
+        incomplete_items.size() == 3 &&
+            incomplete_items[0] == std::make_pair("read", R"({"path":"/a.txt\n"")") &&
+            incomplete_items[1] == std::make_pair("write", R"({"content":"x"")") &&
+            incomplete_items[2] == std::make_pair("write", R"({"path":"/b"")"),
+        "E13: the phantom closes keep the last emitted partials in live order");
+    const Json& body = finish.response.body.at("output");
+    failures += check(body.size() == 1 && body[0].at("type") == "function_call" &&
+                         body[0].at("id") == completed_item_id &&
+                         body[0].at("arguments") == R"({"content":"x"})",
+                      "E13: the body carries the final call with the fresh id");
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -1229,6 +1850,20 @@ int main() {
     failures += test_response_object();
     failures += test_sse_sequence_and_failures();
     failures += test_input_tokens_uses_shared_state_path();
+    failures += test_e1_flag_off_stream_unchanged();
+    failures += test_e2_preview_then_finish();
+    failures += test_e3_truncated_call_not_in_body();
+    failures += test_e4_dual_truncation_no_promotion();
+    failures += test_e5_parallel_calls_complete();
+    failures += test_e6_retraction_no_midstream_close();
+    failures += test_e7_duplicate_parameter_suppression();
+    failures += test_e7b_boundary_shift_suppression();
+    failures += test_e8_no_empty_delta();
+    failures += test_e9_live_id_reuse();
+    failures += test_e10_preview_state_guard();
+    failures += test_e11_namespace_identity_in_preview();
+    failures += test_e12_output_limit_after_complete_call();
+    failures += test_e13_ambiguous_name_match_fresh_ids();
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }

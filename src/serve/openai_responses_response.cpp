@@ -385,6 +385,13 @@ public:
     std::string reasoning_text;
     std::string content_text;
     ItemIds ids;
+    struct FunctionCallLive {
+        int output_index = -1;
+        std::string item_id, call_id;
+        std::string name;
+        std::string last_emitted; // already-emitted partial string (suffix diff)
+    };
+    std::vector<FunctionCallLive> live_calls;
 };
 
 OpenAIResponsesEventStream::OpenAIResponsesEventStream(std::string response_id,
@@ -443,6 +450,67 @@ std::vector<std::string> OpenAIResponsesEventStream::content_delta(const std::st
     return events;
 }
 
+std::vector<std::string>
+OpenAIResponsesEventStream::function_call_preview(const ninfer::ToolCallPreviewSnapshot& snapshot) {
+    if (!impl_->started || impl_->finish_built) {
+        throw std::logic_error("invalid tool-call preview event state");
+    }
+    if (snapshot.calls.empty()) { return {}; }
+    const std::size_t live = impl_->live_calls.size();
+    std::size_t matched = 0;
+    while (matched < live && matched < snapshot.calls.size() &&
+           impl_->live_calls[matched].name == snapshot.calls[matched].name) {
+        ++matched;
+    }
+    std::vector<std::string> events;
+    // New calls: item add plus one full-arguments delta. Live calls that disappeared receive no
+    // mid-stream event (BUG-12); only the finish batch closes them.
+    for (std::size_t j = matched; j < snapshot.calls.size(); ++j) {
+        const auto& call = snapshot.calls[j];
+        Impl::FunctionCallLive live_entry;
+        live_entry.output_index = impl_->next_output_index++;
+        live_entry.item_id      = new_openai_response_item_id("fc");
+        live_entry.call_id      = new_openai_response_item_id("call");
+        live_entry.name         = call.name;
+        Json added_item         = {{"id", live_entry.item_id},
+                                   {"type", "function_call"},
+                                   {"status", "in_progress"},
+                                   {"call_id", live_entry.call_id},
+                                   {"arguments", ""}};
+        add_wire_function_identity(added_item, impl_->request, call.name);
+        events.push_back(sse(impl_->event(
+            "response.output_item.added",
+            Json{{"output_index", live_entry.output_index}, {"item", added_item}})));
+        if (!call.partial_arguments.empty()) {
+            live_entry.last_emitted = call.partial_arguments;
+            events.push_back(sse(impl_->event(
+                "response.function_call_arguments.delta",
+                Json{{"item_id", live_entry.item_id},
+                     {"output_index", live_entry.output_index},
+                     {"delta", call.partial_arguments}})));
+        }
+        impl_->live_calls.push_back(std::move(live_entry));
+    }
+    // Stable calls: strict prefix growth only; duplicate last-wins and boundary shifts are
+    // suppressed (M1 violation) and settled by the terminal batch.
+    for (std::size_t j = 0; j < matched; ++j) {
+        Impl::FunctionCallLive& live_entry = impl_->live_calls[j];
+        const std::string& partial       = snapshot.calls[j].partial_arguments;
+        if (partial.size() <= live_entry.last_emitted.size() ||
+            !partial.starts_with(live_entry.last_emitted)) {
+            continue;
+        }
+        const std::string suffix = partial.substr(live_entry.last_emitted.size());
+        live_entry.last_emitted  = partial;
+        events.push_back(sse(impl_->event(
+            "response.function_call_arguments.delta",
+            Json{{"item_id", live_entry.item_id},
+                 {"output_index", live_entry.output_index},
+                 {"delta", suffix}})));
+    }
+    return events;
+}
+
 OpenAIResponsesStreamFinish OpenAIResponsesEventStream::finish(const GenerationOutcome& outcome) {
     if (!impl_->started || impl_->finish_built) {
         throw std::logic_error("invalid Responses stream finish state");
@@ -490,44 +558,117 @@ OpenAIResponsesStreamFinish OpenAIResponsesEventStream::finish(const GenerationO
         append(impl_->close_message(outcome.text, item_status));
     }
 
-    impl_->ids.function_calls.reserve(outcome.tool_calls.size());
-    impl_->ids.call_ids.reserve(outcome.tool_calls.size());
-    for (const ninfer::GeneratedToolCall& call : outcome.tool_calls) {
-        const std::string item_id = new_openai_response_item_id("fc");
-        const std::string call_id = new_openai_response_item_id("call");
-        impl_->ids.function_calls.push_back(item_id);
-        impl_->ids.call_ids.push_back(call_id);
-        const int output_index = impl_->next_output_index++;
-        Json added_item        = {{"id", item_id},
-                                  {"type", "function_call"},
-                                  {"status", "in_progress"},
-                                  {"call_id", call_id},
-                                  {"arguments", ""}};
-        add_wire_function_identity(added_item, impl_->request, call.name);
-        finished.events_before_terminal.push_back(
-            sse(impl_->event("response.output_item.added",
-                             Json{{"output_index", output_index}, {"item", added_item}})));
-        if (!call.arguments_json.empty()) {
-            finished.events_before_terminal.push_back(sse(impl_->event(
-                "response.function_call_arguments.delta", Json{{"item_id", item_id},
-                                                               {"output_index", output_index},
-                                                               {"delta", call.arguments_json}})));
+    {
+        // Live preview state must agree with the terminal calls where both are present; a
+        // same-size name divergence is structurally impossible and indicates a bug (BUG-11).
+        if (impl_->live_calls.size() == outcome.tool_calls.size()) {
+            for (std::size_t index = 0; index < outcome.tool_calls.size(); ++index) {
+                if (impl_->live_calls[index].name != outcome.tool_calls[index].name) {
+                    throw std::logic_error("live tool-call preview diverged from terminal calls");
+                }
+            }
         }
-        Json arguments_done = {{"item_id", item_id},
-                               {"output_index", output_index},
-                               {"arguments", call.arguments_json}};
-        add_wire_function_identity(arguments_done, impl_->request, call.name);
-        finished.events_before_terminal.push_back(
-            sse(impl_->event("response.function_call_arguments.done", std::move(arguments_done))));
-        Json done_item = {{"id", item_id},
-                          {"type", "function_call"},
-                          {"status", "completed"},
-                          {"call_id", call_id},
-                          {"arguments", call.arguments_json}};
-        add_wire_function_identity(done_item, impl_->request, call.name);
-        finished.events_before_terminal.push_back(
-            sse(impl_->event("response.output_item.done",
-                             Json{{"output_index", output_index}, {"item", done_item}})));
+        // Match terminal calls to live calls: by index first, then by unique name.
+        const std::size_t final_count = outcome.tool_calls.size();
+        std::vector<bool> matched_live(impl_->live_calls.size(), false);
+        std::vector<std::int64_t> live_for_final(final_count, -1);
+        for (std::size_t index = 0; index < final_count; ++index) {
+            if (index < impl_->live_calls.size() && !matched_live[index] &&
+                impl_->live_calls[index].name == outcome.tool_calls[index].name) {
+                live_for_final[index] = static_cast<std::int64_t>(index);
+                matched_live[index]    = true;
+            }
+        }
+        for (std::size_t index = 0; index < final_count; ++index) {
+            if (live_for_final[index] != -1) { continue; }
+            // At most one unmatched live call may carry the final call's name; a name held by
+            // several live calls is ambiguous, so the final call gets fresh IDs and all the
+            // live calls with that name stay unmatched (phantom-closed as incomplete).
+            std::int64_t unique_match = -1;
+            bool multiple             = false;
+            for (std::size_t live_index = 0; live_index < impl_->live_calls.size(); ++live_index) {
+                if (!matched_live[live_index] &&
+                    impl_->live_calls[live_index].name == outcome.tool_calls[index].name) {
+                    if (unique_match != -1) { multiple = true; break; }
+                    unique_match = static_cast<std::int64_t>(live_index);
+                }
+            }
+            if (unique_match != -1 && !multiple) {
+                live_for_final[index]      = unique_match;
+                matched_live[unique_match] = true;
+            }
+        }
+        impl_->ids.function_calls.reserve(final_count);
+        impl_->ids.call_ids.reserve(final_count);
+        for (std::size_t index = 0; index < final_count; ++index) {
+            const std::int64_t live_index = live_for_final[index];
+            if (live_index != -1) {
+                impl_->ids.function_calls.push_back(impl_->live_calls[live_index].item_id);
+                impl_->ids.call_ids.push_back(impl_->live_calls[live_index].call_id);
+            } else {
+                impl_->ids.function_calls.push_back(new_openai_response_item_id("fc"));
+                impl_->ids.call_ids.push_back(new_openai_response_item_id("call"));
+            }
+        }
+        // Terminal events per final call: a live item is closed with done events only; a new
+        // item receives the full added/delta/done/item-done batch.
+        for (std::size_t index = 0; index < final_count; ++index) {
+            const ninfer::GeneratedToolCall& call  = outcome.tool_calls[index];
+            const std::int64_t live_index          = live_for_final[index];
+            const std::string item_id              = impl_->ids.function_calls[index];
+            const std::string call_id              = impl_->ids.call_ids[index];
+            const int output_index =
+                live_index != -1 ? impl_->live_calls[live_index].output_index
+                                 : impl_->next_output_index++;
+            if (live_index == -1) {
+                Json added_item = {{"id", item_id},
+                                   {"type", "function_call"},
+                                   {"status", "in_progress"},
+                                   {"call_id", call_id},
+                                   {"arguments", ""}};
+                add_wire_function_identity(added_item, impl_->request, call.name);
+                finished.events_before_terminal.push_back(
+                    sse(impl_->event("response.output_item.added",
+                                     Json{{"output_index", output_index}, {"item", added_item}})));
+                if (!call.arguments_json.empty()) {
+                    finished.events_before_terminal.push_back(sse(impl_->event(
+                        "response.function_call_arguments.delta", Json{{"item_id", item_id},
+                                                                       {"output_index", output_index},
+                                                                       {"delta", call.arguments_json}})));
+                }
+            }
+            Json arguments_done = {{"item_id", item_id},
+                                   {"output_index", output_index},
+                                   {"arguments", call.arguments_json}};
+            add_wire_function_identity(arguments_done, impl_->request, call.name);
+            finished.events_before_terminal.push_back(
+                sse(impl_->event("response.function_call_arguments.done",
+                                 std::move(arguments_done))));
+            Json done_item = {{"id", item_id},
+                              {"type", "function_call"},
+                              {"status", "completed"},
+                              {"call_id", call_id},
+                              {"arguments", call.arguments_json}};
+            add_wire_function_identity(done_item, impl_->request, call.name);
+            finished.events_before_terminal.push_back(
+                sse(impl_->event("response.output_item.done",
+                                 Json{{"output_index", output_index}, {"item", done_item}})));
+        }
+        // Live calls that never produced a terminal call are closed as incomplete display-only
+        // items in live emission order, without an arguments-done event.
+        for (std::size_t live_index = 0; live_index < impl_->live_calls.size(); ++live_index) {
+            if (matched_live[live_index]) { continue; }
+            const Impl::FunctionCallLive& live = impl_->live_calls[live_index];
+            Json done_item               = {{"id", live.item_id},
+                                            {"type", "function_call"},
+                                            {"status", "incomplete"},
+                                            {"call_id", live.call_id},
+                                            {"arguments", live.last_emitted}};
+            add_wire_function_identity(done_item, impl_->request, live.name);
+            finished.events_before_terminal.push_back(
+                sse(impl_->event("response.output_item.done",
+                                 Json{{"output_index", live.output_index}, {"item", done_item}})));
+        }
     }
 
     finished.response = build_response(impl_->id, impl_->created_at, impl_->request, impl_->runtime,

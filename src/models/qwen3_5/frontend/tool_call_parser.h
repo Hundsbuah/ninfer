@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -86,6 +87,12 @@ public:
 
     [[nodiscard]] std::string feed(std::string_view text);
     [[nodiscard]] Terminal finish();
+    // Display-only view of the in-progress tool calls: the tolerant partial parse of the region
+    // so far (independent of the request's strict/tolerant mode). Returns nullopt when no marker
+    // was seen, when the region is empty, when the decoder is finished (the terminal result is
+    // the authority), or when the growth gate (region growth >= 64 bytes or a changed call
+    // count) has not passed.
+    [[nodiscard]] std::optional<ninfer::ToolCallPreviewSnapshot> partial_view();
 
 private:
     std::shared_ptr<const ToolCallOutputContract> contract_;
@@ -96,6 +103,10 @@ private:
     bool tolerant_                    = false;
     bool saw_tool_marker_             = false;
     bool finished_                    = false;
+    // Growth gate: the partial re-parse runs on the decode lane, so snapshots are only produced
+    // when the region grew by at least 64 bytes or a new call appeared since the last view.
+    std::size_t last_snapshot_region_size_ = 0;
+    std::size_t last_snapshot_call_count_  = 0;
 };
 
 } // namespace ninfer::models::qwen3_5::frontend

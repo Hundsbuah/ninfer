@@ -112,6 +112,9 @@ public:
     std::vector<std::string> start();
     std::vector<std::string> reasoning_delta(const std::string& text);
     std::vector<std::string> content_delta(const std::string& text);
+    // Live tool-call argument preview: adds items and emits suffix-delta events for in-progress
+    // function calls. Display-only; finish() remains the single source of final state.
+    std::vector<std::string> function_call_preview(const ninfer::ToolCallPreviewSnapshot& snapshot);
     OpenAIResponsesStreamFinish finish(const GenerationOutcome& outcome);
     std::string terminal(const BuiltOpenAIResponse& response);
     std::string failed(const ApiError& error);

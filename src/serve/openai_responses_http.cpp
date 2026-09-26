@@ -423,6 +423,12 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
                                          [&] { return stream->encoder->content_delta(text); });
                     };
                     output.is_cancelled = [&] { return transport.poll(); };
+                    if (options_.stream_tool_args) {
+                        output.on_tool_call_preview = [&](const ninfer::ToolCallPreviewSnapshot& snapshot) {
+                            render_and_write(transport,
+                                             [&] { return stream->encoder->function_call_preview(snapshot); });
+                        };
+                    }
 
                     outcome = service_->run(stream->prepared, &output);
                 } catch (const ClientDisconnected&) {
