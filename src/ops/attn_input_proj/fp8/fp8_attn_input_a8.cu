@@ -5,6 +5,7 @@
 #include "core/device.h"
 #include "ops/attn_input_proj/fp8/fp8_attn_input_output.cuh"
 #include "ops/linear/fp8/fp8_a8_mma.cuh"
+#include "ops/linear/fp8/fp8_a8_tma.cuh"
 #include "ops/linear/fp8/fp8_schedule.cuh"
 #include "ops/linear/common/epilogue.cuh"
 
@@ -56,7 +57,13 @@ void fp8_attn_input_a8_launch(const Tensor& x, const Weight& weight, Tensor& q, 
         run<Wide128>(weight, q, gate, k, v, workspace, x.ne[1], stream);
     else if (x.ne[1] <= 144)
         run<Tail144>(weight, q, gate, k, v, workspace, x.ne[1], stream);
-    else
-        run<Prefill>(weight, q, gate, k, v, workspace, x.ne[1], stream);
+    else {
+        const Fp8AttentionInputOutput output{
+            static_cast<__nv_bfloat16*>(q.data), static_cast<__nv_bfloat16*>(k.data),
+            static_cast<__nv_bfloat16*>(gate.data), static_cast<__nv_bfloat16*>(v.data)};
+        if (!launch_fp8_a8_tma_if_cheaper<Prefill>(fp8_a8_operands(weight, workspace, x.ne[1]),
+                                                   output, LinearIdentityEpilogue{}, stream))
+            run<Prefill>(weight, q, gate, k, v, workspace, x.ne[1], stream);
+    }
 }
 } // namespace ninfer::ops::detail

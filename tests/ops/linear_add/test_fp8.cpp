@@ -100,6 +100,11 @@ int run_shape(std::int32_t n, std::int32_t k, std::int32_t first_a8, std::uint32
         Invocation{48, ops::LinearPolicy::AllowA8},
         Invocation{65, ops::LinearPolicy::AllowA8},
         Invocation{1024, ops::LinearPolicy::AllowA8},
+        // The TMA-staged prefill route on an RTX 5090: the cost model's 1664, the always-TMA
+        // floor at 2048 (whole tiles) and 4001 (a partial last tile).
+        Invocation{1664, ops::LinearPolicy::AllowA8},
+        Invocation{2048, ops::LinearPolicy::AllowA8},
+        Invocation{4001, ops::LinearPolicy::AllowA8},
         Invocation{8, ops::LinearPolicy::AllowA8},
         Invocation{16, ops::LinearPolicy::AllowA8},
         Invocation{32, ops::LinearPolicy::AllowA8},
@@ -113,7 +118,7 @@ int run_shape(std::int32_t n, std::int32_t k, std::int32_t first_a8, std::uint32
     }
     for (int columns : {31, 32, 33, 63, 64, 65, 127, 128, 129, 1024})
         invocations.push_back({columns, ops::LinearPolicy::A16Only});
-    constexpr std::int32_t kMaximumTokens = 1024;
+    constexpr std::int32_t kMaximumTokens = 4001;
     quantized_weight::PackedWeight host_weight =
         quantized_weight::make_patterned_weight(QType::FP8_E4M3FN_ROW_BF16, n, k, seed);
     const std::vector<std::int32_t> rows = sampled_indices(n);

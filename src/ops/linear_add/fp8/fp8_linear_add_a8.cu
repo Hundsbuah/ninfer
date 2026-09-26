@@ -5,6 +5,7 @@
 #include "core/device.h"
 #include "ops/linear/fp8/fp8_a8_mma.cuh"
 #include "ops/linear/fp8/fp8_a8_plan.h"
+#include "ops/linear/fp8/fp8_a8_tma.cuh"
 #include "ops/linear/fp8/fp8_instances.cuh"
 #include "ops/linear/fp8/fp8_schedule.cuh"
 #include "ops/linear/common/epilogue.cuh"
@@ -12,6 +13,7 @@
 #include <cuda_bf16.h>
 
 #include <cstdint>
+#include <limits>
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
@@ -37,6 +39,12 @@ void launch_problem(const Weight& weight, Tensor& residual, Fp8A8Workspace works
                                       Fp8MmaFragmentPipeline::PingPong, Fp8MmaRaster::TokenFast>;
     if (tokens <= 96) return launch.template operator()<Narrow32>();
     if (tokens <= 128) return launch.template operator()<Narrow64>();
+    // Upstream measured the TMA route behind its cost model past 4096 tokens at K=6144.
+    constexpr std::int32_t kTmaMaxTokens =
+        Geometry::kInputRows == 6144 ? 4096 : std::numeric_limits<std::int32_t>::max();
+    if (launch_fp8_a8_tma_if_cheaper<Fp8A8T64R128K128>(fp8_a8_operands(weight, workspace, tokens),
+                                                       output, epilogue, stream, kTmaMaxTokens))
+        return;
     launch.template operator()<Fp8A8T64R128K128>();
 }
 

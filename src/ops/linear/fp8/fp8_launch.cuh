@@ -2,7 +2,9 @@
 #include "ops/linear/fp8/fp8_launch.h"
 #include "ops/linear/fp8/fp8_template_launch.cuh"
 #include "ops/linear/fp8/fp8_instances.cuh"
+#include "ops/linear/fp8/fp8_a8_tma.cuh"
 #include <algorithm>
+#include <type_traits>
 
 namespace ninfer::ops::detail {
 template <class Geometry, class Schedule>
@@ -37,9 +39,14 @@ template <class Geometry, class Schedule>
 void launch_fp8_a8(const Tensor& x, const Weight& w, Tensor& out, Fp8A8Workspace scratch,
                    cudaStream_t stream) {
     launch_fp8_a8_quantize(x, w, scratch, stream);
+    const Fp8A8Operands operands = fp8_a8_operands(w, scratch, x.ne[1]);
+    const LinearBf16Output output{static_cast<__nv_bfloat16*>(out.data), w.n};
+    if constexpr (std::is_same_v<Schedule, Fp8A8T64R128K128>) {
+        if (launch_fp8_a8_tma_if_cheaper<Schedule>(operands, output, LinearIdentityEpilogue{},
+                                                   stream))
+            return;
+    }
     launch_fp8_a8_mma<Fp8ScheduleInstance<Schedule, Geometry::kInputRows>>(
-        fp8_a8_operands(w, scratch, x.ne[1]),
-        LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), w.n}, LinearIdentityEpilogue{},
-        stream);
+        operands, output, LinearIdentityEpilogue{}, stream);
 }
 } // namespace ninfer::ops::detail

@@ -466,6 +466,11 @@ int run_fp8_target() {
         }
         for (int t : {129, 144, 145, 160, 161, 192, 193, 256, 257, 1024})
             failures += run_target_projection_case(parent, nullptr, t, policy);
+        // Widths the A8 TMA-staged prefill route takes on an RTX 5090: a partial last 256-token
+        // tile and whole tiles.
+        if (policy == ops::LinearPolicy::AllowA8)
+            for (int t : {1345, 4096})
+                failures += run_target_projection_case(parent, nullptr, t, policy);
         for (int t : {1,  4,  5,  6,  8,  9,  16,  24,  25,  32,  33,  34,
                       64, 65, 80, 81, 96, 97, 128, 129, 144, 145, 160, 161})
             failures += run_target_projection_case(parent, nullptr, t, policy, true);

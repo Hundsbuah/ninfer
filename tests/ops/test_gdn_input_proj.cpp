@@ -405,7 +405,9 @@ int run_fp8() {
 
     failures += run_fp8_case(parent, 1, ops::LinearPolicy::A16Only, true);
     failures += run_fp8_case(parent, 2, ops::LinearPolicy::A16Only);
-    for (const std::int32_t tokens : {1, 2, 7, 8, 48, 65, 1024}) {
+    // 1153 and 3584 take the A8 TMA-staged prefill route on an RTX 5090 (a partial last tile and
+    // the production prefill chunk).
+    for (const std::int32_t tokens : {1, 2, 7, 8, 48, 65, 1024, 1153, 3584}) {
         failures += run_fp8_case(
             parent, tokens, tokens == 8 ? ops::LinearPolicy::AllowA4 : ops::LinearPolicy::AllowA8);
     }
