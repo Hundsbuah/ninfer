@@ -104,7 +104,10 @@ int run_shape(std::int32_t n, std::int32_t k, std::int32_t first_a8, std::uint32
         Invocation{16, ops::LinearPolicy::AllowA8},
         Invocation{32, ops::LinearPolicy::AllowA8},
         Invocation{64, ops::LinearPolicy::AllowA8},
+        Invocation{95, ops::LinearPolicy::AllowA8},
         Invocation{96, ops::LinearPolicy::AllowA8},
+        Invocation{97, ops::LinearPolicy::AllowA8},
+        Invocation{127, ops::LinearPolicy::AllowA8},
         Invocation{128, ops::LinearPolicy::AllowA8},
         Invocation{129, ops::LinearPolicy::AllowA8},
     };
