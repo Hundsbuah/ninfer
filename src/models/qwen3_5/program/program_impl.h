@@ -1459,6 +1459,8 @@ private:
                   std::span<const runtime::RoundBudget> budgets);
     [[nodiscard]] NgramProposer::Match propose_ngram_one(std::uint32_t lane,
                                                          const runtime::RoundBudget& budget);
+    // Moves the prepared prompt's ngram index and archive snapshot into an admitted request.
+    static void take_ngram_index(RequestControl& request, PreparedPromptData& prompt);
     [[nodiscard]] runtime::BatchedGeneratedRound
     decode_ordinary_batch(std::span<const std::uint32_t> lanes,
                           std::span<const runtime::RoundBudget> budgets,
