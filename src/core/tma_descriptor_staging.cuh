@@ -28,8 +28,8 @@ namespace ninfer {
 // Invariants, documented here because this is the single staging site:
 //   - one stream: every staged launch runs on the engine's single compute stream, so the
 //     persistent device buffer orders against itself in-stream;
-//   - allocation before capture: the buffer is allocated by the first stage() call, which must
-//     not be inside a stream capture (an eager launch of the route precedes every capture);
+//   - allocation outside the graph: the buffer is allocated by the first stage() call, in relaxed
+//     capture mode, so a route first reached while a decode graph is being captured still works;
 //   - nothing is freed: the device buffer is reclaimed at process exit.
 namespace tma_staging_detail {
 
@@ -69,8 +69,14 @@ class TmaDescriptorStaging {
     // the kernel must read them from.
     Descriptor* stage(const Descriptor& descriptors, cudaStream_t stream) {
         if (device_ == nullptr) {
-            void* buffer = nullptr;
-            CUDA_CHECK(cudaMalloc(&buffer, sizeof(Descriptor)));
+            // The allocation is not a stream operation; relaxed mode lets it happen while this
+            // thread captures, so it never lands in (or aborts) a graph.
+            cudaStreamCaptureMode mode = cudaStreamCaptureModeRelaxed;
+            CUDA_CHECK(cudaThreadExchangeStreamCaptureMode(&mode));
+            void* buffer             = nullptr;
+            const cudaError_t status = cudaMalloc(&buffer, sizeof(Descriptor));
+            CUDA_CHECK(cudaThreadExchangeStreamCaptureMode(&mode));
+            CUDA_CHECK(status);
             device_ = static_cast<Descriptor*>(buffer);
         }
         tma_staging_detail::DescriptorWords<kWords> words;
