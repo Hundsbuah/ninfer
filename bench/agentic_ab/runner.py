@@ -220,6 +220,13 @@ class Serve:
         deadline = time.time() + load_timeout
         while time.time() < deadline:
             if self.proc.poll() is not None:
+                # A rejected flag is a configuration error, not a context that does not fit:
+                # stop instead of letting calibration retry smaller contexts.
+                with open(self.serve_log, encoding="utf-8", errors="replace") as sf:
+                    rejected = [ln.strip() for ln in sf if "unknown argument" in ln]
+                if rejected:
+                    raise SystemExit("serve rejected its launch flags: %s (see %s)"
+                                     % (rejected[0], self.serve_log))
                 raise RuntimeError("serve exited during startup (rc=%s); see %s"
                                    % (self.proc.returncode, self.serve_log))
             try:
