@@ -4,6 +4,7 @@
 #include "runtime/prefix_cache/tap_planner.h"
 
 #include "models/qwen3_5/frontend/frontend.h"
+#include "models/qwen3_5/program/ngram_proposer.h"
 
 #include <array>
 #include <cstddef>
@@ -152,6 +153,9 @@ struct PreparedPromptData {
     std::vector<TokenId> ngram_boundaries;
     std::vector<NgramSourceView> ngram_archive_sources;
     std::shared_ptr<const NgramSnapshot> ngram_snapshot;
+    // The request's live ngram index over token_ids and ngram_sources, present whenever ngram
+    // drafting is enabled. Preparation builds it so admission only moves it into the request.
+    std::unique_ptr<detail::NgramProposer> ngram_index;
     std::vector<TokenId> token_ids;
     std::vector<std::uint8_t> token_types;
     std::vector<std::int32_t> positions;

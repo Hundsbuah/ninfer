@@ -874,14 +874,7 @@ StartResult ProgramImpl::hybrid_activate(HybridMaterializationTransaction& trans
                        .backend_kv_pages = backend_pool ? quote.backend_kv_page_entitlement : 0U}};
         request.optional_resources = {};
 
-        if (ngram_draft_window != 0) {
-            request.ngram = std::make_unique<NgramProposer>();
-            request.ngram->set_boundaries(prompt.ngram_boundaries);
-            request.ngram->ingest(prompt.token_ids);
-            for (const auto& source : prompt.ngram_sources) { request.ngram->ingest(source); }
-            request.ngram_indexed  = prompt.token_ids.size();
-            request.ngram_snapshot = std::move(prompt.ngram_snapshot);
-        }
+        if (ngram_draft_window != 0) { take_ngram_index(request, prompt); }
 
         std::optional<VisionPrefillPlan> vision;
         if (quote.vision_control_plan) {
