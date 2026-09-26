@@ -664,6 +664,11 @@ and content indices remain stable, and concatenated deltas equal the terminal It
 does not emit the Chat Completions `[DONE]` sentinel. With tools enabled, ordinary answer text still
 streams immediately; only an ambiguous `<tool_call>` suffix or the structured tool region is held.
 Malformed tool markup is flushed back as ordinary text without losing bytes.
+With in-progress tool-call argument streaming enabled (`--stream-tool-args`), live
+`function_call` Items are added as their arguments grow. The assistant `message` Item is
+created before the first live call, so Items always appear in the canonical reasoning,
+message, then function_call order; if the tool region is later flushed back as ordinary
+text, that reserved message may remain empty in both the stream and the terminal output.
 
 ### Local response state and resources
 

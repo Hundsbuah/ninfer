@@ -10,6 +10,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <iostream>
 #include <string>
 #include <utility>
@@ -1389,7 +1390,7 @@ int test_e2_preview_then_finish() {
             item_done->at("item").at("status") == "completed" &&
             item_done->at("item").at("arguments") == terminal_args,
         "E2: the finish batch closes the live item with the terminal arguments");
-    const Json& body_call = finish.response.body.at("output")[0];
+    const Json& body_call = finish.response.body.at("output")[1];
     failures += check(
         body_call.at("id") == item_id && body_call.at("call_id") == call_id &&
             body_call.at("arguments") == terminal_args && partial_2 != terminal_args,
@@ -1482,9 +1483,9 @@ int test_e5_parallel_calls_complete() {
     int failures = 0;
     const Json* added_1 = stream.at_type(0, live_size, "response.output_item.added",
                                          "function_call");
-    failures += check(added_1 != nullptr && added_1->at("output_index") == 0 &&
+    failures += check(added_1 != nullptr && added_1->at("output_index") == 1 &&
                           added_1->at("item").at("name") == "read",
-                      "E5: the first live call owns output index 0");
+                      "E5: the reserved message owns index 0 and the first live call index 1");
     failures += check(stream.count(live_size, stream.events.size(),
                                    "response.function_call_arguments.done") == 2 &&
                           stream.count(live_size, stream.events.size(), "response.output_item.done",
@@ -1502,10 +1503,26 @@ int test_e5_parallel_calls_complete() {
     failures += check(both_completed, "E5: both terminal items are completed");
     const Json& body = finish.response.body.at("output");
     failures += check(
-        body.size() == 2 && body[0].at("type") == "function_call" &&
-            body[0].at("name") == "read" && body[0].at("arguments") == R"({"path":"/a.txt"})" &&
-            body[1].at("name") == "write",
+        body.size() == 3 && body[0].at("type") == "message" &&
+            body[0].at("content")[0].at("text") == "" &&
+            body[1].at("type") == "function_call" && body[1].at("name") == "read" &&
+            body[1].at("arguments") == R"({"path":"/a.txt"})" && body[2].at("name") == "write",
         "E5: the body order and arguments follow the stream");
+    // The reserved-but-empty message is part of the terminal body; replaying that body as
+    // input must be accepted with the empty assistant content and both calls.
+    bool replay_rejected = false;
+    std::size_t replay_calls = 0;
+    try {
+        const OpenAIResponsesCreateRequest replay =
+            parse_openai_responses_create_request(Json{{"model", "m"}, {"input", body}},
+                                                  limits());
+        const ChatTurn& turn = replay.prompt.input_turns.at(0);
+        replay_calls = turn.tool_calls.size();
+    } catch (const std::exception&) {
+        replay_rejected = true;
+    }
+    failures += check(!replay_rejected && replay_calls == 2,
+                      "E5: the body with its reserved empty message replays as input");
     return failures;
 }
 
@@ -1554,7 +1571,7 @@ int test_e7_duplicate_parameter_suppression() {
                       "E7: the non-prefix duplicate round is suppressed (M1)");
     const Json* done = stream.at_type(live_size, stream.events.size(),
                                       "response.function_call_arguments.done");
-    const Json& body_call = finish.response.body.at("output")[0];
+    const Json& body_call = finish.response.body.at("output")[1];
     failures += check(done != nullptr && done->at("arguments") == R"({"value":"second"})" &&
                           body_call.at("arguments") == done->at("arguments"),
                       "E7: the terminal done event matches the body bit-identically");
@@ -1581,7 +1598,7 @@ int test_e7b_boundary_shift_suppression() {
                       "E7b: the shifted boundary round is suppressed");
     const Json* done = stream.at_type(live_size, stream.events.size(),
                                       "response.function_call_arguments.done");
-    const Json& body_call = finish.response.body.at("output")[0];
+    const Json& body_call = finish.response.body.at("output")[1];
     failures += check(done != nullptr && done->at("arguments") ==
                           body_call.at("arguments") &&
                           body_call.at("arguments") == R"({"a":"xy","b":"z"})",
@@ -1641,7 +1658,7 @@ int test_e9_live_id_reuse() {
             item_done->at("item").at("call_id") == call_id &&
             item_done->at("output_index") == output_index,
         "E9: done events carry the live ids and live output index");
-    const Json& body_call = finish.response.body.at("output")[0];
+    const Json& body_call = finish.response.body.at("output")[1];
     failures += check(body_call.at("id") == item_id && body_call.at("call_id") == call_id &&
                           stream.count(0, stream.events.size(), "response.output_item.added",
                                        "function_call") == 1,
@@ -1672,6 +1689,20 @@ int test_e10_preview_state_guard() {
     }
     failures += check(threw_after_finish,
                       "E10: a preview after finish must throw logic_error");
+    // Resuming reasoning after the assistant message has started is an illegal state (the
+    // one-way reasoning channel); it must throw rather than emit a reordered item.
+    OpenAIResponsesEventStream reasoning_guard("resp_e10_reasoning", 1, plain_stream_request(),
+                                               {});
+    reasoning_guard.start();
+    (void)reasoning_guard.content_delta("hello");
+    bool threw_reasoning_after_message = false;
+    try {
+        (void)reasoning_guard.reasoning_delta("late");
+    } catch (const std::logic_error&) {
+        threw_reasoning_after_message = true;
+    }
+    failures += check(threw_reasoning_after_message,
+                      "E10: a reasoning delta after message start must throw logic_error");
     (void)encoder.terminal(finish.response);
     return failures;
 }
@@ -1748,7 +1779,7 @@ int test_e12_output_limit_after_complete_call() {
                           item_done->at("item").at("status") == "completed" &&
                           item_done->at("item").at("id") == item_id,
                       "E12: the complete call closes as completed with the live id");
-    const Json& body_call = finish.response.body.at("output")[0];
+    const Json& body_call = finish.response.body.at("output")[1];
     failures += check(body_call.at("type") == "function_call" &&
                           body_call.at("id") == item_id &&
                           body_call.at("arguments") == R"({"path":"/tmp/x"})" &&
@@ -1809,7 +1840,7 @@ int test_e13_ambiguous_name_match_fresh_ids() {
     for (const std::string& live_id : live_item_ids) {
         if (live_id == completed_item_id) { completed_id_is_live = true; }
     }
-    failures += check(!completed_id_is_live && completed_output_index == 3,
+    failures += check(!completed_id_is_live && completed_output_index == 4,
                       "E13: the ambiguous final call gets fresh ids at the next output index");
     const Json* arguments_done = stream.at_type(live_size, stream.events.size(),
                                                 "response.function_call_arguments.done");
@@ -1825,10 +1856,133 @@ int test_e13_ambiguous_name_match_fresh_ids() {
             incomplete_items[2] == std::make_pair("write", R"({"path":"/b"")"),
         "E13: the phantom closes keep the last emitted partials in live order");
     const Json& body = finish.response.body.at("output");
-    failures += check(body.size() == 1 && body[0].at("type") == "function_call" &&
-                         body[0].at("id") == completed_item_id &&
-                         body[0].at("arguments") == R"({"content":"x"})",
+    failures += check(body.size() == 2 && body[0].at("type") == "message" &&
+                         body[0].at("content")[0].at("text") == "" &&
+                         body[1].at("type") == "function_call" &&
+                         body[1].at("id") == completed_item_id &&
+                         body[1].at("arguments") == R"({"content":"x"})",
                       "E13: the body carries the final call with the fresh id");
+    return failures;
+}
+
+// E14: regression for the observed OMP replay failure. A preview that starts after reasoning
+// and is later rejected by the terminal parser may degrade to assistant text. The message item
+// must already precede the live function-call item, so the final/native history remains
+// reasoning -> message -> function_call rather than reasoning -> function_call -> message.
+int test_e14_preview_fallback_text_keeps_assistant_item_order() {
+    PreviewStream stream("resp_e14", plain_stream_request());
+    stream.feed(stream.encoder.reasoning_delta("checking"));
+    stream.feed(stream.encoder.function_call_preview(
+        preview_of({{"write", R"({"content":"partial")"}})));
+
+    const std::size_t live_size = stream.events.size();
+    GenerationOutcome outcome;
+    outcome.reasoning = "checking";
+    outcome.text =
+        "<tool_call>\n<function=write>\n<parameter=content>\npartial\n</function>\n</tool_call>";
+    outcome.finish_reason = ninfer::FinishReason::StopToken;
+    const OpenAIResponsesStreamFinish finish = stream.encoder.finish(outcome);
+    stream.feed_terminal(finish);
+
+    int failures = 0;
+    std::vector<std::string> added_types;
+    std::vector<int> added_indexes;
+    for (const Json& event : stream.events) {
+        if (event.at("type") != "response.output_item.added") { continue; }
+        added_types.push_back(event.at("item").at("type").get<std::string>());
+        added_indexes.push_back(event.at("output_index").get<int>());
+    }
+    failures += check(
+        added_types == std::vector<std::string>{"reasoning", "message", "function_call"} &&
+            added_indexes == std::vector<int>{0, 1, 2},
+        "E14: preview reserves canonical reasoning -> message -> function_call item order");
+
+    const Json* function_added =
+        stream.at_type(0, live_size, "response.output_item.added", "function_call");
+    const Json* function_done =
+        stream.at_type(live_size, stream.events.size(), "response.output_item.done",
+                       "function_call");
+    failures += check(function_added != nullptr && function_done != nullptr &&
+                          function_done->at("item").at("status") == "incomplete",
+                      "E14: rejected preview still phantom-closes as incomplete");
+    failures += check(
+        stream.count(live_size, stream.events.size(),
+                     "response.function_call_arguments.done") == 0,
+        "E14: rejected preview never receives arguments-done");
+
+    const Json& body = finish.response.body.at("output");
+    failures += check(body.size() == 2 && body[0].at("type") == "reasoning" &&
+                          body[1].at("type") == "message" &&
+                          body[1].at("content")[0].at("text") == outcome.text,
+                      "E14: terminal body omits the rejected call and keeps reasoning then message");
+    // Replay contract (the OMP failure mode): a client reconstructs the assistant run from
+    // the streamed items in added order with the terminal payloads. Incomplete function_call
+    // items cannot be represented in model history and are dropped by a compliant client;
+    // the remaining sequence must be accepted as input in the canonical order.
+    std::map<int, Json> terminal_items;
+    std::vector<int> added_order;
+    for (const Json& event : stream.events) {
+        const std::string type = event.at("type").get<std::string>();
+        if (type != "response.output_item.added" && type != "response.output_item.done") {
+            continue;
+        }
+        const int index = event.at("output_index").get<int>();
+        if (type == "response.output_item.added") { added_order.push_back(index); }
+        terminal_items[index] = event.at("item");
+    }
+    Json replay_input = Json::array();
+    for (int index : added_order) {
+        const Json& item = terminal_items.at(index);
+        if (item.at("type") == "function_call" && item.at("status") != "completed") { continue; }
+        replay_input.push_back(item);
+    }
+    bool replay_rejected = false;
+    std::string replay_signature;
+    try {
+        const OpenAIResponsesCreateRequest replay =
+            parse_openai_responses_create_request(Json{{"model", "m"}, {"input", replay_input}},
+                                                  limits());
+        const ChatTurn& turn = replay.prompt.input_turns.at(0);
+        replay_signature = turn.reasoning_content + "|" +
+                           (turn.content.empty() ? std::string() : turn.content[0].text) + "|" +
+                           std::to_string(turn.tool_calls.size());
+    } catch (const std::exception&) {
+        replay_rejected = true;
+    }
+    failures += check(!replay_rejected &&
+                          replay_signature == "checking|" + outcome.text + "|0",
+                      "E14: the streamed assistant run replays as input in canonical order");
+    return failures;
+}
+
+// E15: the same ordering invariant also applies without reasoning. Starting a preview before
+// any text reserves output index 0 for the message; terminal fallback text then updates that
+// earlier item instead of creating message content after the function call.
+int test_e15_preview_fallback_text_without_reasoning() {
+    PreviewStream stream("resp_e15", plain_stream_request());
+    stream.feed(stream.encoder.function_call_preview(
+        preview_of({{"write", R"({"path":"C:\\tmp")"}})));
+
+    GenerationOutcome outcome;
+    outcome.text = "<tool_call>malformed";
+    outcome.finish_reason = ninfer::FinishReason::StopToken;
+    const OpenAIResponsesStreamFinish finish = stream.encoder.finish(outcome);
+    stream.feed_terminal(finish);
+
+    int failures = 0;
+    std::vector<std::string> added_types;
+    for (const Json& event : stream.events) {
+        if (event.at("type") == "response.output_item.added") {
+            added_types.push_back(event.at("item").at("type").get<std::string>());
+        }
+    }
+    failures += check(
+        added_types == std::vector<std::string>{"message", "function_call"},
+        "E15: no-reasoning preview still places message before function_call");
+    const Json& body = finish.response.body.at("output");
+    failures += check(body.size() == 1 && body[0].at("type") == "message" &&
+                          body[0].at("content")[0].at("text") == outcome.text,
+                      "E15: malformed preview degrades to one canonical message item");
     return failures;
 }
 
@@ -1864,6 +2018,8 @@ int main() {
     failures += test_e11_namespace_identity_in_preview();
     failures += test_e12_output_limit_after_complete_call();
     failures += test_e13_ambiguous_name_match_fresh_ids();
+    failures += test_e14_preview_fallback_text_keeps_assistant_item_order();
+    failures += test_e15_preview_fallback_text_without_reasoning();
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }

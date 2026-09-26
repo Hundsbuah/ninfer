@@ -135,7 +135,7 @@ BuiltOpenAIResponse build_response(const std::string& id, std::int64_t created_a
         built.output_items.push_back(std::move(reasoning_item));
     }
 
-    if (needs_message_item(outcome, status)) {
+    if (!ids.message.empty() || needs_message_item(outcome, status)) {
         if (ids.message.empty()) { ids.message = new_openai_response_item_id("msg"); }
         built.output_items.push_back(
             Json{{"id", ids.message},
@@ -421,6 +421,10 @@ std::vector<std::string> OpenAIResponsesEventStream::reasoning_delta(const std::
         throw std::logic_error("invalid reasoning delta event state");
     }
     if (text.empty()) { return {}; }
+    if (impl_->message_started || !impl_->live_calls.empty()) {
+        throw std::logic_error(
+            "reasoning cannot resume after assistant message/tool-call output has started");
+    }
     std::vector<std::string> events = impl_->ensure_reasoning();
     impl_->reasoning_text += text;
     events.push_back(sse(
@@ -456,13 +460,27 @@ OpenAIResponsesEventStream::function_call_preview(const ninfer::ToolCallPreviewS
         throw std::logic_error("invalid tool-call preview event state");
     }
     if (snapshot.calls.empty()) { return {}; }
+
+    // Responses assistant items have a canonical order: reasoning, message content, then
+    // function calls. A live function-call preview cannot be emitted first and later be
+    // followed by a newly-created message item if the terminal parser degrades the tool
+    // region back to assistant text. Reserve the message item before the first preview so
+    // later output_text deltas update an earlier item instead of creating one after a call.
+    //
+    // The placeholder is closed (and represented in the terminal response body) even when
+    // it stays empty. This keeps stream/native-history/body ordering identical and avoids a
+    // client replay such as reasoning -> function_call -> message.
+    std::vector<std::string> events = impl_->close_reasoning(impl_->reasoning_text);
+    std::vector<std::string> message = impl_->ensure_message();
+    events.insert(events.end(), std::make_move_iterator(message.begin()),
+                  std::make_move_iterator(message.end()));
+
     const std::size_t live = impl_->live_calls.size();
     std::size_t matched = 0;
     while (matched < live && matched < snapshot.calls.size() &&
            impl_->live_calls[matched].name == snapshot.calls[matched].name) {
         ++matched;
     }
-    std::vector<std::string> events;
     // New calls: item add plus one full-arguments delta. Live calls that disappeared receive no
     // mid-stream event (BUG-12); only the finish batch closes them.
     for (std::size_t j = matched; j < snapshot.calls.size(); ++j) {
@@ -538,7 +556,7 @@ OpenAIResponsesStreamFinish OpenAIResponsesEventStream::finish(const GenerationO
         (!outcome.text.empty() || !outcome.tool_calls.empty()) ? "completed" : item_status;
     append(impl_->close_reasoning(outcome.reasoning, reasoning_status));
 
-    if (needs_message_item(outcome, status)) {
+    if (impl_->message_started || needs_message_item(outcome, status)) {
         append(impl_->ensure_message());
         if (outcome.text != impl_->content_text) {
             if (!outcome.text.starts_with(impl_->content_text)) {
