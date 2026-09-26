@@ -57,6 +57,9 @@ for creating NInfer!
 15. has a help screen organised by category
 16. contains various other fixes and improvements (most of which are outlined below), including
     merging in some PRs on the upstream repo.
+17. includes the fixes from a code audit (September 2026), among them a race that could let an
+    aborted prefill write into another conversation's cached prefix, and an ngram index built off
+    the engine worker (median time to first token 16 % lower on the agentic benchmark).
 
 I recommend using this with the NVIDIA NVFP4 artifact I’ve uploaded here, which runs a bit faster
 than the original artifact based on the Unsloth quant and takes up less VRAM:
@@ -497,9 +500,10 @@ Against the flag off (Qwen3.8-27B NVIDIA NVFP4, int8 KV): new-prompt prefill +3.
   driver of 580 or later (CUDA 13); no CUDA toolkit is needed. Copy the DLLs next to
   `ninfer-serve.exe` and install the Visual C++ redistributable if it is missing.
 - **Linux still builds and runs** (see [Quick start (Linux)](#quick-start-linux)), checked under
-  WSL2 Ubuntu 24.04 with CUDA 13.4: 140 of the 141 unit and GPU tests pass (the other, a very long
-  numerical check, ran past its time limit) and the server answers exactly as on Windows. Commit:
-  [`3a47385`](https://github.com/Wallawalla47/ninfer-custom/commit/3a473853).
+  WSL2 Ubuntu 24.04 with CUDA 13.4: all 143 unit and GPU tests pass (the long attention check that
+  used to run past its time limit now takes about 6.5 minutes) and the server answers exactly as on
+  Windows. Commits: [`3a47385`](https://github.com/Wallawalla47/ninfer-custom/commit/3a473853),
+  [`f15959b`][c-oracle-threads].
 
 ### Options and console
 
@@ -527,6 +531,61 @@ Against the flag off (Qwen3.8-27B NVIDIA NVFP4, int8 KV): new-prompt prefill +3.
 - **`--thinking-budget-message S`** sets the message inserted when a request reaches its
   `--default-thinking-budget N`, and **`--chat-template`** loads the chat template from a file.
   Commits: [`29992ec`][c-thinking-message], [`3368d92`][c-chat-template].
+
+### Fixes from a code audit (September 2026)
+
+A local model audited the fork; Claude Opus 5.5 checked its findings against the code, discarded
+the ones that were wrong or not worth their cost, and fixed these:
+
+- **An aborted prefill can no longer write into another conversation's cached prefix.** A lane's
+  block table reaches the GPU by a copy from pinned memory that reads it only when the stream gets
+  there. A request aborted mid-prefill released its lane with such copies still queued, and the
+  next admission on that lane overwrote the same memory, so the aborted chunk wrote its KV into the
+  new request's pages. Publications now wait for an overlapping queued copy; a test reproduces the
+  race on the old code.
+  Commit: [`c5284c8`][c-kv-fence].
+- **The ngram index is built while the prompt is prepared**, on the request's own thread instead
+  of the engine worker at admission, and about 4.7× faster (each window hashed once, its bucket
+  prefetched): at a 136K-token prompt about 25 ms leaves the worker per admission, where it held
+  up the other lane's decode, for about 13 ms on the preparing thread. Proposals are identical.
+  Commit: [`4bb7844`][c-ngram-index].
+- **Checkpoints with another RoPE theta or RMSNorm epsilon** no longer get the fused q/k kernel's
+  built-in 1e7 and 1e-6 at widths up to 256 tokens, which include every decode step. Shipped
+  Qwen3.x artifacts use both values and are unaffected.
+  Commit: [`0f5b953`][c-rope-guard].
+- **`--fast-prefill-kernel` requires `--kv-dtype int8`** and startup says so; with another KV
+  format it used to shrink the prefill chunk to 3584 for a kernel that never ran. Both INT8 prompt
+  kernels and the fused attention input projection (#305) are now checked against the FP64 oracle
+  at that 3584-token production chunk, and the oracle uses every host core (the long attention
+  test that timed out now takes about six minutes).
+  Commits: [`9ffede3`][c-fast-prefill-int8], [`732af1b`][c-prefill-oracle],
+  [`f15959b`][c-oracle-threads].
+- **Smaller fixes:** a full Device KV pool no longer throws and catches up to three exceptions per
+  decode round in the lease ladder; statistics read right after a cancelled request returns no
+  longer count it as running; a request an idle engine can never admit gets 503 instead of 500;
+  Windows servers now detect clients that vanish without closing the connection (keepalive and
+  `TCP_MAXRTMS`, as on Linux); and the A/B runner stops on a launch flag the server rejects.
+  Commits: [`a4aef30`][c-lease-ladder], [`956f66b`][c-stats-cancel], [`e92ab26`][c-idle-503],
+  [`88c842d`][c-windows-liveness], [`dfba788`][c-runner-flags].
+- **Documentation and tests** now match the code for Anthropic trailing `tool_use`, the tool-call
+  fallback warning, mid-stream Chat Completions errors, Responses larger than the store,
+  `--reasoning-effort` and `--ngram-session-mib`; a stale graph-allowance test was updated.
+  Commits: [`fb5aadd`][c-serving-docs], [`822a128`][c-cli-help], [`a085261`][c-graph-test],
+  [`abe5ffe`][c-wrap-skip].
+
+Checked against the previous master (`600d8ac9`) on the RTX 5090 with the production launch flags
+(NVIDIA NVFP4, DFlash2 K=7, ngram 15/12, INT8 KV, fast prefill kernel):
+
+| Measurement | Change |
+|---|---|
+| Decode ms/round at 1, 2, 4 and 8 concurrent requests (two interleaved passes) | 0.0 %, −0.1 %, −0.4 %, +0.2 % |
+| Agentic workload, 3 seeds: median time to first token | −16.3 % (−1.2 to −24.8 per seed) |
+| Agentic workload: decode rounds/s with one / two requests decoding | +1.6 % / +2.4 % |
+| Agentic workload: prompt tokens served from cache, cold prefill tok/s | −0.1 points, +0.3 % |
+| Continuing turns at ~136K tokens (22 per build): prefill wall / prepare / TTFT | −25 ms / +13 ms / −13 ms |
+
+All unit and GPU tests pass on Windows (139) and on Linux under WSL2 (143), and so do the
+real-model tests on Windows.
 
 ### Kept in sync with upstream
 
@@ -635,6 +694,21 @@ well, and for the work this branch builds on.
 [c-bench-agentic]: https://github.com/Wallawalla47/ninfer-custom/commit/535fe5873c8a0ff52a6b323fd7a5775107050832
 [c-bench-concurrency]: https://github.com/Wallawalla47/ninfer-custom/commit/e488da772dca32d1c8c7a5d599f0b3b01b0c3ca9
 [c-bench-ab]: https://github.com/Wallawalla47/ninfer-custom/commit/5b297fbe28a44d355a433d9a695b2996d56b70d0
+[c-kv-fence]: https://github.com/Wallawalla47/ninfer-custom/commit/c5284c8c5c162187a522f968b33a528915f3470e
+[c-ngram-index]: https://github.com/Wallawalla47/ninfer-custom/commit/4bb7844b36a4fe12cf99679d89102fae8884f791
+[c-rope-guard]: https://github.com/Wallawalla47/ninfer-custom/commit/0f5b953407afa82c26d3af15d387e0c9a5d0b51b
+[c-oracle-threads]: https://github.com/Wallawalla47/ninfer-custom/commit/f15959bcd7d0977735a305fb09942edee0c3d91d
+[c-prefill-oracle]: https://github.com/Wallawalla47/ninfer-custom/commit/732af1b1bc68f3e0afc77f92d26c199640f556d1
+[c-fast-prefill-int8]: https://github.com/Wallawalla47/ninfer-custom/commit/9ffede36524ea991de23913caa258f389fc0a897
+[c-lease-ladder]: https://github.com/Wallawalla47/ninfer-custom/commit/a4aef3086684cb7ecfd8eb54ef714a000f70216b
+[c-stats-cancel]: https://github.com/Wallawalla47/ninfer-custom/commit/956f66b2ef81c10e6fccb43e99a95a39ac07b0c1
+[c-idle-503]: https://github.com/Wallawalla47/ninfer-custom/commit/e92ab26ea6f6bef5097e1269b71fe76f478c6da6
+[c-windows-liveness]: https://github.com/Wallawalla47/ninfer-custom/commit/88c842d784cf03ff079405eb80d36173e298f5ff
+[c-serving-docs]: https://github.com/Wallawalla47/ninfer-custom/commit/fb5aadd01a9cfcdc18422ae4ed5858bfa3408b72
+[c-cli-help]: https://github.com/Wallawalla47/ninfer-custom/commit/822a128380a3e3b8f293e34b7abe967f37a1e435
+[c-graph-test]: https://github.com/Wallawalla47/ninfer-custom/commit/a085261ea61c5d6db0b673853a9391022eae10b4
+[c-wrap-skip]: https://github.com/Wallawalla47/ninfer-custom/commit/abe5ffeae7fa6f4256615664da784523206d6bda
+[c-runner-flags]: https://github.com/Wallawalla47/ninfer-custom/commit/dfba788e91eb9af4e9d882891c01652c587539b4
 
 ---
 
