@@ -27,8 +27,16 @@ void launch_problem(const Weight& weight, Tensor& residual, Fp8A8Workspace works
         launch_fp8_a8_mma<Fp8ScheduleInstance<Schedule, Geometry::kInputRows>>(
             fp8_a8_operands(weight, workspace, tokens), output, epilogue, stream);
     };
-    if (tokens <= 64) return launch.template operator()<Fp8A8T32R32K128>();
-    if (tokens <= 128) return launch.template operator()<Fp8A8T64R64K128>();
+    // N=5120 leaves few CTAs per token tile, so the time is the weight stream per CTA. Narrow
+    // four-stage tiles keep more of it in flight: measured on RTX 5090 (cold weights), K=6144 takes
+    // 31.1 us from 24 to 64 tokens instead of 35.5-39.5 and K=17408 72.3-74.3 us instead of
+    // 84.6-92.4; each output still accumulates over K in the same order.
+    using Narrow32 = Fp8A8MmaSchedule<32, 64, 128, 2, 2, 4, 2, Cache::cg, Cache::cg,
+                                      Fp8MmaFragmentPipeline::PingPong, Fp8MmaRaster::TokenFast>;
+    using Narrow64 = Fp8A8MmaSchedule<64, 64, 128, 2, 2, 4, 2, Cache::cg, Cache::cg,
+                                      Fp8MmaFragmentPipeline::PingPong, Fp8MmaRaster::TokenFast>;
+    if (tokens <= 96) return launch.template operator()<Narrow32>();
+    if (tokens <= 128) return launch.template operator()<Narrow64>();
     launch.template operator()<Fp8A8T64R128K128>();
 }
 
