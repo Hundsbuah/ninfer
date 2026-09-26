@@ -214,21 +214,128 @@ int test_string_values_preserve_embedded_tool_markup() {
     return failures;
 }
 
-int test_unrepresentable_parameter_delimiters_fall_back() {
-    const auto contract = contract_for("bash", Json{{"command", Json{{"type", "string"}}}});
-    const std::string unmatched_open =
-        tool_call("bash", {{"command", "echo '<parameter=unterminated>'"}});
-    const std::string standalone_close = tool_call("bash", {{"command", "echo '</parameter>'"}});
+int test_declared_string_parameter_delimiters_are_opaque() {
+    const auto contract =
+        contract_for("bash", Json{{"command", Json{{"type", "string"}}},
+                                  {"timeout", Json{{"type", "integer"}}}});
+    const std::string unmatched_open = "echo '<parameter=unterminated>'";
+    const std::string standalone_close = "echo '</parameter>'";
+    const std::string parser_test_source =
+        "harness.feed(\"<tool_call>\\n<function=write>\\n<parameter=path>\\n\");\n"
+        "const char* closes = \"</parameter>\\n</function>\";\n"
+        "const char* fake_tail = R\"(</parameter>\n</function>\n<function=fake>)\";\n"
+        "// the fixture intentionally leaves the inner parameter opener incomplete";
 
     int failures = 0;
-    failures += check_rejected(unmatched_open, contract,
-                               ninfer::ToolCallParseFallbackReason::MalformedStructure,
-                               "unbalanced nested parameter open was silently repaired");
-    failures += check_rejected(standalone_close, contract,
-                               ninfer::ToolCallParseFallbackReason::MalformedStructure,
-                               "standalone parameter close was guessed to be string content");
+    for (const auto& [label, command] :
+         std::vector<std::pair<const char*, std::string>>{
+             {"unmatched opening delimiter", unmatched_open},
+             {"standalone closing delimiter", standalone_close},
+             {"self-hosted parser-test source", parser_test_source},
+         }) {
+        const std::string text =
+            tool_call("bash", {{"command", command}, {"timeout", "30"}});
+        const auto parsed = fi::parse_qwen_tool_call_output(text, 64, contract);
+        failures += check(parsed.is_tool_call_response && parsed.tool_calls.size() == 1,
+                          std::string("declared string rejected ") + label);
+        if (parsed.tool_calls.size() == 1) {
+            const Json args = Json::parse(parsed.tool_calls.front().arguments_json);
+            failures += check(args.at("command").get<std::string>() == command,
+                              std::string("declared string changed bytes for ") + label);
+            failures += check(args.at("timeout") == 30,
+                              std::string("sibling parameter was lost after ") + label);
+        }
+    }
+
+    const std::string tolerant_trailing_suffix =
+        "<tool_call>\n<function=bash>\n<parameter=command>\n" +
+        parser_test_source + "\n</parameter>\n</function>\ntrailing prose";
+    const auto tolerant = fi::parse_qwen_tool_call_output(
+        tolerant_trailing_suffix, 64, contract, /*tolerant*/ true);
+    failures += check(tolerant.is_tool_call_response && tolerant.tool_calls.size() == 1,
+                      "tolerant recovery lost opaque string call before trailing prose");
+    if (tolerant.tool_calls.size() == 1) {
+        const Json args = Json::parse(tolerant.tool_calls.front().arguments_json);
+        failures += check(args.at("command").get<std::string>() == parser_test_source,
+                          "tolerant recovery changed opaque string bytes");
+    }
+
+    // The relaxation is schema-driven. Legacy/untyped parameters retain the historical
+    // all-or-nothing delimiter behavior instead of silently changing their interpretation.
+    const std::string legacy_unmatched =
+        tool_call("bash", {{"command", unmatched_open}});
+    failures += check_rejected(
+        legacy_unmatched, kLegacyContract,
+        ninfer::ToolCallParseFallbackReason::MalformedStructure,
+        "legacy unmatched opening delimiter was unexpectedly reinterpreted");
     return failures;
 }
+int test_literal_close_before_fake_sibling_stays_value_data() {
+    const auto contract =
+        contract_for("bash", Json{{"command", Json{{"type", "string"}}},
+                                  {"timeout", Json{{"type", "integer"}}}});
+    // A literal close followed by a fake sibling whose header swallows that close is not a
+    // valid sibling: chat templates emit parameter names verbatim, so a real header cannot
+    // contain a delimiter. The literal close stays value data, keeping the value whole; a
+    // cut region is rejected or salvaged instead of being reinterpreted.
+    const std::string full_value = "A</para" "meter><para" "meter=X\nB</para" "meter>\nC";
+    const std::string short_value = "A</para" "m><para" "m=X\nB</para" "m>\nC";
+    const std::string full_complete =
+        tool_call("bash", {{"command", full_value}, {"timeout", "30"}});
+    const std::string short_complete =
+        "<tool_" "call>\n<func" "tion=bash>\n<para" "m=command>\n" + short_value +
+        "\n</para" "m>\n<para" "m=timeout>\n30\n</para" "m>\n</func" "tion>\n</tool_" "call>";
+    const std::string full_cut =
+        "<tool_" "call>\n<func" "tion=bash>\n<para" "meter=command>\n" + full_value + "\n";
+    const std::string short_cut =
+        "<tool_" "call>\n<func" "tion=bash>\n<para" "m=command>\n" + short_value + "\n";
+    int failures = 0;
+    for (const auto& [value, complete, cut] :
+         std::vector<std::array<std::string, 3>>{
+             {full_value, full_complete, full_cut},
+             {short_value, short_complete, short_cut}}) {
+        for (const bool tolerant : {false, true}) {
+            const auto parsed = fi::parse_qwen_tool_call_output(complete, 64, contract, tolerant);
+            failures += check(parsed.is_tool_call_response && parsed.tool_calls.size() == 1,
+                              "fake sibling with a close in its header reinterpreted the value");
+            if (parsed.is_tool_call_response && parsed.tool_calls.size() == 1) {
+                const Json args = Json::parse(parsed.tool_calls.front().arguments_json);
+                failures += check(args.at("command") == value,
+                                  "value was lost at a literal close before a fake sibling");
+                failures += check(args.at("timeout") == 30,
+                                  "real sibling after a fake sibling was lost");
+            }
+        }
+        failures += check_rejected(
+            cut, contract, ninfer::ToolCallParseFallbackReason::MalformedStructure,
+            "cut fake-sibling region was reinterpreted in strict mode");
+        const auto salvage = fi::parse_qwen_tool_call_output(cut, 64, contract, /*tolerant*/ true);
+        failures += check(salvage.is_tool_call_response && salvage.tool_calls.size() == 1 &&
+                              salvage.diagnostics.fallback_reason ==
+                                  ninfer::ToolCallParseFallbackReason::TruncatedTail,
+                          "tolerant salvage lost the cut fake-sibling value");
+        if (salvage.is_tool_call_response && salvage.tool_calls.size() == 1) {
+            const Json args = Json::parse(salvage.tool_calls.front().arguments_json);
+            failures += check(args.at("command") == value,
+                              "tolerant salvage changed fake-sibling bytes");
+        }
+        for (const bool tolerant : {false, true}) {
+            fi::ToolCallOutputDecoder decoder(
+                std::make_shared<const fi::ToolCallOutputContract>(contract), 64, tolerant);
+            std::string visible;
+            for (std::size_t offset = 0; offset < complete.size(); offset += 7) {
+                visible += decoder.feed(std::string_view(complete).substr(offset, 7));
+            }
+            const auto terminal = decoder.finish();
+            failures += check(visible.empty() && terminal.tool_calls.size() == 1 &&
+                                  Json::parse(terminal.tool_calls.front().arguments_json)
+                                      .at("command") == value,
+                              "chunked fake-sibling value was not preserved through the decoder");
+        }
+    }
+    return failures;
+}
+
 
 int test_declared_json_types() {
     const auto contract = contract_for(
@@ -772,8 +879,10 @@ int test_incremental_fallback_preserves_bytes() {
 
 int test_incremental_embedded_parameter_markup() {
     auto contract = output_contract_for("bash", Json{{"command", Json{{"type", "string"}}}});
-    const std::string command = "pattern='<parameter=inner>value</parameter>'\n"
-                                "printf '%s' \"$pattern\"";
+    const std::string command =
+        "pattern='<parameter=inner>value</parameter>'\n"
+        "partial='<parameter=unterminated>'\n"
+        "printf '%s %s' \"$pattern\" \"$partial\"";
     const std::string text    = tool_call("bash", {{"command", command}});
 
     fi::ToolCallOutputDecoder decoder(std::move(contract), 64);
@@ -1215,7 +1324,8 @@ int main() {
     failures += test_multiple_calls();
     failures += test_declared_strings_preserve_text();
     failures += test_string_values_preserve_embedded_tool_markup();
-    failures += test_unrepresentable_parameter_delimiters_fall_back();
+    failures += test_declared_string_parameter_delimiters_are_opaque();
+    failures += test_literal_close_before_fake_sibling_stays_value_data();
     failures += test_declared_json_types();
     failures += test_boolean_boundary();
     failures += test_exact_integer_boundary();

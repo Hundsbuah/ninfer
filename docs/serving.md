@@ -222,9 +222,18 @@ supported explicit type retain untyped inference. NInfer does not apply defaults
 properties, perform recursive JSON Schema validation, or use constrained decoding.
 
 String parameters preserve function/tool-call markers and balanced nested
-`<parameter=...>...</parameter>` text as value bytes. The Qwen wire format has no delimiter escape,
-so an unmatched nested parameter opener or a standalone `</parameter>` cannot be represented
-unambiguously; either makes that tool-call region ordinary content. Later content is still examined:
+`<parameter=...>...</parameter>` text as value bytes. For a parameter whose declared schema
+admits a string, parameter delimiters are opaque: a literal opener in the value does not nest,
+and a literal close ends the value only when what follows continues the call (a sibling
+parameter with a delimiter-free header, or the function close, and in tolerant mode also a
+function close followed by discarded trailing tokens or the end of the cut region); unmatched
+literal delimiters and a fake sibling whose header contains a close marker remain representable
+value bytes. Non-string and untyped parameters keep the balanced rule, where an
+unmatched nested opener or a standalone close makes that tool-call region ordinary content. The
+wire format has no delimiter escape, so a value that itself contains a complete closing
+boundary is ambiguous and ends the value at the first such boundary; the bytes after that
+boundary may then be parsed as further parameters or calls, and that reinterpretation produces
+no fallback reason. Later content is still examined:
 the first tool-call region (any accepted marker form) that parses becomes the structured turn, and any
 quoted markup before it stays ordinary content. Generated reasoning closes only at a `</think>`
 followed by a line break or the end of the turn, so a marker the model quotes while reasoning (followed
