@@ -1863,10 +1863,13 @@ private:
             if (active.size == 0) {
                 // Nothing running can free resources for this request, so it would wait forever.
                 // Fail it alone: as a worker error it would repeat on every boundary and exhaust
-                // the recovery streak, failing the whole Engine.
+                // the recovery streak, failing the whole Engine. It is a capacity condition, so
+                // the client sees it as unavailable, not as an internal server error.
                 (void)remove_pending_error(
-                    head, std::make_exception_ptr(std::logic_error(
-                              "isolated-feasible request is blocked in an idle Engine")));
+                    head, std::make_exception_ptr(RequestError(
+                              RequestErrorKind::Unavailable,
+                              "the Engine cannot admit this request: its resources stay "
+                              "unavailable with no request running")));
                 control_progress = true;
                 continue;
             }
