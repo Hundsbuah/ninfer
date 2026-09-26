@@ -559,18 +559,21 @@ receives the caller-visible execution envelope and owns all decode, prompt, Smal
 choices. `all` emits every storage mode as an independent row.
 
 Append-and-attend accepts `--batch 1,2,4,8`; each ordinary `--context L` point gives every row the
-same context and all `W` columns are valid. One exact mixed profile uses `--row-contexts`,
-`--valid-columns`, and `--table-rows`, each with exactly `B` entries. Cached-only remains B=1.
-The timed call consumes the whole batch once; metadata copies and graph capture remain outside the
-interval. Uniform full-width profiles use the dense public contract; exact partial profiles use
-device-resident valid extents. Q/K/V contain nonuniform finite values; initial cache rows are encoded
-by the public KV append Op before timing. Reported useful bytes/FLOPs sum only valid row work.
-`graph_nodes` counts the complete capture. `workspace_bytes` is the per-Op public capacity query
-and `workspace_peak_bytes` is the observed peak; the arena is empty after each call. For short warm
-Ops, `--execution graph --cache warm --graph-calls 32` captures 32 consecutive calls to reduce CPU
-submission gaps. Reported times are normalized per Op, and the CSV records `graph_calls`. Repeated
-append calls overwrite the same positions with identical values; this is a warm Op measurement,
-not 32 speculative rounds. Cold measurements require one call per graph.
+same context and all `W` columns are valid. `--fast-prompt` and `--small-prefill` set the matching
+envelope hints: the fast INT8 prompt kernel, and chunked small-T for single-row widths 17-64 over a
+long context. `--gate standalone|fused` adds the attention output gate. One exact mixed profile
+uses `--row-contexts`, `--valid-columns`, and `--table-rows`, each with exactly `B` entries.
+Cached-only remains B=1. The timed call consumes the whole batch once; metadata copies and graph
+capture remain outside the interval. Uniform full-width profiles use the dense public contract;
+exact partial profiles use device-resident valid extents. Q/K/V contain nonuniform finite values;
+initial cache rows are encoded by the public KV append Op before timing. Reported useful
+bytes/FLOPs sum only valid row work. `graph_nodes` counts the complete capture. `workspace_bytes`
+is the per-Op public capacity query and `workspace_peak_bytes` is the observed peak; the arena is
+empty after each call. For short warm Ops, `--execution graph --cache warm --graph-calls 32`
+captures 32 consecutive calls to reduce CPU submission gaps. Reported times are normalized per Op,
+and the CSV records `graph_calls`. Repeated append calls overwrite the same positions with
+identical values; this is a warm Op measurement, not 32 speculative rounds. Cold measurements
+require one call per graph.
 
 ```bash
 cmake --build build --parallel --target ninfer_causal_softmax_attention_bench

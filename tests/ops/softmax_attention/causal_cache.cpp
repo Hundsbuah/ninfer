@@ -1912,6 +1912,42 @@ int run_a1_case(const Geometry& geometry, KvCacheStorage storage, const Attentio
         std::cerr << label << ": workspace query/execution high-water mismatch\n";
         ++failures;
     }
+
+    // A gate handed to the Op must give exactly what sigmoid_mul applied afterwards gives, on the
+    // routes that fold it into their epilogue (BF16/INT8 small-T and chunked small-T) and on the
+    // ones that apply the standalone multiply alike. Re-running the Op appends the same k/v to the same
+    // positions, which leaves the cache byte-identical.
+    {
+        const auto gate_bits =
+            to_bf16_bits(make_bf16_values(q_elements, test_case.seed + 97u, -3.0F, 3.0F));
+        GuardedDeviceBuffer dgate(gate_bits.size() * sizeof(std::uint16_t));
+        GuardedDeviceBuffer dexpected(q_bits.size() * sizeof(std::uint16_t));
+        GuardedDeviceBuffer dgated(q_bits.size() * sizeof(std::uint16_t));
+        dgate.copy_from_host(gate_bits.data(), gate_bits.size() * sizeof(std::uint16_t));
+        Tensor tgate(dgate.data(), DType::BF16, {kHeadDim, geometry.q_heads, test_case.tokens});
+        Tensor texpected(dexpected.data(), DType::BF16,
+                         {kHeadDim, geometry.q_heads, test_case.tokens});
+        Tensor tgated(dgated.data(), DType::BF16, {kHeadDim, geometry.q_heads, test_case.tokens});
+        const auto run = [&](Tensor& target, const Tensor* gate) {
+            ops::causal_softmax_attention(tq, tk, tv, tp, Tensor{}, ttable_row,
+                                          op_geometry(geometry), kAttentionScale,
+                                          cache.batch_view(), envelope, workspace, target, nullptr,
+                                          gate);
+        };
+        run(texpected, nullptr);
+        cuda_synchronize();
+        failures += verify_exact((label + " ungated repeat").c_str(),
+                                 copy_from_guarded<std::uint16_t>(dexpected, q_bits.size()),
+                                 output_bits);
+        ops::sigmoid_mul(tgate, texpected, nullptr);
+        run(tgated, &tgate);
+        cuda_synchronize();
+        failures += verify_exact((label + " gate against standalone sigmoid_mul").c_str(),
+                                 copy_from_guarded<std::uint16_t>(dgated, q_bits.size()),
+                                 copy_from_guarded<std::uint16_t>(dexpected, q_bits.size()));
+        failures += verify_input(label + " gate unchanged", dgate, gate_bits);
+        failures += dgated.verify_guards((label + " gated output").c_str());
+    }
     failures += cache.verify_guards(label);
     return failures;
 }
@@ -2483,6 +2519,15 @@ int run_batch_cases() {
     failures +=
         run_batch_case(kGeometries[0], KvCacheStorage::Fp8E4M3Row256,
                        {6, {61, 127, 511}, {6, 3, 0}, {2, 0, 1}, MappingPattern::Fragmented, 505u});
+    // Prompt-route width with inactive columns: the prompt kernels write those rows as zeros, and the
+    // gate must still reach them exactly as the standalone kernel would.
+    for (const bool fast : {false, true}) {
+        BatchAttentionCase prompt{300, {0}, {250}, {0}, MappingPattern::Identity, 506u};
+        prompt.fast_prompt_kernel = fast;
+        failures += run_batch_case(kGeometries[0], KvCacheStorage::Int8Group64, prompt);
+    }
+    failures += run_batch_case(kGeometries[1], KvCacheStorage::BFloat16,
+                               {300, {40}, {211}, {0}, MappingPattern::Fragmented, 507u});
     return failures;
 }
 

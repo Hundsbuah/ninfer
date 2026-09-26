@@ -84,16 +84,19 @@ struct Options {
     // and the prompt route may take the fast INT8 kernel.
     bool wide        = false;
     bool fast_prompt = false;
+    // The small-prefill hint: single-row widths 17-64 over a long context take chunked small-T.
+    bool small_prefill = false;
     std::string csv_out;
 };
 
 // The envelope hints of the current run; every envelope this bench builds carries them.
-bool envelope_wide        = false;
-bool envelope_fast_prompt = false;
+bool envelope_wide          = false;
+bool envelope_fast_prompt   = false;
+bool envelope_small_prefill = false;
 
 ops::CausalAttentionExecutionEnvelope bench_envelope(std::int32_t visible) {
     return {static_cast<std::uint32_t>(visible), static_cast<std::uint32_t>(visible), envelope_wide,
-            envelope_fast_prompt};
+            envelope_fast_prompt, envelope_small_prefill};
 }
 
 struct Result {
@@ -149,6 +152,7 @@ GateMode effective_gate(GateMode requested, Entry entry) noexcept {
                  "[--execution eager|graph|both] [--cache cold|warm|both] "
                  "[--mapping identity|fragmented] [--gate off|standalone|fused] "
                  "[--warmup N] [--repeat N] [--graph-calls N] [--profile] [--wide] [--fast-prompt] "
+                 "[--small-prefill] "
                  "[--csv-out PATH]\n",
                  message);
     std::exit(2);
@@ -294,6 +298,8 @@ Options parse_options(int argc, char** argv) {
             options.wide = true;
         } else if (argument == "--fast-prompt") {
             options.fast_prompt = true;
+        } else if (argument == "--small-prefill") {
+            options.small_prefill = true;
         } else if (argument == "--csv-out") {
             options.csv_out = next("--csv-out requires a path");
         } else if (argument == "--help" || argument == "-h") {
@@ -923,6 +929,7 @@ int main(int argc, char** argv) {
         const Options options = parse_options(argc, argv);
         envelope_wide         = options.wide;
         envelope_fast_prompt  = options.fast_prompt;
+        envelope_small_prefill = options.small_prefill;
         cudaStream_t stream   = nullptr;
         CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
         DeviceBuffer flush(kFlushBytes);

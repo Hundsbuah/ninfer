@@ -315,7 +315,7 @@ void launch_chunked_small_t(const Tensor& q, const Tensor& k, const Tensor& v,
                             const Tensor& positions, const Tensor& valid_columns,
                             const Tensor& table_rows, float scale, PagedKVBatchLayerView cache,
                             CausalAttentionExecutionEnvelope envelope, WorkspaceArena& workspace,
-                            Tensor& out, cudaStream_t stream) {
+                            Tensor& out, cudaStream_t stream, const void* gate) {
     for (std::int32_t begin = 0; begin < q.ne[2];
          begin +=
          causal_attention_chunk_tokens(q.ne[1], q.ne[2], q.ne[3], cache.storage, envelope)) {
@@ -329,7 +329,7 @@ void launch_chunked_small_t(const Tensor& q, const Tensor& k, const Tensor& v,
             allocate_small_t_workspace(workspace, q.ne[1], count, splits, q.ne[3]);
         detail::causal_attention_small_t_launch(q, k, v, positions, valid_columns, table_rows,
                                                 scale, cache, envelope, begin, count, partial.acc,
-                                                partial.m, partial.l, out, stream);
+                                                partial.m, partial.l, out, stream, gate);
     }
 }
 
@@ -514,10 +514,16 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
     auto scope = workspace.scope();
     const detail::CausalAttentionRoute route =
         detail::causal_attention_resolve_route(q.ne[1], width, batch, cache.storage, envelope);
+    // Only the shared BF16/INT8 small-T reducer carries a gate. The FP8, NVFP4 and K8V4 storages
+    // reach their own reduce kernels, so they take the standalone multiply like the prompt route,
+    // where folding the gate into the epilogue measured slower; every caller sees one contract.
+    const bool fusable = cache.storage == KvCacheStorage::BFloat16 ||
+                         cache.storage == KvCacheStorage::Int8Group64;
+    const void* fused_gate = gate != nullptr && fusable ? gate->data : nullptr;
     if (route == detail::CausalAttentionRoute::ChunkedSmallT) {
         launch_chunked_small_t(q, k, v, positions, valid_columns, kv_table_rows, scale, cache,
-                               envelope, workspace, out, stream);
-        if (gate != nullptr) { sigmoid_mul(*gate, out, stream); }
+                               envelope, workspace, out, stream, fused_gate);
+        if (gate != nullptr && !fusable) { sigmoid_mul(*gate, out, stream); }
         return;
     }
     if (route == detail::CausalAttentionRoute::SmallT) {
@@ -525,15 +531,9 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
             detail::causal_attention_split_capacity(q.ne[1], width, cache.storage, envelope, batch);
         SmallTWorkspace partial =
             allocate_small_t_workspace(workspace, q.ne[1], width, splits, batch);
-        // Only the shared BF16/INT8 reducer carries a gate. The FP8, NVFP4 and K8V4 storages reach
-        // their own reduce kernels, so they take the standalone multiply like the routes that
-        // cannot fold it at all; every caller still sees one contract.
-        const bool fusable = cache.storage == KvCacheStorage::BFloat16 ||
-                             cache.storage == KvCacheStorage::Int8Group64;
         detail::causal_attention_small_t_launch(
             q, k, v, positions, valid_columns, kv_table_rows, scale, cache, envelope, 0, width,
-            partial.acc, partial.m, partial.l, out, stream,
-            (gate != nullptr && fusable) ? gate->data : nullptr);
+            partial.acc, partial.m, partial.l, out, stream, fused_gate);
         if (gate != nullptr && !fusable) { sigmoid_mul(*gate, out, stream); }
         return;
     }
