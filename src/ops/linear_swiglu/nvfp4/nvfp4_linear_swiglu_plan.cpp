@@ -2,10 +2,9 @@
 #include "ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_plan.h"
 
 #include "core/layout.h"
-#include "ninfer/ops/silu_mul.h"
-#include "ops/linear/nvfp4/nvfp4_config.h"
-#include "ops/linear/nvfp4/nvfp4_w4a4_plan.h"
-#include "ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_w4a4_tma_launch.h"
+#include "ops/linear/nvfp4/nvfp4_layout.h"
+#include "ops/linear/nvfp4/nvfp4_a4_plan.h"
+#include "ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_a4_tma_launch.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -17,20 +16,9 @@ namespace {
 enum class Nvfp4LinearSwiGluRoute {
     DecodeFusedA16,
     SmallTFusedA16,
-    FusedW4A4,
-    LinearW4A4Post,
-    TmaFusedW4A4,
+    FusedA4,
+    TmaFusedA4,
 };
-
-constexpr std::int32_t kFusedMaxTokens = 128;
-
-// The fused TMA kernel takes every width from this floor up, whole M tiles or ragged. Below it the
-// public linear + silu_mul composition is ahead on an RTX 5090 (cold weights, Qwen3.8-27B
-// 34816x5120): by 15 % at one whole tile, 6 to 16 % at two and still 1 to 3 % at four and five.
-// The composition's cost grows with the width while the fused kernel's steps once per tile, so
-// the two cross inside the sixth tile: level from 1408 to 1440, the fused kernel 0.5 to 1.8 %
-// ahead from 1456 to 1535 and about 7 % at 3584 and 4096.
-constexpr std::int32_t kTmaFloor = 1440;
 
 Nvfp4LinearSwiGluRoute resolve_route(LinearPolicy policy, std::int32_t tokens) {
     if (tokens <= 0) { throw std::invalid_argument("nvfp4 linear_swiglu: T must be positive"); }
@@ -44,38 +32,15 @@ Nvfp4LinearSwiGluRoute resolve_route(LinearPolicy policy, std::int32_t tokens) {
     }
     if (tokens == 1) { return Nvfp4LinearSwiGluRoute::DecodeFusedA16; }
     if (tokens <= 4) { return Nvfp4LinearSwiGluRoute::SmallTFusedA16; }
-    if (tokens <= kFusedMaxTokens) { return Nvfp4LinearSwiGluRoute::FusedW4A4; }
     // This route dispatches its own fused kernel rather than a Linear shape's, so it carries its
     // own condition; the call site below forces the matching scale layout.
-    if (tokens >= kTmaFloor) { return Nvfp4LinearSwiGluRoute::TmaFusedW4A4; }
-    return Nvfp4LinearSwiGluRoute::LinearW4A4Post;
-}
-
-struct Nvfp4LinearSwiGluWorkspace {
-    Tensor projected;
-    DeviceSpan linear;
-};
-
-template <class Allocator>
-Nvfp4LinearSwiGluWorkspace allocate_baseline_workspace(Allocator& allocator, std::int32_t tokens) {
-    Nvfp4LinearSwiGluWorkspace out;
-    out.projected = allocator.alloc(DType::BF16, {Nvfp4N34816K5120::kOutputRows, tokens}, 256);
-    const std::size_t linear_bytes = linear_workspace_capacity_bytes(
-        QType::NVFP4, Nvfp4N34816K5120::kOutputRows, Nvfp4N34816K5120::kInputRows,
-        LinearPolicy::AllowA4, tokens, tokens);
-    out.linear = allocator.alloc_bytes(linear_bytes, 256);
-    return out;
+    if (tokens >= 256) { return Nvfp4LinearSwiGluRoute::TmaFusedA4; }
+    return Nvfp4LinearSwiGluRoute::FusedA4;
 }
 
 template <class Allocator>
-Nvfp4W4a4Workspace allocate_fused_workspace(Allocator& allocator, std::int32_t tokens) {
-    return allocate_nvfp4_w4a4_workspace(allocator, tokens, Nvfp4N34816K5120::kInputRows);
-}
-
-std::size_t baseline_workspace_bytes(std::int32_t tokens) {
-    WorkspaceLayoutBuilder layout;
-    (void)allocate_baseline_workspace(layout, tokens);
-    return layout.peak_bytes(1);
+Nvfp4A4Workspace allocate_fused_workspace(Allocator& allocator, std::int32_t tokens) {
+    return allocate_nvfp4_a4_workspace(allocator, tokens, Nvfp4N34816K5120::kInputRows);
 }
 
 std::size_t fused_workspace_bytes(std::int32_t tokens) {
@@ -98,20 +63,7 @@ std::size_t nvfp4_linear_swiglu_workspace_capacity_bytes(LinearPolicy policy,
         return 0;
     }
 
-    // Each route owns one contiguous band of widths and needs the most at the widest width of the
-    // interval inside its band.
-    std::size_t maximum = 0;
-    if (min_tokens <= kFusedMaxTokens && max_tokens >= 5) {
-        maximum = fused_workspace_bytes(std::min(max_tokens, kFusedMaxTokens));
-    }
-    const std::int32_t widest_composition = std::min(max_tokens, kTmaFloor - 1);
-    if (widest_composition >= std::max(min_tokens, kFusedMaxTokens + 1)) {
-        maximum = std::max(maximum, baseline_workspace_bytes(widest_composition));
-    }
-    if (max_tokens >= kTmaFloor) {
-        maximum = std::max(maximum, fused_workspace_bytes(max_tokens));
-    }
-    return maximum;
+    return fused_workspace_bytes(max_tokens);
 }
 
 void nvfp4_linear_swiglu_dispatch(const Tensor& x, const Weight& weight, Tensor& out,
@@ -124,31 +76,19 @@ void nvfp4_linear_swiglu_dispatch(const Tensor& x, const Weight& weight, Tensor&
     case Nvfp4LinearSwiGluRoute::SmallTFusedA16:
         nvfp4_linear_swiglu_small_t_launch(x, weight, out, stream);
         return;
-    case Nvfp4LinearSwiGluRoute::FusedW4A4:
-        nvfp4_linear_swiglu_w4a4_launch(x, weight, out, workspace, stream);
+    case Nvfp4LinearSwiGluRoute::FusedA4:
+        nvfp4_linear_swiglu_a4_launch(x, weight, out, workspace, stream);
         return;
-    case Nvfp4LinearSwiGluRoute::TmaFusedW4A4: {
-        auto scope                       = workspace.scope();
-        const Nvfp4W4a4Workspace scratch = allocate_fused_workspace(workspace, x.ne[1]);
-        launch_nvfp4_w4a4_quantize(x, weight, scratch, Nvfp4ScaleLayout::Tiled, stream);
-        const float alpha = 1.0F / (weight.input_scale_divisor * weight.weight_scale_divisor);
-        launch_nvfp4_linear_swiglu_w4a4_tma(
-            scratch.codes, scratch.scales, static_cast<const std::uint8_t*>(weight.qdata),
-            static_cast<const std::uint8_t*>(weight.scales), static_cast<__nv_bfloat16*>(out.data),
-            x.ne[1], alpha, stream);
+    case Nvfp4LinearSwiGluRoute::TmaFusedA4: {
+        auto scope                     = workspace.scope();
+        const Nvfp4A4Workspace scratch = allocate_fused_workspace(workspace, x.ne[1]);
+        launch_nvfp4_a4_quantize(x, weight, scratch, Nvfp4ScaleLayout::Tiled256, stream);
+        launch_nvfp4_linear_swiglu_a4_tma(
+            nvfp4_a4_operands(weight, scratch, x.ne[1], Nvfp4ScaleLayout::Tiled256),
+            static_cast<__nv_bfloat16*>(out.data), stream);
         return;
     }
-    case Nvfp4LinearSwiGluRoute::LinearW4A4Post:
-        break;
     }
-
-    auto scope                         = workspace.scope();
-    Nvfp4LinearSwiGluWorkspace scratch = allocate_baseline_workspace(workspace, x.ne[1]);
-    WorkspaceArena linear_workspace(scratch.linear);
-    linear(x, weight, scratch.projected, LinearPolicy::AllowA4, linear_workspace, stream);
-    constexpr std::int32_t kIntermediate = Nvfp4N34816K5120::kOutputRows / 2;
-    silu_mul(scratch.projected.slice(0, 0, kIntermediate),
-             scratch.projected.slice(0, kIntermediate, kIntermediate), out, stream);
+    throw std::logic_error("unreachable NVFP4 SwiGLU route");
 }
-
 } // namespace ninfer::ops::detail

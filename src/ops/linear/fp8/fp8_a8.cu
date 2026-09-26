@@ -5,9 +5,9 @@
 #include "core/pdl.cuh"
 #include "ops/common/math.cuh"
 #include "ops/common/warp.cuh"
-#include "ops/linear/fp8/fp8_a8_schedule.cuh"
-#include "ops/linear/fp8/fp8_config.h"
-#include "ops/linear/fp8/fp8_output.cuh"
+#include "ops/linear/fp8/fp8_instances.cuh"
+#include "ops/linear/fp8/fp8_schedule.cuh"
+#include "ops/linear/common/epilogue.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
