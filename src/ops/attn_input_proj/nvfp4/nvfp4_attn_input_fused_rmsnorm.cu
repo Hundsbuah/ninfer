@@ -1,14 +1,16 @@
 #include "ops/attn_input_proj/nvfp4/nvfp4_attn_input_plan.h"
 
 #include "core/device.h"
+#include "ops/attn_input_proj/nvfp4/nvfp4_attn_input_a4_tma_launch.h"
 #include "ops/kernel/rmsnorm.cuh"
-#include "ops/linear/nvfp4/nvfp4_codec.cuh"
-#include "ops/linear/nvfp4/nvfp4_w4a4_mma.cuh"
-#include "ops/linear/nvfp4/nvfp4_w4a4_tma_launch.h"
+#include "ops/linear/nvfp4/nvfp4_a4_quantize.cuh"
+#include "ops/linear/nvfp4/nvfp4_geometry.h"
+#include "ops/linear/nvfp4/nvfp4_operands.h"
 
 #include <cuda_bf16.h>
 
 #include <cstdint>
+#include <stdexcept>
 
 namespace ninfer::ops::detail {
 namespace {
@@ -21,19 +23,23 @@ static_assert(kPairsPerThread == 10);
 
 // The sum and Offset epilogue deliberately use the D=5120 RMSNorm launcher's pair ownership,
 // accumulation order, reduction, and BF16 store rounding. The shared row is the exact BF16 image
-// which the standalone quantizer would read from the intermediate global allocation.
+// which the standalone quantizer would read from the intermediate global allocation. The scales go
+// to the tiled plane the TMA route reads; a token past the real count is a tile's padding and gets
+// zero scales, as the standalone quantizer writes them.
+template <Nvfp4ScaleLayout Layout>
 __launch_bounds__(kBlock) __global__
     void rmsnorm_nvfp4_quantize_kernel(const __nv_bfloat162* __restrict__ residual,
                                        const __nv_bfloat162* __restrict__ norm_weight,
                                        std::uint8_t* __restrict__ codes,
                                        std::uint8_t* __restrict__ scales, std::int32_t tokens,
                                        float eps, float input_scale_divisor) {
+    static_assert(Layout != Nvfp4ScaleLayout::RowMajor);
     const int token             = static_cast<int>(blockIdx.x);
     const int thread            = static_cast<int>(threadIdx.x);
     constexpr int kGroupsPerRow = Geometry::kGroupsPerRow;
     if (token >= tokens) {
         for (int group = thread; group < kGroupsPerRow; group += kBlock) {
-            scales[nvfp4_tiled_scale_offset<Geometry>(token, group)] = 0;
+            scales[nvfp4_tiled_scale_offset<Geometry, Layout>(token, group)] = 0;
         }
         return;
     }
@@ -79,8 +85,23 @@ __launch_bounds__(kBlock) __global__
         auto* code_destination =
             codes + static_cast<std::int64_t>(token) * Geometry::kCodeBytesPerRow + group * 8;
         store_vec(code_destination, make_uint2(quantized.codes_lo, quantized.codes_hi));
-        scales[nvfp4_tiled_scale_offset<Geometry>(token, group)] = quantized.scale;
+        scales[nvfp4_tiled_scale_offset<Geometry, Layout>(token, group)] = quantized.scale;
     }
+}
+
+template <Nvfp4ScaleLayout Layout>
+void launch_quantize(const Tensor& residual, const Tensor& norm_weight, float eps,
+                     float input_scale_divisor, Nvfp4A4Workspace workspace, cudaStream_t stream) {
+    const std::int32_t tokens = residual.ne[1];
+    const int padded          = nvfp4_a4_padded_tokens(tokens, Layout);
+    if (static_cast<std::size_t>(padded) * Geometry::kGroupsPerRow > workspace.scale_bytes) {
+        throw std::logic_error("fused rmsnorm NVFP4 quantize: scale plane is too small");
+    }
+    rmsnorm_nvfp4_quantize_kernel<Layout><<<padded, kBlock, 0, stream>>>(
+        static_cast<const __nv_bfloat162*>(residual.data),
+        static_cast<const __nv_bfloat162*>(norm_weight.data), workspace.codes, workspace.scales,
+        tokens, eps, input_scale_divisor);
+    CUDA_CHECK(cudaGetLastError());
 }
 
 } // namespace
@@ -88,31 +109,39 @@ __launch_bounds__(kBlock) __global__
 void launch_nvfp4_attn_input_fused_rmsnorm_quantize(const Tensor& residual,
                                                     const Tensor& norm_weight, float eps,
                                                     float input_scale_divisor,
-                                                    Nvfp4W4a4Workspace workspace,
-                                                    cudaStream_t stream) {
-    const std::int32_t tokens = residual.ne[1];
-    rmsnorm_nvfp4_quantize_kernel<<<nvfp4_w4a4_padded_tokens(tokens), kBlock, 0, stream>>>(
-        static_cast<const __nv_bfloat162*>(residual.data),
-        static_cast<const __nv_bfloat162*>(norm_weight.data), workspace.codes, workspace.scales,
-        tokens, eps, input_scale_divisor);
-    CUDA_CHECK(cudaGetLastError());
+                                                    Nvfp4A4Workspace workspace,
+                                                    Nvfp4ScaleLayout layout, cudaStream_t stream) {
+    switch (layout) {
+    case Nvfp4ScaleLayout::Tiled128:
+        launch_quantize<Nvfp4ScaleLayout::Tiled128>(residual, norm_weight, eps,
+                                                    input_scale_divisor, workspace, stream);
+        return;
+    case Nvfp4ScaleLayout::Tiled256:
+        launch_quantize<Nvfp4ScaleLayout::Tiled256>(residual, norm_weight, eps,
+                                                    input_scale_divisor, workspace, stream);
+        return;
+    case Nvfp4ScaleLayout::RowMajor:
+        break;
+    }
+    throw std::invalid_argument("fused rmsnorm NVFP4 quantize: the TMA route reads a tiled plane");
 }
 
 void nvfp4_attn_input_fused_rmsnorm_launch(const Tensor& residual, const Tensor& norm_weight,
                                            float eps, const Weight& weight, Tensor& q, Tensor& gate,
                                            Tensor& k, Tensor& v, WorkspaceArena& workspace,
                                            cudaStream_t stream) {
-    const std::int32_t tokens        = residual.ne[1];
-    auto scope                       = workspace.scope();
-    const Nvfp4W4a4Workspace scratch = allocate_nvfp4_w4a4_workspace(workspace, tokens, weight.k);
+    const std::int32_t tokens      = residual.ne[1];
+    const Nvfp4ScaleLayout layout  = nvfp4_attn_input_scale_layout(tokens);
+    auto scope                     = workspace.scope();
+    const Nvfp4A4Workspace scratch = allocate_nvfp4_a4_workspace(workspace, tokens, weight.k);
     launch_nvfp4_attn_input_fused_rmsnorm_quantize(residual, norm_weight, eps,
-                                                   weight.input_scale_divisor, scratch, stream);
-    const float alpha = 1.0F / (weight.input_scale_divisor * weight.weight_scale_divisor);
-    launch_nvfp4_w4a4_tma_attention(
-        scratch.codes, scratch.scales, static_cast<const std::uint8_t*>(weight.qdata),
-        static_cast<const std::uint8_t*>(weight.scales), static_cast<__nv_bfloat16*>(q.data),
-        static_cast<__nv_bfloat16*>(gate.data), static_cast<__nv_bfloat16*>(k.data),
-        static_cast<__nv_bfloat16*>(v.data), tokens, alpha, stream);
+                                                   weight.input_scale_divisor, scratch, layout,
+                                                   stream);
+    launch_nvfp4_a4_tma_attention(nvfp4_a4_operands(weight, scratch, tokens, layout),
+                                  static_cast<__nv_bfloat16*>(q.data),
+                                  static_cast<__nv_bfloat16*>(gate.data),
+                                  static_cast<__nv_bfloat16*>(k.data),
+                                  static_cast<__nv_bfloat16*>(v.data), stream);
 }
 
 } // namespace ninfer::ops::detail

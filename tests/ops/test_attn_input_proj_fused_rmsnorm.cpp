@@ -102,14 +102,14 @@ int run_case(const Weight& weight, const quantized_weight::PackedWeight& host, i
     {
         auto reference_scope = reference_workspace.scope();
         auto fused_scope     = fused_workspace.scope();
+        const auto layout = ops::detail::nvfp4_attn_input_scale_layout(tokens);
         const auto reference_planes =
-            ops::detail::allocate_nvfp4_w4a4_workspace(reference_workspace, tokens, kHidden);
+            ops::detail::allocate_nvfp4_a4_workspace(reference_workspace, tokens, kHidden);
         const auto fused_planes =
-            ops::detail::allocate_nvfp4_w4a4_workspace(fused_workspace, tokens, kHidden);
-        ops::detail::launch_nvfp4_w4a4_quantize(hidden, weight, reference_planes,
-                                                ops::detail::Nvfp4ScaleLayout::Tiled, nullptr);
+            ops::detail::allocate_nvfp4_a4_workspace(fused_workspace, tokens, kHidden);
+        ops::detail::launch_nvfp4_a4_quantize(hidden, weight, reference_planes, layout, nullptr);
         ops::detail::launch_nvfp4_attn_input_fused_rmsnorm_quantize(
-            residual, gain, kEps, weight.input_scale_divisor, fused_planes, nullptr);
+            residual, gain, kEps, weight.input_scale_divisor, fused_planes, layout, nullptr);
         cuda_synchronize();
         const std::string suffix = " T=" + std::to_string(tokens);
         failures += compare_bytes("codes" + suffix, reference_planes.codes, fused_planes.codes,
@@ -235,16 +235,17 @@ int main() {
         if (ops::attn_input_proj_fused_rmsnorm_nvfp4_eligible(weight, ops::LinearPolicy::A16Only,
                                                               1024) ||
             ops::attn_input_proj_fused_rmsnorm_nvfp4_eligible(weight, ops::LinearPolicy::AllowA4,
-                                                              1023) ||
+                                                              511) ||
             !ops::attn_input_proj_fused_rmsnorm_nvfp4_eligible(weight, ops::LinearPolicy::AllowA4,
-                                                               1024)) {
+                                                               512)) {
             std::cerr << "fused route eligibility mismatch\n";
             return 1;
         }
         int failures       = 0;
         const bool measure = std::getenv("NINFER_MEASURE_FUSED_STAGE") != nullptr;
-        // 3584 is the production prefill chunk under the fast prefill kernel's wave re-basing.
-        for (const int tokens : {1024, 1500, 2048, 3584, 4096}) {
+        // 512 and 700 read the 128-token scale tiles (700 a ragged last tile); from 1024 the tiles
+        // are 256 tokens. 3584 is the production prefill chunk under the fast prefill kernel.
+        for (const int tokens : {512, 700, 1024, 1500, 2048, 3584, 4096}) {
             failures += run_case(weight, parent.host, tokens, measure);
         }
         return failures == 0 ? 0 : 1;
