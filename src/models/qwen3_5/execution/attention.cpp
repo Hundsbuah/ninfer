@@ -30,9 +30,17 @@ void require_rope_axes(const Tensor& positions, const RopeConfig& config) {
 // is a dispatch choice, and both branches are the same arithmetic bit for bit.
 constexpr std::int32_t kFusedTextQkNormRopeMaximumTokens = 256;
 
+// The fused text Op's formula fixes the native schedule's constants rather than taking them as
+// operands; any other theta, epsilon or YaRN coefficient takes the three calls.
+constexpr float kFusedTextRopeTheta = 1.0e7F;
+constexpr float kFusedTextNormEpsilon = 1.0e-6F;
+
 bool fused_text_qk_norm_rope(const Tensor& positions, const RopeConfig& rope,
-                             const AttentionConfig& attention, std::int32_t tokens) {
-    return positions.ne[1] == 1 && tokens <= kFusedTextQkNormRopeMaximumTokens &&
+                             const AttentionConfig& attention, float rms_norm_eps,
+                             const ops::PreparedRope& prepared, std::int32_t tokens) {
+    return prepared.factor == 1.0F && prepared.theta == kFusedTextRopeTheta &&
+           rms_norm_eps == kFusedTextNormEpsilon && positions.ne[1] == 1 &&
+           tokens <= kFusedTextQkNormRopeMaximumTokens &&
            attention.head_dim == 256 && rope.rotary_dim == 64 &&
            ((attention.num_attention_heads == 16 && attention.num_key_value_heads == 2) ||
             (attention.num_attention_heads == 24 && attention.num_key_value_heads == 4));
@@ -78,8 +86,8 @@ void text_qk_norm_rope(const Tensor& positions, const RopeConfig& rope,
                        const Tensor& query, const Tensor& key, Tensor& normalized_query,
                        Tensor& normalized_key, cudaStream_t stream) {
     require_rope_axes(positions, rope);
-    if (prepared.factor == 1.0F &&
-        fused_text_qk_norm_rope(positions, rope, attention, query.ne[2])) {
+    if (fused_text_qk_norm_rope(positions, rope, attention, rms_norm_eps, prepared,
+                                query.ne[2])) {
         ops::rmsnorm_rope(positions, q_norm_weight, k_norm_weight, query, key, normalized_query,
                           normalized_key, stream);
         return;
