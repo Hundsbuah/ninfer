@@ -1132,8 +1132,6 @@ private:
     // Builds the lane from the staged, Device-resident source.
     [[nodiscard]] StartResult hybrid_activate(HybridMaterializationTransaction& transaction);
     void hybrid_abort_materialization(HybridMaterializationTransaction& transaction) noexcept;
-    void hybrid_prompt_keys(const PreparedPromptData& prompt, std::vector<std::uint64_t>& hashes,
-                            std::vector<std::uint64_t>& extras) const;
     [[nodiscard]] bool hybrid_make_room(std::uint32_t text_pages, std::uint32_t backend_pages);
     // The backend KV frontier restored with a snapshot at `frontier` (MTP trails by one token).
     [[nodiscard]] std::uint32_t hybrid_backend_frontier(std::uint32_t frontier) const noexcept;

@@ -10,6 +10,7 @@
 #include "models/qwen3_5/frontend/tokenizer.h"
 #include "models/qwen3_5/frontend/tool_call_parser.h"
 #include "models/qwen3_5/frontend/ngram_sources.h"
+#include "models/qwen3_5/program/prefix/block_keys.h"
 #include "text/unicode.h"
 
 #include <nlohmann/json.hpp>
@@ -1065,6 +1066,7 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
         fi::check_preparation_control(control, "ngram index");
         build_ngram_index(result);
     }
+    detail::prompt_block_keys(result, result.block_hashes, result.block_extras);
     result.prepare.seconds = std::chrono::duration<double>(Clock::now() - start).count();
     return PreparedPrompt(std::move(prepared));
 }
@@ -1141,6 +1143,7 @@ PreparedPrompt Frontend::prepare_tokens(std::vector<TokenId> token_ids,
         result.ngram_archive_sources.push_back({result.token_ids, NgramSourceKind::Text});
     }
     assign_text_positions(result);
+    detail::prompt_block_keys(result, result.block_hashes, result.block_extras);
     result.identity.reusable                  = allow_prefix_identity;
     result.context_cache.retention            = runtime::RetentionClass::RecentPrivate;
     result.context_cache.update_session_index = false;
