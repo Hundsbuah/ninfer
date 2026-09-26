@@ -184,9 +184,10 @@ __device__ __forceinline__ void nvfp4_tma_load_2d(void* destination, const CUten
 template <class Geometry, class Schedule, class Epilogue, class OutputPolicy>
 __global__
 __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_w4a4_tma_kernel(
+    const OutputPolicy output, int token_count
     const __grid_constant__ Nvfp4W4a4TmaDescriptors descriptors, float alpha,
     const __grid_constant__ Epilogue epilogue, const __grid_constant__ OutputPolicy output,
-    int token_count) {
+    int token_count
     static_assert((Geometry::kInputRows % Schedule::kBlockK) == 0);
     static_assert((Geometry::kOutputRows % Schedule::kBlockN) == 0);
     static_assert(Schedule::kStages >= 2, "the activation-scale buffer needs two slots");
