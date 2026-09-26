@@ -21,9 +21,13 @@ enum class Q8KSplitActivationStage : std::uint8_t {
     RuntimeActive,
 };
 
+// RowTiles 16-row MMA tiles share each CTA's staged activation block. With one tile every 16
+// weight rows re-read the whole BF16 activation from L2, which at verification widths exceeds the
+// weight stream; two tiles halve that traffic. Two tiles serve contiguous identity-row stores only.
 template <int KWarps, int TileTokens, int MinBlocksPerSm, Q8KSplitScaleAccess ScaleAccess,
           Cache ActivationCache = Cache::ca, Cache WeightCache = Cache::cg,
-          Q8KSplitActivationStage ActivationStage = Q8KSplitActivationStage::ActiveOnly>
+          Q8KSplitActivationStage ActivationStage = Q8KSplitActivationStage::ActiveOnly,
+          int RowTiles                            = 1>
 struct Q8KSplitSchedule {
     static_assert(KWarps == 4 || KWarps == 8 || KWarps == 16);
     static_assert(TileTokens == 8 || TileTokens == 16 || TileTokens == 24 || TileTokens == 32 ||
@@ -41,9 +45,12 @@ struct Q8KSplitSchedule {
     static constexpr int kThreads           = KWarps * 32;
     static constexpr int kTileKPerWarp      = 64;
     static constexpr int kGroupK            = KWarps * kTileKPerWarp;
-    static constexpr int kRowsPerCta        = 16;
+    static constexpr int kRowTiles          = RowTiles;
+    static constexpr int kRowsPerCta        = 16 * RowTiles;
     static constexpr int kRowsPerLoaderWarp = kRowsPerCta / KWarps;
     static constexpr int kScaleBytesPerRow  = kGroupK / 16;
+    static_assert(RowTiles == 1 || RowTiles == 2);
+    static_assert(kRowsPerCta % KWarps == 0);
 };
 
 template <int TileTokens, int ActiveTokens>

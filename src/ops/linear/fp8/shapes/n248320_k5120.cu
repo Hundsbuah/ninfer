@@ -11,8 +11,14 @@ namespace {
 template <int ActiveTokens>
 void launch_tile(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
     using Geometry = Fp8N248320K5120;
+    // Above 16 columns each 16-row CTA re-reads more activation bytes from L2 than it streams
+    // weight bytes, so two row tiles share the staged activation. Measured on RTX 5090 this takes
+    // 24/32/40 columns from 835/1026/1193 us to 774/795/837 us with identical split-K arithmetic.
     using Schedule = Fp8A16KSplitSchedule<(ActiveTokens <= 8 ? 16 : (ActiveTokens <= 24 ? 8 : 4)),
-                                          ActiveTokens, ActiveTokens <= 8 ? 1 : 2>;
+                                          ActiveTokens, (ActiveTokens <= 8 ? 1 : 2),
+                                          Fp8A16KSplitCache::Default, Fp8A16KSplitCache::Streaming,
+                                          Fp8A16KSplitActivationStage::ActiveOnly,
+                                          (ActiveTokens > 16 ? 2 : 1)>;
     static_assert((Geometry::kInputRows % Schedule::kGroupK) == 0);
     constexpr int kBlocks = Geometry::kOutputRows / Schedule::kRowsPerCta;
     const Fp8ContiguousOutput output{static_cast<__nv_bfloat16*>(out.data), Geometry::kOutputRows};

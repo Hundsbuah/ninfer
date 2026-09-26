@@ -67,7 +67,7 @@ union alignas(16) Q8KSplitSharedStorage {
                                 : 1];
     } staging;
 
-    float partial[Schedule::kKWarps * (Schedule::kTileTokens / 8) * 32 * 4];
+    float partial[Schedule::kKWarps * Schedule::kRowTiles * (Schedule::kTileTokens / 8) * 32 * 4];
 };
 
 struct Q8KSplitIdentityColumns {
@@ -102,6 +102,13 @@ q8_ksplit_mma(const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restric
                   "runtime-active staging requires a runtime column extent");
     constexpr int kNt        = kTileCols / 8;
     constexpr unsigned kMask = 0xffffffffu;
+    constexpr int kRowTiles  = Schedule::kRowTiles;
+    static_assert(kRowTiles == 1 || (std::is_same_v<RowPolicy, Q8KSplitIdentityRows> &&
+                                     std::is_same_v<Output, Q8ContiguousOutput> &&
+                                     (std::is_same_v<Epilogue, Q8KSplitStoreEpilogue> ||
+                                      std::is_same_v<Epilogue, Q8KSplitResidualEpilogue>)),
+                  "multiple row tiles serve contiguous identity-row stores only");
+    constexpr int kCtaRows = kRowTiles == 1 ? RowPolicy::kOutputRowsPerCta : kRowsPerCta;
 
     using SharedStorage = Q8KSplitSharedStorage<Schedule>;
 
@@ -122,7 +129,7 @@ q8_ksplit_mma(const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restric
     const int lid     = lane & 3;
     const int k_split = warp;
 
-    const int cta_row0 = static_cast<int>(blockIdx.x) * RowPolicy::kOutputRowsPerCta;
+    const int cta_row0 = static_cast<int>(blockIdx.x) * kCtaRows;
 
     const auto stage_x = [&](int group_k0) {
         constexpr bool kPaddedStage =
@@ -190,13 +197,16 @@ q8_ksplit_mma(const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restric
     const int b_rin     = lane & 7;
     const int b_koff    = ((lane >> 3) & 1) << 3;
     const int warp_koff = k_split * kTileK;
-    float acc[kNt][4];
+    float acc[kRowTiles][kNt][4];
 #pragma unroll
-    for (int ni = 0; ni < kNt; ++ni) {
-        acc[ni][0] = 0.0f;
-        acc[ni][1] = 0.0f;
-        acc[ni][2] = 0.0f;
-        acc[ni][3] = 0.0f;
+    for (int tile = 0; tile < kRowTiles; ++tile) {
+#pragma unroll
+        for (int ni = 0; ni < kNt; ++ni) {
+            acc[tile][ni][0] = 0.0f;
+            acc[tile][ni][1] = 0.0f;
+            acc[tile][ni][2] = 0.0f;
+            acc[tile][ni][3] = 0.0f;
+        }
     }
 
     stage_codes(0);
@@ -211,32 +221,41 @@ q8_ksplit_mma(const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restric
     for (int group_index = 0; group_index < kGroups; ++group_index) {
         const int group_k0 = group_index * kGroupK;
 
-        unsigned lane_scale_pair = 0;
-        if (lid < 2) {
-            if constexpr (Schedule::kScaleAccess == Q8KSplitScaleAccess::Shared) {
-                const int scale_row = gid + lid * 8;
-                lane_scale_pair =
-                    *reinterpret_cast<const unsigned*>(&scale_shared[scale_row][warp_koff / 16]);
-            } else {
-                const int scale_row = row_policy.weight_row(cta_row0, gid + lid * 8);
-                lane_scale_pair     = *reinterpret_cast<const unsigned*>(
-                    scales + (static_cast<std::int64_t>(scale_row) * Geometry::kGroupsPerRow +
-                              group_k0 / 32 + warp_koff / 32) *
-                                 2);
+        unsigned top_scale_pair[kRowTiles];
+        unsigned bot_scale_pair[kRowTiles];
+#pragma unroll
+        for (int tile = 0; tile < kRowTiles; ++tile) {
+            unsigned lane_scale_pair = 0;
+            if (lid < 2) {
+                if constexpr (Schedule::kScaleAccess == Q8KSplitScaleAccess::Shared) {
+                    const int scale_row = tile * 16 + gid + lid * 8;
+                    lane_scale_pair     = *reinterpret_cast<const unsigned*>(
+                        &scale_shared[scale_row][warp_koff / 16]);
+                } else {
+                    const int scale_row =
+                        row_policy.weight_row(cta_row0, tile * 16 + gid + lid * 8);
+                    lane_scale_pair = *reinterpret_cast<const unsigned*>(
+                        scales + (static_cast<std::int64_t>(scale_row) * Geometry::kGroupsPerRow +
+                                  group_k0 / 32 + warp_koff / 32) *
+                                     2);
+                }
             }
+            top_scale_pair[tile] = __shfl_sync(kMask, lane_scale_pair, lane & ~3);
+            bot_scale_pair[tile] = __shfl_sync(kMask, lane_scale_pair, (lane & ~3) + 1);
         }
-        const unsigned top_scale_pair = __shfl_sync(kMask, lane_scale_pair, lane & ~3);
-        const unsigned bot_scale_pair = __shfl_sync(kMask, lane_scale_pair, (lane & ~3) + 1);
 
 #pragma unroll
         for (int group = 0; group < 2; ++group) {
-            float group_acc[kNt][4];
+            float group_acc[kRowTiles][kNt][4];
 #pragma unroll
-            for (int ni = 0; ni < kNt; ++ni) {
-                group_acc[ni][0] = 0.0f;
-                group_acc[ni][1] = 0.0f;
-                group_acc[ni][2] = 0.0f;
-                group_acc[ni][3] = 0.0f;
+            for (int tile = 0; tile < kRowTiles; ++tile) {
+#pragma unroll
+                for (int ni = 0; ni < kNt; ++ni) {
+                    group_acc[tile][ni][0] = 0.0f;
+                    group_acc[tile][ni][1] = 0.0f;
+                    group_acc[tile][ni][2] = 0.0f;
+                    group_acc[tile][ni][3] = 0.0f;
+                }
             }
 #pragma unroll
             for (int ki = 0; ki < 2; ++ki) {
@@ -248,11 +267,16 @@ q8_ksplit_mma(const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restric
                     return static_cast<unsigned>(
                         *reinterpret_cast<const unsigned short*>(&code_shared[code_row][offset]));
                 };
-                const unsigned af0 = q8_ksplit_bf16_pair_from_s8(load_code_pair(gid, code_col));
-                const unsigned af1 = q8_ksplit_bf16_pair_from_s8(load_code_pair(gid + 8, code_col));
-                const unsigned af2 = q8_ksplit_bf16_pair_from_s8(load_code_pair(gid, code_col + 8));
-                const unsigned af3 =
-                    q8_ksplit_bf16_pair_from_s8(load_code_pair(gid + 8, code_col + 8));
+                unsigned af[kRowTiles][4];
+#pragma unroll
+                for (int tile = 0; tile < kRowTiles; ++tile) {
+                    const int top = tile * 16 + gid;
+                    af[tile][0]   = q8_ksplit_bf16_pair_from_s8(load_code_pair(top, code_col));
+                    af[tile][1]   = q8_ksplit_bf16_pair_from_s8(load_code_pair(top + 8, code_col));
+                    af[tile][2]   = q8_ksplit_bf16_pair_from_s8(load_code_pair(top, code_col + 8));
+                    af[tile][3] =
+                        q8_ksplit_bf16_pair_from_s8(load_code_pair(top + 8, code_col + 8));
+                }
 #pragma unroll
                 for (int ni = 0; ni < kNt; ++ni) {
                     unsigned bf0, bf1;
@@ -261,20 +285,29 @@ q8_ksplit_mma(const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restric
                         bf0, bf1,
                         smem_addr(&b_shared[k_split][br * kTileK +
                                                      q8_ksplit_swizzle_64(br, ks * 16 + b_koff)]));
-                    mma_bf16(group_acc[ni][0], group_acc[ni][1], group_acc[ni][2], group_acc[ni][3],
-                             af0, af1, af2, af3, bf0, bf1);
+#pragma unroll
+                    for (int tile = 0; tile < kRowTiles; ++tile) {
+                        mma_bf16(group_acc[tile][ni][0], group_acc[tile][ni][1],
+                                 group_acc[tile][ni][2], group_acc[tile][ni][3], af[tile][0],
+                                 af[tile][1], af[tile][2], af[tile][3], bf0, bf1);
+                    }
                 }
             }
-            const unsigned top_bits = group == 0 ? top_scale_pair & 0xffffu : top_scale_pair >> 16;
-            const unsigned bot_bits = group == 0 ? bot_scale_pair & 0xffffu : bot_scale_pair >> 16;
-            const float top_scale   = __half2float(__ushort_as_half(top_bits));
-            const float bot_scale   = __half2float(__ushort_as_half(bot_bits));
 #pragma unroll
-            for (int ni = 0; ni < kNt; ++ni) {
-                acc[ni][0] = fmaf(group_acc[ni][0], top_scale, acc[ni][0]);
-                acc[ni][1] = fmaf(group_acc[ni][1], top_scale, acc[ni][1]);
-                acc[ni][2] = fmaf(group_acc[ni][2], bot_scale, acc[ni][2]);
-                acc[ni][3] = fmaf(group_acc[ni][3], bot_scale, acc[ni][3]);
+            for (int tile = 0; tile < kRowTiles; ++tile) {
+                const unsigned top_bits =
+                    group == 0 ? top_scale_pair[tile] & 0xffffu : top_scale_pair[tile] >> 16;
+                const unsigned bot_bits =
+                    group == 0 ? bot_scale_pair[tile] & 0xffffu : bot_scale_pair[tile] >> 16;
+                const float top_scale = __half2float(__ushort_as_half(top_bits));
+                const float bot_scale = __half2float(__ushort_as_half(bot_bits));
+#pragma unroll
+                for (int ni = 0; ni < kNt; ++ni) {
+                    acc[tile][ni][0] = fmaf(group_acc[tile][ni][0], top_scale, acc[tile][ni][0]);
+                    acc[tile][ni][1] = fmaf(group_acc[tile][ni][1], top_scale, acc[tile][ni][1]);
+                    acc[tile][ni][2] = fmaf(group_acc[tile][ni][2], bot_scale, acc[tile][ni][2]);
+                    acc[tile][ni][3] = fmaf(group_acc[tile][ni][3], bot_scale, acc[tile][ni][3]);
+                }
             }
         }
 
@@ -290,28 +323,39 @@ q8_ksplit_mma(const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restric
 
     pdl::trigger_dependents();
     __syncthreads();
-    auto* partial = shared.partial;
+    auto* partial            = shared.partial;
+    const auto partial_index = [&](int split, int tile, int ni) {
+        return (((split * kRowTiles + tile) * kNt + ni) * 32 + lane) * 4;
+    };
     if ((k_split & 1) != 0) {
 #pragma unroll
-        for (int ni = 0; ni < kNt; ++ni) {
-            store_vec(partial + ((warp * kNt + ni) * 32 + lane) * 4,
-                      make_float4(acc[ni][0], acc[ni][1], acc[ni][2], acc[ni][3]));
+        for (int tile = 0; tile < kRowTiles; ++tile) {
+#pragma unroll
+            for (int ni = 0; ni < kNt; ++ni) {
+                store_vec(partial + partial_index(warp, tile, ni),
+                          make_float4(acc[tile][ni][0], acc[tile][ni][1], acc[tile][ni][2],
+                                      acc[tile][ni][3]));
+            }
         }
     }
     __syncthreads();
 
     if ((k_split & 1) == 0) {
 #pragma unroll
-        for (int ni = 0; ni < kNt; ++ni) {
-            const float4 partner =
-                load_vec<float4>(partial + (((warp + 1) * kNt + ni) * 32 + lane) * 4);
-            acc[ni][0] += partner.x;
-            acc[ni][1] += partner.y;
-            acc[ni][2] += partner.z;
-            acc[ni][3] += partner.w;
-            if (k_split != 0) {
-                store_vec(partial + ((warp * kNt + ni) * 32 + lane) * 4,
-                          make_float4(acc[ni][0], acc[ni][1], acc[ni][2], acc[ni][3]));
+        for (int tile = 0; tile < kRowTiles; ++tile) {
+#pragma unroll
+            for (int ni = 0; ni < kNt; ++ni) {
+                const float4 partner =
+                    load_vec<float4>(partial + partial_index(warp + 1, tile, ni));
+                acc[tile][ni][0] += partner.x;
+                acc[tile][ni][1] += partner.y;
+                acc[tile][ni][2] += partner.z;
+                acc[tile][ni][3] += partner.w;
+                if (k_split != 0) {
+                    store_vec(partial + partial_index(warp, tile, ni),
+                              make_float4(acc[tile][ni][0], acc[tile][ni][1], acc[tile][ni][2],
+                                          acc[tile][ni][3]));
+                }
             }
         }
     }
@@ -320,49 +364,54 @@ q8_ksplit_mma(const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restric
     if (k_split == 0) {
         float* projected = partial;
 #pragma unroll
-        for (int ni = 0; ni < kNt; ++ni) {
-            float4 sum = make_float4(acc[ni][0], acc[ni][1], acc[ni][2], acc[ni][3]);
+        for (int tile = 0; tile < kRowTiles; ++tile) {
+            const int tile_row0 = cta_row0 + tile * 16;
 #pragma unroll
-            for (int split = 2; split < kWarps; split += 2) {
-                const float4 value =
-                    load_vec<float4>(partial + ((split * kNt + ni) * 32 + lane) * 4);
-                sum.x += value.x;
-                sum.y += value.y;
-                sum.z += value.z;
-                sum.w += value.w;
-            }
-            const int col0 = ni * 8 + 2 * lid;
-            if constexpr (std::is_same_v<Epilogue, Q8KSplitStoreEpilogue> ||
-                          std::is_same_v<Epilogue, Q8KSplitResidualEpilogue>) {
-                const auto store = [&](int row, int col, float value) {
-                    if constexpr (TiledColumns) {
-                        if (col >= live_columns) return;
+            for (int ni = 0; ni < kNt; ++ni) {
+                float4 sum = make_float4(acc[tile][ni][0], acc[tile][ni][1], acc[tile][ni][2],
+                                         acc[tile][ni][3]);
+#pragma unroll
+                for (int split = 2; split < kWarps; split += 2) {
+                    const float4 value = load_vec<float4>(partial + partial_index(split, tile, ni));
+                    sum.x += value.x;
+                    sum.y += value.y;
+                    sum.z += value.z;
+                    sum.w += value.w;
+                }
+                const int col0 = ni * 8 + 2 * lid;
+                if constexpr (std::is_same_v<Epilogue, Q8KSplitStoreEpilogue> ||
+                              std::is_same_v<Epilogue, Q8KSplitResidualEpilogue>) {
+                    const auto store = [&](int row, int col, float value) {
+                        if constexpr (TiledColumns) {
+                            if (col >= live_columns) return;
+                        }
+                        __nv_bfloat16* destination =
+                            output.tile(cta_row0).at(row, col + column_offset);
+                        if constexpr (std::is_same_v<Epilogue, Q8KSplitResidualEpilogue>) {
+                            value += __bfloat162float(*destination);
+                        }
+                        *destination = __float2bfloat16_rn(value);
+                    };
+                    if (col0 < ActiveCols) {
+                        store(tile_row0 + gid, col0, sum.x);
+                        store(tile_row0 + gid + 8, col0, sum.z);
                     }
-                    __nv_bfloat16* destination = output.tile(cta_row0).at(row, col + column_offset);
-                    if constexpr (std::is_same_v<Epilogue, Q8KSplitResidualEpilogue>) {
-                        value += __bfloat162float(*destination);
+                    if (col0 + 1 < ActiveCols) {
+                        store(tile_row0 + gid, col0 + 1, sum.y);
+                        store(tile_row0 + gid + 8, col0 + 1, sum.w);
                     }
-                    *destination = __float2bfloat16_rn(value);
-                };
-                if (col0 < ActiveCols) {
-                    store(cta_row0 + gid, col0, sum.x);
-                    store(cta_row0 + gid + 8, col0, sum.z);
-                }
-                if (col0 + 1 < ActiveCols) {
-                    store(cta_row0 + gid, col0 + 1, sum.y);
-                    store(cta_row0 + gid + 8, col0 + 1, sum.w);
-                }
-            } else if constexpr (DirectPairEpilogue) {
-                epilogue.store_pair(cta_row0 + gid, col0 + column_offset, sum,
-                                    TiledColumns ? columns : ActiveCols);
-            } else {
-                if (col0 < ActiveCols) {
-                    projected[gid * kTileCols + col0]       = sum.x;
-                    projected[(gid + 8) * kTileCols + col0] = sum.z;
-                }
-                if (col0 + 1 < ActiveCols) {
-                    projected[gid * kTileCols + col0 + 1]       = sum.y;
-                    projected[(gid + 8) * kTileCols + col0 + 1] = sum.w;
+                } else if constexpr (DirectPairEpilogue) {
+                    epilogue.store_pair(cta_row0 + gid, col0 + column_offset, sum,
+                                        TiledColumns ? columns : ActiveCols);
+                } else {
+                    if (col0 < ActiveCols) {
+                        projected[gid * kTileCols + col0]       = sum.x;
+                        projected[(gid + 8) * kTileCols + col0] = sum.z;
+                    }
+                    if (col0 + 1 < ActiveCols) {
+                        projected[gid * kTileCols + col0 + 1]       = sum.y;
+                        projected[(gid + 8) * kTileCols + col0 + 1] = sum.w;
+                    }
                 }
             }
         }

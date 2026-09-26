@@ -10,9 +10,14 @@ using C4       = Q8KSplitSchedule<4, 8, 2, Access::Direct, Cache::ca, Cache::cg,
 using C8       = Q8KSplitSchedule<4, 8, 2, Access::Shared, Cache::ca, Cache::cg, Stage::ActiveOnly>;
 using C16 = Q8KSplitSchedule<4, 16, 2, Access::Shared, Cache::ca, Cache::cg, Stage::ActiveOnly>;
 using C24 = Q8KSplitSchedule<8, 24, 2, Access::Shared, Cache::ca, Cache::cg, Stage::ActiveOnly>;
-using C32 = Q8KSplitSchedule<4, 32, 2, Access::Shared, Cache::ca, Cache::cg, Stage::RuntimeActive>;
-using C40 = Q8KSplitSchedule<4, 40, 2, Access::Shared, Cache::ca, Cache::cg, Stage::RuntimeActive>;
-using C56 = Q8KSplitSchedule<4, 56, 2, Access::Shared, Cache::ca, Cache::cg, Stage::ActiveOnly>;
+// From 32 columns two row tiles share each CTA's staged activation, halving its L2 re-reads:
+// measured on RTX 5090, 32/40/56 columns take 141/156/206 us instead of 153/178/255 us, with the
+// same split-K arithmetic.
+using C32 =
+    Q8KSplitSchedule<4, 32, 2, Access::Shared, Cache::ca, Cache::cg, Stage::RuntimeActive, 2>;
+using C40 =
+    Q8KSplitSchedule<4, 40, 2, Access::Shared, Cache::ca, Cache::cg, Stage::RuntimeActive, 2>;
+using C56 = Q8KSplitSchedule<4, 56, 2, Access::Shared, Cache::ca, Cache::cg, Stage::ActiveOnly, 2>;
 } // namespace
 
 Q8Launch select_q8_n34816_k5120(std::int32_t tokens) {

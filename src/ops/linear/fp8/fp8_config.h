@@ -76,10 +76,14 @@ enum class Fp8A16KSplitCache : std::uint8_t {
     Streaming,
 };
 
+// RowTiles 16-row MMA tiles share each CTA's staged activation block. One tile re-reads the whole
+// BF16 activation from L2 for every 16 weight rows; at verification widths that L2 traffic exceeds
+// the weight stream, so wide heads amortize it over two tiles.
 template <int KWarps, int TileTokens, int MinBlocksPerSm,
           Fp8A16KSplitCache ActivationCache           = Fp8A16KSplitCache::Default,
           Fp8A16KSplitCache WeightCache               = Fp8A16KSplitCache::Streaming,
-          Fp8A16KSplitActivationStage ActivationStage = Fp8A16KSplitActivationStage::ActiveOnly>
+          Fp8A16KSplitActivationStage ActivationStage = Fp8A16KSplitActivationStage::ActiveOnly,
+          int RowTiles                                = 1>
 struct Fp8A16KSplitSchedule {
     static_assert(KWarps == 4 || KWarps == 8 || KWarps == 16);
     static_assert(TileTokens == 8 || TileTokens == 16 || TileTokens == 24 || TileTokens == 32 ||
@@ -95,8 +99,11 @@ struct Fp8A16KSplitSchedule {
     static constexpr int kThreads           = KWarps * 32;
     static constexpr int kTileKPerWarp      = 64;
     static constexpr int kGroupK            = KWarps * kTileKPerWarp;
-    static constexpr int kRowsPerCta        = 16;
+    static constexpr int kRowTiles          = RowTiles;
+    static constexpr int kRowsPerCta        = 16 * RowTiles;
     static constexpr int kRowsPerLoaderWarp = kRowsPerCta / KWarps;
+    static_assert(RowTiles == 1 || RowTiles == 2);
+    static_assert(kRowsPerCta % KWarps == 0);
 };
 
 } // namespace ninfer::ops::detail

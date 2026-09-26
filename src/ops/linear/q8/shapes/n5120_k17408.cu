@@ -9,12 +9,17 @@ using Stage    = Q8KSplitActivationStage;
 using C4  = Q8KSplitSchedule<8, 8, 2, Access::Direct, Cache::ca, Cache::cg, Stage::RuntimeActive>;
 using C8  = Q8KSplitSchedule<8, 8, 2, Access::Shared, Cache::ca, Cache::cg, Stage::RuntimeActive>;
 using C16 = Q8KSplitSchedule<8, 16, 2, Access::Shared, Cache::ca, Cache::cg, Stage::ActiveOnly>;
-using C24 = Q8KSplitSchedule<8, 24, 2, Access::Shared, Cache::ca, Cache::cg, Stage::RuntimeActive>;
-using C32 = Q8KSplitSchedule<8, 32, 2, Access::Shared, Cache::ca, Cache::cg, Stage::RuntimeActive>;
+// Two row tiles share each CTA's staged activation, halving its L2 re-reads. Measured on RTX 5090:
+// 24 columns 74 -> 68 us (same split-K); 32 columns 95 -> 84 us, where the two-tile staging only
+// fits the static shared-memory limit with four K warps; 48/64 columns 116/164 -> 103/147 us.
+using C24 =
+    Q8KSplitSchedule<8, 24, 2, Access::Shared, Cache::ca, Cache::cg, Stage::RuntimeActive, 2>;
+using C32 =
+    Q8KSplitSchedule<4, 32, 2, Access::Shared, Cache::ca, Cache::cg, Stage::RuntimeActive, 2>;
 using C40 = Q8KSplitSchedule<4, 40, 3, Access::Shared, Cache::ca, Cache::cg, Stage::RuntimeActive>;
-using C48 = Q8KSplitSchedule<4, 48, 3, Access::Shared, Cache::ca, Cache::cg, Stage::ActiveOnly>;
-using C56 = Q8KSplitSchedule<4, 56, 3, Access::Shared, Cache::ca, Cache::cg, Stage::ActiveOnly>;
-using C64 = Q8KSplitSchedule<4, 64, 3, Access::Shared, Cache::ca, Cache::cg, Stage::ActiveOnly>;
+using C48 = Q8KSplitSchedule<4, 48, 2, Access::Shared, Cache::ca, Cache::cg, Stage::ActiveOnly, 2>;
+using C56 = Q8KSplitSchedule<4, 56, 2, Access::Shared, Cache::ca, Cache::cg, Stage::ActiveOnly, 2>;
+using C64 = Q8KSplitSchedule<4, 64, 2, Access::Shared, Cache::ca, Cache::cg, Stage::ActiveOnly, 2>;
 } // namespace
 
 Q8Launch select_q8_n5120_k17408(std::int32_t tokens) {

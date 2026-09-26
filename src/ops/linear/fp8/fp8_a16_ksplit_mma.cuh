@@ -2,7 +2,8 @@
 
 // Small-T row-scaled E4M3 weight x BF16 activation Tensor Core mainloop.
 //
-// A CTA owns sixteen output rows and splits K across compile-time-selected warps. Persistent E4M3
+// A CTA owns Schedule::kRowTiles sixteen-row output tiles and splits K across compile-time-selected
+// warps. Every row tile reuses the same staged activation and B fragments. Persistent E4M3
 // codes are widened exactly to BF16 MMA operands; the represented BF16 row multiplier is applied
 // once to the complete FP32 dot product. The public activation is never quantized.
 
@@ -29,6 +30,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a16_ks
     constexpr int kTileK      = Schedule::kTileKPerWarp;
     constexpr int kWarps      = Schedule::kKWarps;
     constexpr int kRowsPerCta = Schedule::kRowsPerCta;
+    constexpr int kRowTiles   = Schedule::kRowTiles;
     constexpr int kGroupK     = Schedule::kGroupK;
     constexpr int kGroups     = kHidden / kGroupK;
     constexpr int kTileTokens = Schedule::kTileTokens;
@@ -45,7 +47,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a16_ks
             __nv_bfloat16 activations[kWarps][kTileTokens * kTileK];
         } staging;
 
-        float partial[kWarps * kTokenMmas * 32 * 4];
+        float partial[kWarps * kRowTiles * kTokenMmas * 32 * 4];
     };
 
     __shared__ __align__(16) SharedStorage shared;
@@ -103,10 +105,10 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a16_ks
         }
     };
 
-    const int b_row                   = lane & 7;
-    const int b_k_offset              = ((lane >> 3) & 1) << 3;
-    const int warp_k0                 = warp * kTileK;
-    float accumulators[kTokenMmas][4] = {};
+    const int b_row                              = lane & 7;
+    const int b_k_offset                         = ((lane >> 3) & 1) << 3;
+    const int warp_k0                            = warp * kTileK;
+    float accumulators[kRowTiles][kTokenMmas][4] = {};
 
     stage_codes(0);
     pdl::enter_streaming();
@@ -126,10 +128,15 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a16_ks
                 return static_cast<unsigned>(
                     *reinterpret_cast<const std::uint16_t*>(&code_shared[row][offset]));
             };
-            const unsigned a0 = fp8_e4m3x2_to_bf16x2_bits(load_code_pair(gid, code_col));
-            const unsigned a1 = fp8_e4m3x2_to_bf16x2_bits(load_code_pair(gid + 8, code_col));
-            const unsigned a2 = fp8_e4m3x2_to_bf16x2_bits(load_code_pair(gid, code_col + 8));
-            const unsigned a3 = fp8_e4m3x2_to_bf16x2_bits(load_code_pair(gid + 8, code_col + 8));
+            unsigned a[kRowTiles][4];
+#pragma unroll
+            for (int tile = 0; tile < kRowTiles; ++tile) {
+                const int top = tile * 16 + gid;
+                a[tile][0]    = fp8_e4m3x2_to_bf16x2_bits(load_code_pair(top, code_col));
+                a[tile][1]    = fp8_e4m3x2_to_bf16x2_bits(load_code_pair(top + 8, code_col));
+                a[tile][2]    = fp8_e4m3x2_to_bf16x2_bits(load_code_pair(top, code_col + 8));
+                a[tile][3]    = fp8_e4m3x2_to_bf16x2_bits(load_code_pair(top + 8, code_col + 8));
+            }
 #pragma unroll
             for (int token_mma = 0; token_mma < kTokenMmas; ++token_mma) {
                 unsigned b0;
@@ -139,9 +146,12 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a16_ks
                     b0, b1,
                     smem_addr(&x_shared[warp][row * kTileK + fp8_a16_shared_col_64(
                                                                  row, k_step * 16 + b_k_offset)]));
-                mma_bf16(accumulators[token_mma][0], accumulators[token_mma][1],
-                         accumulators[token_mma][2], accumulators[token_mma][3], a0, a1, a2, a3, b0,
-                         b1);
+#pragma unroll
+                for (int tile = 0; tile < kRowTiles; ++tile) {
+                    mma_bf16(accumulators[tile][token_mma][0], accumulators[tile][token_mma][1],
+                             accumulators[tile][token_mma][2], accumulators[tile][token_mma][3],
+                             a[tile][0], a[tile][1], a[tile][2], a[tile][3], b0, b1);
+                }
             }
         }
 
@@ -158,69 +168,86 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a16_ks
 
     pdl::trigger_dependents();
     __syncthreads();
-    auto* partial = shared.partial;
+    auto* partial            = shared.partial;
+    const auto partial_index = [&](int split, int tile, int token_mma) {
+        return (((split * kRowTiles + tile) * kTokenMmas + token_mma) * 32 + lane) * 4;
+    };
     if ((warp & 1) != 0) {
 #pragma unroll
-        for (int token_mma = 0; token_mma < kTokenMmas; ++token_mma) {
-            store_vec(partial + ((warp * kTokenMmas + token_mma) * 32 + lane) * 4,
-                      make_float4(accumulators[token_mma][0], accumulators[token_mma][1],
-                                  accumulators[token_mma][2], accumulators[token_mma][3]));
+        for (int tile = 0; tile < kRowTiles; ++tile) {
+#pragma unroll
+            for (int token_mma = 0; token_mma < kTokenMmas; ++token_mma) {
+                store_vec(partial + partial_index(warp, tile, token_mma),
+                          make_float4(
+                              accumulators[tile][token_mma][0], accumulators[tile][token_mma][1],
+                              accumulators[tile][token_mma][2], accumulators[tile][token_mma][3]));
+            }
         }
     }
     __syncthreads();
 
     if ((warp & 1) == 0) {
 #pragma unroll
-        for (int token_mma = 0; token_mma < kTokenMmas; ++token_mma) {
-            const float4 partner =
-                load_vec<float4>(partial + (((warp + 1) * kTokenMmas + token_mma) * 32 + lane) * 4);
-            accumulators[token_mma][0] += partner.x;
-            accumulators[token_mma][1] += partner.y;
-            accumulators[token_mma][2] += partner.z;
-            accumulators[token_mma][3] += partner.w;
-            if (warp != 0) {
-                store_vec(partial + ((warp * kTokenMmas + token_mma) * 32 + lane) * 4,
-                          make_float4(accumulators[token_mma][0], accumulators[token_mma][1],
-                                      accumulators[token_mma][2], accumulators[token_mma][3]));
+        for (int tile = 0; tile < kRowTiles; ++tile) {
+#pragma unroll
+            for (int token_mma = 0; token_mma < kTokenMmas; ++token_mma) {
+                const float4 partner =
+                    load_vec<float4>(partial + partial_index(warp + 1, tile, token_mma));
+                accumulators[tile][token_mma][0] += partner.x;
+                accumulators[tile][token_mma][1] += partner.y;
+                accumulators[tile][token_mma][2] += partner.z;
+                accumulators[tile][token_mma][3] += partner.w;
+                if (warp != 0) {
+                    store_vec(partial + partial_index(warp, tile, token_mma),
+                              make_float4(accumulators[tile][token_mma][0],
+                                          accumulators[tile][token_mma][1],
+                                          accumulators[tile][token_mma][2],
+                                          accumulators[tile][token_mma][3]));
+                }
             }
         }
     }
     __syncthreads();
 
     if (warp == 0) {
-        unsigned lane_scale = 0;
-        if (lid < 2) {
-            lane_scale = static_cast<unsigned>(
-                reinterpret_cast<const std::uint16_t*>(row_scales)[row0 + gid + lid * 8]);
-        }
-        const unsigned top_scale_bits    = __shfl_sync(kMask, lane_scale, lane & ~3);
-        const unsigned bottom_scale_bits = __shfl_sync(kMask, lane_scale, (lane & ~3) + 1);
-        const float top_scale =
-            __bfloat162float(__ushort_as_bfloat16(static_cast<std::uint16_t>(top_scale_bits)));
-        const float bottom_scale =
-            __bfloat162float(__ushort_as_bfloat16(static_cast<std::uint16_t>(bottom_scale_bits)));
+#pragma unroll
+        for (int tile = 0; tile < kRowTiles; ++tile) {
+            const int tile_row0 = row0 + tile * 16;
+            unsigned lane_scale = 0;
+            if (lid < 2) {
+                lane_scale = static_cast<unsigned>(
+                    reinterpret_cast<const std::uint16_t*>(row_scales)[tile_row0 + gid + lid * 8]);
+            }
+            const unsigned top_scale_bits    = __shfl_sync(kMask, lane_scale, lane & ~3);
+            const unsigned bottom_scale_bits = __shfl_sync(kMask, lane_scale, (lane & ~3) + 1);
+            const float top_scale =
+                __bfloat162float(__ushort_as_bfloat16(static_cast<std::uint16_t>(top_scale_bits)));
+            const float bottom_scale = __bfloat162float(
+                __ushort_as_bfloat16(static_cast<std::uint16_t>(bottom_scale_bits)));
 
 #pragma unroll
-        for (int token_mma = 0; token_mma < kTokenMmas; ++token_mma) {
-            float4 sum = make_float4(accumulators[token_mma][0], accumulators[token_mma][1],
-                                     accumulators[token_mma][2], accumulators[token_mma][3]);
+            for (int token_mma = 0; token_mma < kTokenMmas; ++token_mma) {
+                float4 sum =
+                    make_float4(accumulators[tile][token_mma][0], accumulators[tile][token_mma][1],
+                                accumulators[tile][token_mma][2], accumulators[tile][token_mma][3]);
 #pragma unroll
-            for (int split = 2; split < kWarps; split += 2) {
-                const float4 value =
-                    load_vec<float4>(partial + ((split * kTokenMmas + token_mma) * 32 + lane) * 4);
-                sum.x += value.x;
-                sum.y += value.y;
-                sum.z += value.z;
-                sum.w += value.w;
-            }
-            const int token0 = token_mma * 8 + 2 * lid;
-            if (token0 < live_columns) {
-                output.store(row0 + gid, token0, sum.x * top_scale);
-                output.store(row0 + gid + 8, token0, sum.z * bottom_scale);
-            }
-            if (token0 + 1 < live_columns) {
-                output.store(row0 + gid, token0 + 1, sum.y * top_scale);
-                output.store(row0 + gid + 8, token0 + 1, sum.w * bottom_scale);
+                for (int split = 2; split < kWarps; split += 2) {
+                    const float4 value =
+                        load_vec<float4>(partial + partial_index(split, tile, token_mma));
+                    sum.x += value.x;
+                    sum.y += value.y;
+                    sum.z += value.z;
+                    sum.w += value.w;
+                }
+                const int token0 = token_mma * 8 + 2 * lid;
+                if (token0 < live_columns) {
+                    output.store(tile_row0 + gid, token0, sum.x * top_scale);
+                    output.store(tile_row0 + gid + 8, token0, sum.z * bottom_scale);
+                }
+                if (token0 + 1 < live_columns) {
+                    output.store(tile_row0 + gid, token0 + 1, sum.y * top_scale);
+                    output.store(tile_row0 + gid + 8, token0 + 1, sum.w * bottom_scale);
+                }
             }
         }
     }
