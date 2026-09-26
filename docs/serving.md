@@ -91,6 +91,19 @@ selected for this process.
 Engine-wide failure it returns HTTP 503 with `{"status":"unavailable"}`. Temporary queue
 saturation does not make the Engine unavailable. The endpoint remains unauthenticated.
 
+How failures end:
+
+- An out-of-memory condition or a failed internal check during one unit of work fails the requests
+  that unit involved, logs `worker out of memory: ... - recovering` or `worker recovering from a
+  failed request`, and the Engine carries on with its queue.
+- A failure after eight such recoveries in a row, with no successful unit between them, fails every
+  queued and running request and stops the Engine: `/health` then answers 503 and every request
+  fails until the server is restarted. Any other exception on the worker (`worker crash: ...`)
+  ends the Engine the same way.
+- A CUDA error other than out of memory (an illegal address, a lost device) cannot be recovered
+  in-process: the server prints `CUDA_CHECK(...) failed` with the error and exits, without final
+  request-log records for the requests in flight.
+
 Every OpenAI-compatible response carries a unique `x-request-id` header, including streaming and
 error responses. Anthropic endpoints use their separate `request-id` contract.
 
