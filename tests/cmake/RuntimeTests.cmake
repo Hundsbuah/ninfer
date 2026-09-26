@@ -21,3 +21,9 @@ ninfer_add_test(ninfer_sampling_defaults_test
 ninfer_add_test(ninfer_prefix_cache_index_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_prefix_cache_index.cpp"
   LIBRARIES ninfer_runtime_support)
+
+ninfer_add_test(ninfer_engine_options_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_engine_options.cpp"
+  LIBRARIES ninfer_engine ninfer_core)
+
+set_tests_properties(ninfer_engine_options_test PROPERTIES SKIP_RETURN_CODE 77)
