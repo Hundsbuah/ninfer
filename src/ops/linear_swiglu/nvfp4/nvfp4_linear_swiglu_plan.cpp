@@ -24,18 +24,13 @@ enum class Nvfp4LinearSwiGluRoute {
 
 constexpr std::int32_t kFusedMaxTokens = 128;
 
-// A ragged width is worth the fused route once its partial M tile is not half of the grid. While
-// the grid is two tiles the fused kernel and the public linear + silu_mul composition are close
-// enough on an RTX 5090 that the sign of the difference does not survive a second session, so
-// that band keeps the composition it already had.
-constexpr std::int32_t kRaggedTmaFloor = 2 * kNvfp4TmaBlockM;
-// The capacity function walks one step down from this floor to find the widest width the
-// composition still serves. That walk is only correct while the floor is at least one whole tile:
-// below that the composition owns widths above the floor as well, and one step does not reach
-// them.
-static_assert(kRaggedTmaFloor >= kNvfp4TmaBlockM,
-              "a ragged floor inside the first M tile would leave the composition band above it "
-              "out of the workspace capacity");
+// The fused TMA kernel takes every width from this floor up, whole M tiles or ragged. Below it the
+// public linear + silu_mul composition is ahead on an RTX 5090 (cold weights, Qwen3.8-27B
+// 34816x5120): by 15 % at one whole tile, 6 to 16 % at two and still 1 to 3 % at four and five.
+// The composition's cost grows with the width while the fused kernel's steps once per tile, so
+// the two cross inside the sixth tile: level from 1408 to 1440, the fused kernel 0.5 to 1.8 %
+// ahead from 1456 to 1535 and about 7 % at 3584 and 4096.
+constexpr std::int32_t kTmaFloor = 1440;
 
 Nvfp4LinearSwiGluRoute resolve_route(LinearPolicy policy, std::int32_t tokens) {
     if (tokens <= 0) { throw std::invalid_argument("nvfp4 linear_swiglu: T must be positive"); }
@@ -51,12 +46,8 @@ Nvfp4LinearSwiGluRoute resolve_route(LinearPolicy policy, std::int32_t tokens) {
     if (tokens <= 4) { return Nvfp4LinearSwiGluRoute::SmallTFusedA16; }
     if (tokens <= kFusedMaxTokens) { return Nvfp4LinearSwiGluRoute::FusedW4A4; }
     // This route dispatches its own fused kernel rather than a Linear shape's, so it carries its
-    // own condition - a whole tile, or a ragged width with enough behind it; the call site below
-    // forces the matching scale layout either way.
-    if (tokens >= kNvfp4TmaBlockM &&
-        ((tokens % kNvfp4TmaBlockM) == 0 || tokens >= kRaggedTmaFloor)) {
-        return Nvfp4LinearSwiGluRoute::TmaFusedW4A4;
-    }
+    // own condition; the call site below forces the matching scale layout.
+    if (tokens >= kTmaFloor) { return Nvfp4LinearSwiGluRoute::TmaFusedW4A4; }
     return Nvfp4LinearSwiGluRoute::LinearW4A4Post;
 }
 
@@ -107,28 +98,18 @@ std::size_t nvfp4_linear_swiglu_workspace_capacity_bytes(LinearPolicy policy,
         return 0;
     }
 
+    // Each route owns one contiguous band of widths and needs the most at the widest width of the
+    // interval inside its band.
     std::size_t maximum = 0;
     if (min_tokens <= kFusedMaxTokens && max_tokens >= 5) {
         maximum = fused_workspace_bytes(std::min(max_tokens, kFusedMaxTokens));
     }
-    // From the ragged floor upward the TMA route owns every width, so the widest it can be asked
-    // for is the interval's own maximum; below the floor it owns only whole tiles, and the guard
-    // then rejects an interval that contains none.
-    const std::int32_t largest_fused =
-        max_tokens >= kRaggedTmaFloor ? max_tokens : max_tokens - (max_tokens % kNvfp4TmaBlockM);
-    if (largest_fused >= std::max(min_tokens, kNvfp4TmaBlockM)) {
-        maximum = std::max(maximum, fused_workspace_bytes(largest_fused));
+    const std::int32_t widest_composition = std::min(max_tokens, kTmaFloor - 1);
+    if (widest_composition >= std::max(min_tokens, kFusedMaxTokens + 1)) {
+        maximum = std::max(maximum, baseline_workspace_bytes(widest_composition));
     }
-
-    // The composition keeps the gap below the floor, so it no longer has to be sized for the
-    // interval's maximum. Capping at the floor puts the search where the only TMA widths are whole
-    // tiles, and no two consecutive widths are both whole tiles, so one step is always enough.
-    std::int32_t last_baseline = std::min(max_tokens, kRaggedTmaFloor - 1);
-    if (resolve_route(policy, last_baseline) == Nvfp4LinearSwiGluRoute::TmaFusedW4A4) {
-        --last_baseline;
-    }
-    if (last_baseline >= std::max(min_tokens, kFusedMaxTokens + 1)) {
-        maximum = std::max(maximum, baseline_workspace_bytes(last_baseline));
+    if (max_tokens >= kTmaFloor) {
+        maximum = std::max(maximum, fused_workspace_bytes(max_tokens));
     }
     return maximum;
 }

@@ -11,14 +11,13 @@ int main() {
 
     try {
         constexpr std::array<std::int32_t, 4> kA16Cases{1, 4, 8, 16};
-        // 511 and 513 straddle the ragged floor: the first still reaches the composition, the
-        // second is the narrowest ragged width the fused route admits and leaves one real token
-        // in a third M tile. 767 leaves that tile all but full, and 1025 leaves one after four
-        // whole tiles. 255/256 straddle the whole-tile floor, which does not move; 257 stays as
-        // the width just past it that the composition keeps.
-        constexpr std::array<std::int32_t, 21> kA4Cases{2,   4,   5,   16,  56,  64,   65,
-                                                        96,  97,  112, 128, 129, 255,  256,
-                                                        257, 511, 512, 513, 767, 1024, 1025};
+        // 128/129 straddle the small fused route and the composition, which keeps whole and
+        // ragged widths alike (256, 257, 512, 513, 1024, 1025) below the TMA floor at 1440.
+        // 1439/1440 straddle that floor inside the sixth M tile; 1536 fills it, 1537 leaves one
+        // real token in a seventh, and 1791 leaves that tile all but full.
+        constexpr std::array<std::int32_t, 25> kA4Cases{
+            2,   4,   5,   16,   56,   64,   65,   96,   97,   112,  128,  129,  255,
+            256, 257, 511, 512,  513,  1024, 1025, 1439, 1440, 1536, 1537, 1791};
         int failures = 0;
         failures += run_profile("LinearSwiGLU NVFP4_A16",
                                 {QType::NVFP4, 34816, 5120, 17408, 1801U, ActivationCompute::A16},
