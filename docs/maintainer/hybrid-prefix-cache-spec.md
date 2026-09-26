@@ -53,6 +53,7 @@ every other value is derived from the rest of the configuration (§14.2).
 | §7.2–§7.3 zero-split GDN state tap and phase alignment | not implemented: an exact tap costs one prefill split (about 15 ms per turn on 27B); flexible taps avoid it, and requests resuming from an endpoint skip the opener tap (§7.1) |
 | §11.2 KV transfer Op | copy-engine path only (`cudaMemcpy2DAsync` runs over consecutive pages and slabs) |
 | §6.3 persistent backfill proof | not issued: a blocked FIFO head is never overtaken |
+| §6.6 prefetching the blocked head | done: Host-only path blocks copied into spare Device cache while the FIFO head waits |
 | §12 optional features other than 12.2, §13.2 Op qualification | not implemented |
 | §13.3 real-artifact scenarios | `ninfer_qwen3_5_hybrid_prefix_real_test`: Host vs Device restore exactness (with and without MTP), generation-opener and system-block reuse, Device-only mode, protocol cache hints, Vision, persistence across a restart; `NINFER_HYBRID_KV_DTYPE` runs them for every KV storage (bf16, int8, fp8, nvfp4, k8v4 pass). `ninfer_ngram_concurrent_real` runs on Hybrid with `NINFER_NGRAM_TEST_CONTEXT_CACHE=hybrid` |
 
@@ -579,6 +580,33 @@ Consequences:
 Failure: a CUDA error in a restore job is Engine-wide, as today. A request cancelled while staged
 (before activation) waits for the restore stream, returns every destination and reservation, and
 releases its pins.
+
+### 6.6 Prefetching the blocked head
+
+When the Device pool cannot hold every conversation, each admission restores most of its path
+from the Host tier (the production agent log of 2026-09-26: 2.59 TB, a median 2.7 GB per turn).
+For a short turn the first prefill pass waits for those copies, and other lanes' decode queues
+behind it. The FIFO head usually waited seconds to minutes for a lane or for pages before that,
+so its restore can happen during the wait instead.
+
+- When the head stays blocked (hybrid mode does not backfill, §6.3), the Engine asks the Program to
+  prefetch for it. The Program matches the prompt as a quote would, takes the source admission
+  would choose, and copies up to 256 of its Host-only path blocks into Device pages. They are
+  ordinary cached blocks: `Filling` until the batch lands, then unpinned at the MRU end of the
+  device LRU. Admission later finds them Device-resident and restores only the rest.
+- Pages come from the free pool and from host-backed cached blocks, least recently used first.
+  The head's path is pinned meanwhile. A prefetch never drops a block's last copy, never waits for
+  a transfer, and never runs beside an open admission or another prefetch. Active leases may evict
+  the prefetched blocks like any cache.
+- One batch is about 550 MB for 27B INT8 KV (about 20 ms of PCIe). The Engine retries for the same
+  head only while the last attempt copied blocks or the spare room grew, because matching walks
+  the whole prompt path.
+- A quote whose candidates cross a landing prefetch waits for it (`settle_prefetch`) instead of
+  skipping those candidates for a shallower source. A lane's own restore batches are never waited
+  for synchronously (§6.5).
+
+In the production log about 57 % of the restored bytes could have been copied this way. The rest
+did not fit beside the active sequences while the head waited.
 
 ---
 

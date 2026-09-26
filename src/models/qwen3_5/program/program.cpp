@@ -567,6 +567,15 @@ std::uint32_t Program::hybrid_reclaim_device_kv(std::uint32_t main_pages,
     return impl_->hybrid_reclaim_device_kv(main_pages, backend_pages);
 }
 
+std::optional<std::uint32_t> Program::hybrid_prefetch(const PreparedPrompt& prompt,
+                                                      const RequestBasePlan& base) {
+    return impl_->hybrid_prefetch(PreparedPromptAccess::view(prompt), base);
+}
+
+std::uint32_t Program::hybrid_prefetch_room() const noexcept {
+    return impl_->hybrid_prefetch_room();
+}
+
 HybridPrefixCacheStats Program::hybrid_stats() const noexcept { return impl_->hybrid_stats(); }
 
 void Program::set_hybrid_cost(const runtime::prefix_cache::CacheCostModel& cost) {

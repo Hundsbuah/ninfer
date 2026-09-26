@@ -1111,6 +1111,13 @@ public:
     // number of cached blocks released.
     [[nodiscard]] std::uint32_t hybrid_reclaim_device_kv(std::uint32_t main_pages,
                                                          std::uint32_t backend_pages);
+    // Copies Host-only blocks a waiting request resumes from into Device pages the pools can
+    // spare as cache (hybrid-prefix-cache-spec §6.6), so its admission restores less. Returns the
+    // blocks whose copy started; absent while a prefetch or an admission is still in flight.
+    [[nodiscard]] std::optional<std::uint32_t> hybrid_prefetch(const PreparedPrompt& prompt,
+                                                               const RequestBasePlan& base);
+    // Device pages a prefetch could fill now: free ones and host-backed cached ones.
+    [[nodiscard]] std::uint32_t hybrid_prefetch_room() const noexcept;
     [[nodiscard]] HybridPrefixCacheStats hybrid_stats() const noexcept;
     // Installs the Engine's calibrated machine model for hybrid admission choice and eviction.
     void set_hybrid_cost(const runtime::prefix_cache::CacheCostModel& cost);

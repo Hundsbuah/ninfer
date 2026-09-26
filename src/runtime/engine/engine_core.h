@@ -1548,6 +1548,17 @@ private:
                                   request->publication_order, allowance);
     }
 
+    // Hybrid prefix cache: copies a blocked head's Host-only blocks into spare Device cache while
+    // it waits (hybrid-prefix-cache-spec §6.6).
+    void prefetch_blocked_head(const std::shared_ptr<Request>& head) {
+        if constexpr (!std::is_same_v<Manager, ResourceManager<ModelContract>>) {
+            resources_.prefetch_blocked_head(*instance_.program, head->prompt, *head->base_plan,
+                                             head->publication_order);
+        } else {
+            (void)head;
+        }
+    }
+
     [[nodiscard]] AdmissionProgress remove_pending_error(const std::shared_ptr<Request>& request,
                                                          std::exception_ptr error) {
         if (!erase_pending(request)) { return AdmissionProgress::None; }
@@ -1875,6 +1886,7 @@ private:
             }
             if (!scheduler_.protect_blocked_head(head->id, active.span(),
                                                  instance_.program->resource_revision())) {
+                prefetch_blocked_head(head);
                 return control_progress ? AdmissionProgress::ControlProgress
                                         : AdmissionProgress::None;
             }
@@ -1961,6 +1973,8 @@ private:
                                                  std::move(*grant));
                 }
             }
+            // No backfill: the head's wait can move its Host-only blocks onto the Device.
+            prefetch_blocked_head(head);
             return control_progress ? AdmissionProgress::ControlProgress : AdmissionProgress::None;
         }
     }

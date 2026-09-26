@@ -39,6 +39,10 @@ namespace {
 
 constexpr std::uint32_t kBlock = pc::kBlockTokens;
 
+// Blocks one prefetch batch copies (§6.6): about 20 ms of PCIe for 27B INT8, the longest a quote
+// may wait for blocks it is about to resume over.
+constexpr std::uint32_t kPrefetchBatchBlocks = 256;
+
 std::uint64_t all_vision_key(std::span<const VisionTokenRange> ranges) noexcept {
     std::uint64_t cumulative = 0;
     for (const VisionTokenRange& range : ranges) {
@@ -252,6 +256,17 @@ HybridAdmissionQuote ProgramImpl::hybrid_quote(const PreparedPromptData& prompt,
         }
         pc::MatchResult match =
             index.match(prompt.token_ids, prompt.block_hashes, prompt.block_extras, n);
+        const auto filling = [](const pc::MatchResult& result) {
+            return std::any_of(
+                result.candidates.begin(), result.candidates.end(),
+                [](const pc::MatchCandidate& candidate) { return candidate.filling_blocks != 0; });
+        };
+        if (hybrid_->prefetch_landing() && filling(match)) {
+            // A prefetch (§6.6) is copying blocks this prompt resumes over: they land within a
+            // batch's copy time, and skipping them would pick a shallower source.
+            hybrid_->settle_prefetch();
+            match = index.match(prompt.token_ids, prompt.block_hashes, prompt.block_extras, n);
+        }
         quote->cached_prefix_tokens = static_cast<std::uint32_t>(match.path.size()) * kBlock;
         const std::vector<VisionTokenRange> ranges =
             prompt.vision_items.empty() ? std::vector<VisionTokenRange>{} : vision_ranges(prompt);
@@ -320,6 +335,94 @@ HybridAdmissionQuote ProgramImpl::hybrid_quote(const PreparedPromptData& prompt,
     out.summary   = quote->summary;
     out.impl      = std::move(quote);
     return out;
+}
+
+std::optional<std::uint32_t> ProgramImpl::hybrid_prefetch(const PreparedPromptData& prompt,
+                                                          const RequestBasePlan& base) {
+    if (!hybrid_ || !hybrid_->host_tier() || base.impl_ == nullptr ||
+        !base.impl_->allow_prefix_reuse || !prompt.identity.reusable) {
+        return 0U;
+    }
+    if (has_context_transaction() || hybrid_->restore_open()) { return std::nullopt; }
+    hybrid_->poll();
+    if (hybrid_->prefetch_landing()) { return std::nullopt; }
+    const auto n = static_cast<std::uint32_t>(prompt.token_ids.size());
+    if (n == 0 || prompt.block_hashes.size() != prompt.token_ids.size() / kBlock) { return 0U; }
+
+    // The source the admission would choose now, as in hybrid_quote.
+    pc::PrefixCacheIndex& index = hybrid_->index();
+    pc::MatchResult match =
+        index.match(prompt.token_ids, prompt.block_hashes, prompt.block_extras, n);
+    const std::vector<VisionTokenRange> ranges =
+        prompt.vision_items.empty() ? std::vector<VisionTokenRange>{} : vision_ranges(prompt);
+    std::erase_if(match.candidates, [&](const pc::MatchCandidate& candidate) {
+        return candidate.filling_blocks != 0 || inside_vision(candidate.frontier, ranges);
+    });
+    const pc::AdmissionChoice choice = index.choose(match, n);
+    if (!choice.candidate || match.candidates[*choice.candidate].host_only_blocks == 0) {
+        return 0U;
+    }
+    const std::span<const pc::NodeRef> path(match.path.data(),
+                                            match.candidates[*choice.candidate].path_blocks);
+
+    // Pinned while room is made, so no block of this path is evicted to hold another of them.
+    // Room comes from free pages and host-backed cache, least recently used first: a prefetch
+    // never waits for a transfer and never drops a block's last copy.
+    index.acquire_path(path);
+    std::uint32_t started = 0;
+    try {
+        DeviceKVPagePool& text_pool = text_kv_pages->physical_pool();
+        DeviceKVPagePool* backend_pool =
+            backend_kv_pages ? &backend_kv_pages->physical_pool() : nullptr;
+        const auto available = [&] {
+            const std::uint32_t text = text_pool.available_pages();
+            return backend_pool != nullptr ? std::min(text, backend_pool->available_pages()) : text;
+        };
+        std::uint32_t wanted =
+            std::min(match.candidates[*choice.candidate].host_only_blocks, kPrefetchBatchBlocks);
+        while (available() < wanted && index.evict_backed_device_blocks(1) != 0) {}
+        wanted = std::min(wanted, available());
+        std::optional<DeviceKVPageReservation> text_pages;
+        std::optional<DeviceKVPageReservation> backend_pages;
+        if (wanted != 0) {
+            text_pages = text_pool.reserve(wanted);
+            if (backend_pool != nullptr) { backend_pages = backend_pool->reserve(wanted); }
+        }
+        if (text_pages && (backend_pool == nullptr || backend_pages)) {
+            hybrid_->open_restore(device.stream);
+            for (const pc::NodeRef node : path) {
+                if (started == wanted) { break; }
+                if (index.node(node).device != pc::CopyState::Absent) { continue; }
+                HybridBlockPages pages{
+                    .text = text_kv_pages->materialize_transfer_destination(*text_pages, kBlock)};
+                if (backend_pool != nullptr) {
+                    pages.backend =
+                        backend_kv_pages->materialize_transfer_destination(*backend_pages, kBlock);
+                }
+                hybrid_->restore_block(node, pages);
+                ++started;
+            }
+            hybrid_->submit_restore();
+            hybrid_->detach_prefetch();
+        }
+    } catch (...) {
+        hybrid_->abort_restore();
+        index.release_path(path);
+        throw;
+    }
+    index.release_path(path);
+    if (started != 0) { advance_resource_revision(); }
+    return started;
+}
+
+std::uint32_t ProgramImpl::hybrid_prefetch_room() const noexcept {
+    if (!hybrid_ || !hybrid_->host_tier()) { return 0U; }
+    const std::uint32_t cached = hybrid_->index().device_backed_evictable_blocks();
+    std::uint32_t room         = text_kv_pages->physical_pool().available_pages() + cached;
+    if (backend_kv_pages) {
+        room = std::min(room, backend_kv_pages->physical_pool().available_pages() + cached);
+    }
+    return room;
 }
 
 bool ProgramImpl::hybrid_await_sibling(const PreparedPromptData& prompt, std::uint32_t reuse,

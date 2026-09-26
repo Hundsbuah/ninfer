@@ -252,7 +252,10 @@ public:
     // Releases up to `blocks` unpinned device copies, host-backed ones first. Returns the number
     // released. An unbacked release loses the node and its subtree (§9.4).
     std::uint32_t evict_device_blocks(std::uint32_t blocks);
+    // The same, releasing only host-backed copies: nothing loses its last copy.
+    std::uint32_t evict_backed_device_blocks(std::uint32_t blocks);
     [[nodiscard]] std::uint32_t device_evictable_blocks() const noexcept;
+    [[nodiscard]] std::uint32_t device_backed_evictable_blocks() const noexcept;
 
     // ---- host residency (§9.3)
     // ------------------------------------------------------------------- Allocates a slab for a
@@ -399,6 +402,7 @@ private:
     void refresh_node(std::uint32_t node);
     void refresh_tail(std::uint32_t snapshot);
 
+    std::uint32_t evict_device_entries(std::uint32_t blocks, bool unbacked);
     void lru_remove(std::uint32_t entry);
     void lru_append(std::uint32_t entry, std::uint8_t list);
     [[nodiscard]] std::uint32_t lru_pop(std::uint8_t list);

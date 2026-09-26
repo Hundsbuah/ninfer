@@ -533,6 +533,10 @@ std::uint32_t PrefixCacheIndex::device_evictable_blocks() const noexcept {
     return lru_[kBacked].count + lru_[kUnbacked].count;
 }
 
+std::uint32_t PrefixCacheIndex::device_backed_evictable_blocks() const noexcept {
+    return lru_[kBacked].count;
+}
+
 void PrefixCacheIndex::drop_node_device_copy(std::uint32_t index) {
     Node& node = nodes_[index];
     if (node.device != CopyState::Resident) { invariant("prefix cache drops a non-resident page"); }
@@ -554,10 +558,18 @@ void PrefixCacheIndex::drop_node_host_copy(std::uint32_t index) {
 }
 
 std::uint32_t PrefixCacheIndex::evict_device_blocks(std::uint32_t blocks) {
+    return evict_device_entries(blocks, true);
+}
+
+std::uint32_t PrefixCacheIndex::evict_backed_device_blocks(std::uint32_t blocks) {
+    return evict_device_entries(blocks, false);
+}
+
+std::uint32_t PrefixCacheIndex::evict_device_entries(std::uint32_t blocks, bool unbacked) {
     std::uint32_t released = 0;
     while (released < blocks) {
         std::uint32_t entry = lru_pop(kBacked);
-        if (entry == kNoId) { entry = lru_pop(kUnbacked); }
+        if (entry == kNoId && unbacked) { entry = lru_pop(kUnbacked); }
         if (entry == kNoId) { break; }
         if (entry < config_.max_nodes) {
             Node& node = nodes_[entry];

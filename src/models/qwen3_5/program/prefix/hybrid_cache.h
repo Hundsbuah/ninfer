@@ -53,7 +53,8 @@ struct HybridCacheCounters {
     std::uint64_t host_image_writes   = 0;
     std::uint64_t host_block_writes   = 0;
     std::uint64_t host_image_restores = 0;
-    std::uint64_t host_block_restores = 0;
+    std::uint64_t host_block_restores = 0; // prefetched blocks included
+    std::uint64_t prefetched_blocks   = 0;
     std::uint64_t host_tail_restores  = 0;
     std::uint64_t host_write_bytes    = 0;
     std::uint64_t host_restore_bytes  = 0;
@@ -190,6 +191,13 @@ public:
     void order_after_restore(std::uint64_t ticket, cudaStream_t consumer) const;
     // Waits for any submitted copies of the staged batch and returns every destination.
     void abort_restore() noexcept;
+    // Hands a submitted batch of blocks to the cache without a consumer: a prefetch for a request
+    // still waiting (spec §6.6). Its nodes stay Filling and pinned until poll() sees it land.
+    void detach_prefetch();
+    // Whether a prefetch batch may still be landing.
+    [[nodiscard]] bool prefetch_landing() const noexcept;
+    // Waits for every landing prefetch batch and publishes it.
+    void settle_prefetch();
 
     // Releases every reference the cache holds. The index is rebuilt empty.
     void clear() noexcept;
@@ -252,6 +260,8 @@ private:
         std::vector<cudaEvent_t> layers;
         // Pins a landing batch holds on its snapshot (tail or image source) until it lands.
         std::optional<runtime::prefix_cache::SnapshotRef> pinned_snapshot;
+        // Copies blocks for a waiting request; no lane waits on its events.
+        bool prefetch = false;
     };
 
     [[nodiscard]] std::uint32_t allocate_block_id(HybridBlockPages pages);

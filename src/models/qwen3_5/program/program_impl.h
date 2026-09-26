@@ -686,6 +686,12 @@ public:
                                    runtime::CancellationFlagView cancellation);
     [[nodiscard]] std::uint32_t hybrid_reclaim_device_kv(std::uint32_t main_pages,
                                                          std::uint32_t backend_pages);
+    // Prefetch for a waiting request (spec §6.6): blocks whose copy started, absent while a
+    // prefetch or an admission is still in flight.
+    [[nodiscard]] std::optional<std::uint32_t> hybrid_prefetch(const PreparedPromptData& prompt,
+                                                               const RequestBasePlan& base);
+    // Device pages a prefetch could fill now: free ones and host-backed cached ones.
+    [[nodiscard]] std::uint32_t hybrid_prefetch_room() const noexcept;
     [[nodiscard]] HybridPrefixCacheStats hybrid_stats() const noexcept;
     // Installs the Engine's calibrated machine model for hybrid admission and eviction.
     void set_hybrid_cost(const runtime::prefix_cache::CacheCostModel& cost);
