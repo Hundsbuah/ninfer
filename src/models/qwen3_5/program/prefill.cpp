@@ -1053,8 +1053,6 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
             selectors.destination,
             staged.initial_mtp_extent,
             dflash_host_ingress};
-        // The first pass after a Host restore waits for each layer's copies (hybrid spec §6.5).
-        schedule_state.layer_ready = hybrid_take_restore_layers(sequence.lane);
 
         if (staged.mtp_bridge == MtpBridgeMode::BeforeSuffix) {
             if (staged.cursor != staged.base || staged.base == 0 ||
@@ -1137,6 +1135,12 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                     split_frontier = *hybrid_split;
                 }
                 execution::PrefillChunkResult result;
+                // The first pass after a Host restore waits for each layer's copies (hybrid spec
+                // §6.5). The events are a view into the landing batch, so they are taken here,
+                // where nothing can poll the cache before the chunk enqueues its waits: taken
+                // before the MTP bridge, whose KV commit polls, a batch that landed meanwhile was
+                // freed under the view. A landed batch returns no events; its copies are complete.
+                schedule_state.layer_ready = hybrid_take_restore_layers(sequence.lane);
                 timing.pause();
                 if (staged.vision) {
                     if (!workspace_plan.vision) {
@@ -1153,6 +1157,7 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                 }
                 timing.include(result.timing);
                 timing.resume_post();
+                // The KV commit below polls the cache, which may free the batch the view points at.
                 schedule_state.layer_ready = {};
                 if (result.processed_tokens == 0 || result.processed_tokens > remaining) {
                     throw std::logic_error("ordinary prefill chunk made invalid progress");

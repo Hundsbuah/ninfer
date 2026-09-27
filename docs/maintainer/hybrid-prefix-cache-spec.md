@@ -139,6 +139,7 @@ prompt tokens from cache but prefilled 5.02M tokens (994 s). It showed three pro
 | A Host tier smaller than the saved file restores its most valuable snapshots and only their paths (file format 3, tables before slab bytes), with a startup warning | "fix(prefix-cache): restore the most valuable snapshots …" (2026-09-27) | §5.5 | a correctness fix, not A/B tested. Format 2 restored every block before any snapshot, in file order, and still reported the file restored. For the production file (15,807 blocks and 98 snapshots of 91–92 slabs of 2.06 MiB, 49.97 GiB, saved at `--host-cache-mib 52000`), any tier below about 32,800 MiB filled with blocks and kept no snapshot, so nothing was resumable; between that and about 51,200 MiB the snapshots kept depended on file order | kept |
 | One Ctrl+C during the stop exits without saving and deletes the unfinished file (`PrefixCacheSaveControl`); the line reads `Press Ctrl+C again to exit without saving` | "fix(serve): one more Ctrl+C during the stop exits …" (2026-09-27) | §5.5 | a behavior change, not A/B tested. Before, leaving during the save needed another confirmed pair of presses, the console said `Ctrl+C twice exits without saving`, and `_Exit` left a partial `.tmp` of up to the Host tier's size beside the previous file until the next save | kept |
 | The requests a stop ends are answered before the save, not after it (`fail_all_locked` answers them before the Program cleanup that saves) | "fix(engine): answer the requests a stop ends before saving the prefix cache" (2026-09-27) | §5.5 | a behavior fix, not A/B tested. The stop row above describes this order, but the worker completed the requests only after the cleanup, so each 503 waited for the whole save. Console test (`double`: one streaming and one queued request, 408 blocks and 4 snapshots, 1,438 MiB): before, both 503s were logged 392 ms after the stop, as the 0.3 s save ended; after, 8 ms after the stop and 447 ms before the save ended. The `persist` real test now checks that the file is not yet saved when the running generation is answered; it fails on the old order | kept |
+| A Host restore's per-layer events are looked up immediately before the first prefill chunk, not before the MTP bridge | "fix(prefix-cache): look up a restore's layer events at the prefill chunk that waits on them" (2026-09-27) | §6.5 | a correctness fix, not A/B tested. Reported by funguf (ninfer-custom#2) with an AddressSanitizer trace and 9 production crashes in `cuStreamWaitEvent` in one day (`--spec mtp`, Host tier): the view was taken before the MTP bridge, whose KV commit polls the cache, and a batch that had landed meanwhile was freed under it, so the first chunk waited on whatever the freed memory held. The report's fix copied the handles into the prefill context; looking them up at the chunk instead never hands CUDA an event the cache has recycled, needs no allocation, and skips the waits once the copies are complete. DFlash2 and no-speculation lanes run no bridge and were not exposed | kept |
 
 Fix 3 was measured on top of the backfill proof. The build that combined all three against the
 base: at the 16 GB Host tier, prompt tokens prefilled −13.9 % (seed 42) and −2.7 % (seed 43), TTFT
@@ -686,11 +687,14 @@ the order a forward pass reads it, recording an event after each part:
 MTP bridge reads the backend pages and hidden) and hands the lane a ticket for the per-layer
 events. The lane's first prefill pass waits for each layer's event just before that layer
 (`TextContext::run_layers`), so it computes the early layers while later ones are still arriving;
-later passes are stream-ordered behind it. A lane released before its first pass makes the compute
+later passes are stream-ordered behind it. The events are looked up by ticket immediately before
+that pass's chunk call, because `poll()` retires a landed batch and recycles its events: a batch
+already retired has landed, so the pass has nothing to wait for. A lane released before its first pass makes the compute
 stream wait for the whole batch, because the state slot it returns may still be a destination.
 
 The index keeps the batch's nodes and tail `Filling`, and the batch keeps them and its snapshot
-pinned, until `poll()` (every admission quote) or `drain()` sees the last event. So no eviction,
+pinned, until `poll()` (every admission quote, and the block publication after each KV commit)
+or `drain()` sees the last event. So no eviction,
 dead-KV reclaim or Host write can free a slab or page a copy still reads or writes. Other admissions
 skip `Filling` candidates for that short window.
 
