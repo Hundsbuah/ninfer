@@ -2439,6 +2439,159 @@ int test_canonical_grammar_findings() {
     }
     return failures;
 }
+
+int test_invalid_utf8_arguments_are_lossless() {
+    using ParsedToolCallOutput = fi::ParsedToolCallOutput;
+    using Reason               = ninfer::ToolCallParseFallbackReason;
+    int failures = 0;
+    const auto contract =
+        contract_for("bash", Json{{"command", Json{{"type", "string"}}},
+                                 {"timeout", Json{{"type", "integer"}}}});
+    auto value_text = [](const std::string& value) {
+        return std::string("<tool_call>\n<function=bash>\n<parameter=command>\n") + value +
+               "\n</parameter>\n</function>\n</tool_call>";
+    };
+    const auto expect_arguments = [&](const std::string& label, const std::string& name,
+                                      const ParsedToolCallOutput& parsed,
+                                      std::string_view expected) {
+        return check(parsed.is_tool_call_response && parsed.tool_calls.size() == 1 &&
+                         parsed.tool_calls.front().name == name &&
+                         parsed.tool_calls.front().arguments_json == expected,
+                     std::string(label));
+    };
+
+    // Invalid bytes in a declared string value stay structured: each byte maps to a \u00XX
+    // escape (0x7F is a valid single-byte code point and passes through raw).
+    const std::string high = std::string("\xFF\xFE\x80\x7F");
+    const std::string expected_high =
+        std::string("{\"command\":\"") + "\\u00ff" + "\\u00fe" + "\\u0080" +
+        std::string(1, static_cast<char>(0x7F)) + "\"}";
+    {
+        const auto parsed = fi::parse_qwen_tool_call_output(value_text(high), 64, contract);
+        failures += expect_arguments("invalid UTF-8 in a declared string value was not encoded",
+                                     "bash", parsed, expected_high);
+        const Json args = Json::parse(parsed.tool_calls.front().arguments_json);
+        failures += check(args.at("command").is_string() &&
+                              args.at("command") == Json(std::string("\u00FF\u00FE\u0080\u007F")),
+                          "invalid UTF-8 byte escapes were not reversible");
+    }
+
+    // The legacy path (undeclared function in tolerant mode) encodes identically.
+    {
+        const std::string text = "<tool_call>\n<function=unknown>\n<parameter=extra>\n" + high +
+                                 "\n</parameter>\n</function>\n</tool_call>";
+        const std::string expected_extra =
+            std::string("{\"extra\":\"") + "\\u00ff" + "\\u00fe" + "\\u0080" +
+            std::string(1, static_cast<char>(0x7F)) + "\"}";
+        const auto parsed = fi::parse_qwen_tool_call_output(text, 64, contract, true);
+        failures += expect_arguments("invalid UTF-8 in a legacy value was not encoded", "unknown",
+                                     parsed, expected_extra);
+    }
+
+    // A parameter name with an invalid byte is preserved as a \u00XX escape as well.
+    {
+        const std::string name  = std::string("c") + "\xFF" + "d";
+        const std::string text  = std::string("<tool_call>\n<function=bash>\n<parameter=") + name +
+                                  ">\nx\n</parameter>\n</function>\n</tool_call>";
+        const std::string expected_name =
+            std::string("{\"c\\u00ffd\":") + "\"x\"" + "}";
+        const auto parsed = fi::parse_qwen_tool_call_output(text, 64, contract);
+        failures += expect_arguments("invalid UTF-8 in a parameter name was not encoded", "bash",
+                                     parsed, expected_name);
+        failures += check(parsed.diagnostics.schema_mismatch_arguments == 1,
+                          "unknown parameter name was not reported as a schema mismatch");
+    }
+
+    // Valid UTF-8 is untouched: the multibyte byte sequence stays verbatim in the JSON.
+    {
+        const std::string utf8  = "\xE4\xB8\x96";
+        const auto parsed       = fi::parse_qwen_tool_call_output(value_text("echo " + utf8), 64,
+                                                                  contract);
+        failures += expect_arguments(
+            "valid UTF-8 in a declared string value changed", "bash", parsed,
+            std::string("{\"command\":\"echo ") + utf8 + "\"}");
+    }
+
+    // A multibyte character cut by the output budget stays structured in tolerant mode with
+    // the partial bytes escaped and the tail flagged.
+    {
+        const std::string cut = std::string("<tool_call>\n<function=bash>\n<parameter=command>\n") +
+                                "ab" + "\xE4\xB8";
+        const auto parsed = fi::parse_qwen_tool_call_output(cut, 64, contract, true);
+        failures +=
+            expect_arguments("a budget-cut multibyte value was not kept structured", "bash",
+                             parsed, std::string("{\"command\":\"ab\\u00e4\\u00b8\"}"));
+        failures += check(parsed.diagnostics.fallback_reason == Reason::TruncatedTail,
+                          "a budget-cut multibyte value was not flagged as a truncated tail");
+    }
+
+    // A NUL byte is valid UTF-8: it is preserved in the value and escaped by the dumper.
+    {
+        const std::string nul_value = std::string("a") + std::string(1, '\0') + "b";
+        const auto parsed           = fi::parse_qwen_tool_call_output(value_text(nul_value), 64,
+                                                                  contract);
+        failures += expect_arguments(
+            "a NUL byte in a declared string value was not preserved", "bash", parsed,
+            std::string("{\"command\":\"a\\u0000b\"}"));
+    }
+
+    // The streaming decoder must not throw on the same bytes and must produce the same call.
+    {
+        const std::string text = value_text(high);
+        const std::shared_ptr<const fi::ToolCallOutputContract> shared =
+            std::make_shared<const fi::ToolCallOutputContract>(contract);
+        fi::ToolCallOutputDecoder decoder(shared, 64);
+        std::string visible;
+        for (std::size_t offset = 0; offset < text.size(); offset += 3) {
+            visible += decoder.feed(std::string_view(text).substr(offset, 3));
+        }
+        const auto terminal = decoder.finish();
+        failures += check(visible.empty() && terminal.content.empty() &&
+                              terminal.tool_calls.size() == 1 &&
+                              terminal.tool_calls.front().arguments_json == expected_high,
+                          "streaming did not encode invalid UTF-8 without throwing");
+    }
+    return failures;
+}
+
+int test_cut_function_opener_reports_invalid_name() {
+    using Reason = ninfer::ToolCallParseFallbackReason;
+    int failures = 0;
+    const auto contract = contract_for("bash", Json{{"command", Json{{"type", "string"}}}});
+
+    // A region that ends inside a function opener (the name found no closing '>') is an
+    // invalid-name attempt in both modes, like every other failed function entry.
+    const std::string cut = "<tool_call>\n<function=ba";
+    failures += check_rejected(cut, contract, Reason::InvalidToolName,
+                               "a cut function opener in strict mode was not an invalid name");
+    failures +=
+        check_rejected(cut, contract, Reason::InvalidToolName,
+                       "a cut function opener in tolerant mode was not an invalid name", true);
+    failures += check_rejected("<function=ba", contract, Reason::InvalidToolName,
+                               "a standalone cut function opener was not an invalid name");
+
+    // A wrapper with no function attempt at all stays a structural failure.
+    failures +=
+        check_rejected("<tool_call>\n", contract, Reason::MalformedStructure,
+                       "an empty wrapper was not a structural failure");
+    failures +=
+        check_rejected("<tool_call>", contract, Reason::MalformedStructure,
+                       "a bare wrapper was not a structural failure");
+
+    // A NUL byte in the function name is an invalid name in both modes.
+    {
+        const std::string nul_name = std::string("<tool_call>\n<function=b") +
+                                     std::string(1, '\0') +
+                                     "ash>\n</function>\n</tool_call>";
+        failures += check_rejected(nul_name, contract, Reason::InvalidToolName,
+                                   "a NUL byte in a function name was not an invalid name");
+        failures +=
+            check_rejected(nul_name, contract, Reason::InvalidToolName,
+                           "a NUL byte in a function name was not an invalid name (tolerant)",
+                           true);
+    }
+    return failures;
+}
 int main() {
     int failures = 0;
     failures += test_duplicate_parameter_keeps_last_value();
@@ -2486,6 +2639,8 @@ int main() {
     failures += test_tolerant_missing_function_close_bracket();
     failures += test_tolerant_undeclared_and_value_cut();
     failures += test_canonical_grammar_findings();
+    failures += test_invalid_utf8_arguments_are_lossless();
+    failures += test_cut_function_opener_reports_invalid_name();
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }

@@ -871,7 +871,48 @@ bool admits_value(TypeSet types, JsonValueKind kind) {
     return false;
 }
 
-std::string encode_json_string(std::string_view value) { return Json(std::string(value)).dump(); }
+// Encodes a raw byte run as a JSON string literal. Valid UTF-8 is dumped by nlohmann
+// unchanged; an invalid sequence (for example a multibyte character cut by the output
+// budget) is encoded as \u00XX escapes - one per byte, so the bytes stay recoverable - and
+// model-derived bytes can never throw out of normalization.
+std::string encode_json_string(std::string_view value) {
+    try {
+        return Json(std::string(value)).dump();
+    } catch (const Json::type_error&) {
+        const char hex_digits[] = "0123456789abcdef";
+        std::string encoded;
+        encoded.reserve(value.size() * 2 + 2);
+        encoded.push_back('"');
+        for (const char byte : value) {
+            const unsigned c = static_cast<unsigned char>(byte);
+            if (c == '"') {
+                encoded += "\\\"";
+            } else if (c == '\\') {
+                encoded += "\\\\";
+            } else if (c == '\b') {
+                encoded += "\\b";
+            } else if (c == '\f') {
+                encoded += "\\f";
+            } else if (c == '\n') {
+                encoded += "\\n";
+            } else if (c == '\r') {
+                encoded += "\\r";
+            } else if (c == '\t') {
+                encoded += "\\t";
+            } else if (c < 0x20 || c >= 0x80) {
+                encoded += "\\u";
+                encoded += hex_digits[(c >> 12) & 0xF];
+                encoded += hex_digits[(c >> 8) & 0xF];
+                encoded += hex_digits[(c >> 4) & 0xF];
+                encoded += hex_digits[c & 0xF];
+            } else {
+                encoded.push_back(static_cast<char>(c));
+            }
+        }
+        encoded.push_back('"');
+        return encoded;
+    }
+}
 
 NormalizedParameter normalize_declared_parameter(std::string_view encoded_value, TypeSet types) {
     const std::string_view framed = remove_parameter_framing_newlines(encoded_value);
@@ -1073,7 +1114,9 @@ private:
         // markers_[idx] is the wrapper open.
         const std::size_t open_end = markers_[idx].end;
         if (idx + 1 >= markers_.size()) {
-            return function_entry_failure(open_end);
+            // The region ends inside the function opener: report the attempt at the first
+            // non-whitespace byte after the wrapper, like every other expected position.
+            return function_entry_failure(first_non_whitespace(open_end, text_.size()));
         }
         // The expected function position is the first non-whitespace byte after the wrapper
         // open. Only a function open token aligned there is the attempt the single-position

@@ -65,7 +65,8 @@ build_tool_call_output_contract(std::span<const std::string> tool_jsons, bool en
 // Parse Qwen's XML-like tool-call format. In tolerant mode, a complete function call is
 // recovered even when the model adds malformed wrapper markup, a trailing suffix, or stops at
 // its output budget before the closing tags; the strict parser keeps its all-or-nothing
-// behavior.
+// behavior. Argument bytes that are not valid UTF-8 (for example a multibyte character cut by
+// the output budget) are preserved in the arguments JSON as \u00XX byte escapes.
 [[nodiscard]] ParsedToolCallOutput
 parse_qwen_tool_call_output(const std::string& text, std::size_t max_tool_name_length,
                             const ToolCallOutputContract& contract, bool tolerant = false);

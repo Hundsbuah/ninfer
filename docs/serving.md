@@ -303,7 +303,9 @@ recovers a call instead when the model adds a suffix after a complete call, a se
 malformed, a single final call is cut by the output budget before its closing tags, or the closing
 bracket after the function name is missing: the recovered call is reported structurally with a
 `truncated_tail` diagnostic (logged at Info severity) rather than demoted to text, and an
-undeclared tool name stays structured for the consumer to judge.
+undeclared tool name stays structured for the consumer to judge. Argument bytes that are not
+valid UTF-8 (for example a multibyte character cut by the output budget) are preserved as
+`\u00XX` byte escapes in the arguments JSON, so normalization cannot drop or reject them.
 A function opener that lost its leading `<` (doubled or missing, including a leaked `im_start`
 turn marker) is recovered in tolerant mode and is structural in exactly the places a canonical
 opener is: it can begin a call and, after the function close of a complete call, end a declared
