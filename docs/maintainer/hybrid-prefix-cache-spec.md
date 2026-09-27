@@ -135,6 +135,7 @@ prompt tokens from cache but prefilled 5.02M tokens (994 s). It showed three pro
 | Superseded snapshots evicted first; valuation against the nearest retained ancestor | `39bc99c4` | §9.3 | prompt tokens prefilled −10.8 % (seed 42) and −3.4 % (seed 43); main-session turns that re-prefilled the whole prompt 3 → 1 (seed 42); TTFT without queue wait −6 % and −3 % | kept |
 | Persistent backfill proof with a 16K-token growth reserve | not merged (branch `feat/hybrid-cache-policy-rebased`, `c974e5ec`) | §6.3 | targeted scenario: four 12K-token requests queued behind a blocked 90K-token head finish in 1.6 s instead of 35–36 s; the long request already decoding takes 4.7 s (12 %) longer, about the borrowers' prefill time, and the head starts that much later (its answer ends at the same time); no answer is cut short. Agentic workload: 0–9 backfills per run, effect within sampling noise | reverted: a trade-off, not a win (below) |
 | Prefetch of the blocked head's Host-only blocks | `d9b8d437` | §6.6 | admission Host restores −22 % (seed 42, 62.4 → 48.6 GB) and −25 % (seed 43, 68.4 → 51.3 GB), 10–11 GB prefetched per run; TTFT without queue wait −3 % and −6 %; decode rounds/s unchanged (57.8 vs 57.8, one request decoding) | kept |
+| Stop cancels running and queued requests before the save (`Engine::stop()`; `ninfer-serve` stops on Ctrl+C pressed twice within 5 s) | "fix(serve): stop on a confirmed Ctrl+C …" (2026-09-27) | §5.5 | a correctness fix, not A/B tested. The production log's stops at 07:48 and 07:54 left 10 and 3 requests unfinished and wrote no file: Ctrl+C waited silently for them and a second Ctrl+C killed the process. Console test, one streaming and one queued request: before, generation ran on 68.6 s after Ctrl+C; after, one press only prompts, and a confirmed pair fails both with 503 within 0.2 s, saves 99 blocks (503 MiB) in 0.1–0.2 s and exits about 0.7 s later | kept |
 
 Fix 3 was measured on top of the backfill proof. The build that combined all three against the
 base: at the 16 GB Host tier, prompt tokens prefilled −13.9 % (seed 42) and −2.7 % (seed 43), TTFT
@@ -509,10 +510,13 @@ With `persistent_file` (`--prefix-cache-file`), the Host tier outlives the proce
 resolves the path to an absolute one at launch. It rejects a directory, a missing parent
 directory, or `--host-cache-mib 0`, so an unusable location fails before any caching:
 
-- **Save**, in the worker's orderly stop when the Engine is destroyed (clean shutdown: Ctrl+C,
-  Ctrl+Break, or closing the console window on Windows, where `ninfer-serve`'s console handler
-  stops the server and blocks while `main` unwinds; Windows ends the process about 5 s after a
-  close, and an unfinished save leaves the previous file in place).
+- **Save**, in the worker's orderly stop, which `Engine::stop()` or the Engine's destruction
+  starts. `ninfer-serve` calls `stop()` on a confirmed Ctrl+C (a second press within 5 s,
+  `serve/stop_control.h`), Ctrl+Break, `SIGTERM` or console close. Running and queued requests
+  then fail as Unavailable at the next unit boundary instead of holding the stop until they
+  finish. Another confirmed Ctrl+C exits at once. The console-close handler blocks while `main`
+  unwinds, but Windows ends the process about 5 s after a close. Either way an unfinished save
+  leaves the previous file in place.
   `Program::shutdown_cleanup` releases every lane first, so requests still in flight write their
   committed blocks through, and saves before the cleanup drops the cache. Every Host write
   lands, then every retained (not superseded, §9.3) Host-resident snapshot whose anchor path is

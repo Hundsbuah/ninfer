@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -14,6 +15,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -89,6 +91,16 @@ ninfer::RequestOptions greedy(std::uint32_t outputs) {
     return options;
 }
 
+template <typename Call>
+bool fails_unavailable(Call&& call) {
+    try {
+        std::forward<Call>(call)();
+    } catch (const ninfer::RequestError& error) {
+        return error.kind() == ninfer::RequestErrorKind::Unavailable;
+    }
+    return false;
+}
+
 struct Observed {
     std::vector<ninfer::TokenId> tokens;
     std::uint32_t reused = 0;
@@ -148,9 +160,9 @@ int exercise_restore_exact(const char* artifact, ninfer::SpeculativeBackend back
     return failures;
 }
 
-// A restarted Engine resumes from the Host tier its predecessor saved: the restored snapshot is
-// the same bytes, so greedy generation matches an Engine that never restarted. A file written for
-// a different build identity is ignored.
+// A restarted Engine resumes from the Host tier its predecessor saved when stopped mid-generation:
+// the restored snapshot is the same bytes, so greedy generation matches an Engine that never
+// restarted. A file written for a different build identity is ignored.
 int exercise_persist(const char* artifact) {
     const std::filesystem::path file =
         std::filesystem::temp_directory_path() / "ninfer-hybrid-persist-real-test.bin";
@@ -176,11 +188,26 @@ int exercise_persist(const char* artifact) {
         (void)engine.generate(engine.prepare_tokens(first), greedy(8));
         reference = engine.generate(engine.prepare_tokens(second), greedy(24)).generated_token_ids;
     }
+    int failures = 0;
     {
+        // The Engine stops the way ninfer-serve does: stop() while a generation is still far from
+        // its output limit. It fails as Unavailable instead of running on, new work is refused,
+        // and the Host tier is still saved.
         ninfer::Engine saver(options("persist-test"));
         (void)saver.generate(saver.prepare_tokens(first), greedy(8));
+        ninfer::GenerationHandle running =
+            saver.submit(saver.prepare_tokens(synthetic_tokens(200, 6)), greedy(3500));
+        std::this_thread::sleep_for(std::chrono::seconds(2));
+        saver.stop();
+        if (!fails_unavailable([&] { (void)running.wait(); })) {
+            std::cerr << "persist: a running generation was not ended as Unavailable by stop()\n";
+            ++failures;
+        }
+        if (!fails_unavailable([&] { (void)saver.submit(saver.prepare_tokens(second), greedy(4)); })) {
+            std::cerr << "persist: a stopped Engine accepted a request\n";
+            ++failures;
+        }
     }
-    int failures = 0;
     if (!std::filesystem::exists(file)) {
         std::cerr << "persist: the Engine did not save its Host tier\n";
         return 1;

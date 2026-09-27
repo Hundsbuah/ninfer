@@ -90,8 +90,10 @@ first):
 ninfer-serve.exe qwen3_8_27b_nvfp4-nvidia.ninfer --host 127.0.0.1 --port 8080 --max-context 240000 --max-concurrency 2 --spec dflash2 --draft-tokens 7 --lm-head-draft --ngram-draft-tokens 15 --ngram-min-match 12 --kv-dtype int8 --preserve-thinking --host-cache-mib 52000 --pending-timeout-ms 900000 --prefill-chunk 4096 --kv-capacity auto --vram-headroom-mib 0 --log-colours on --ngram-archive-mib 2048 --ngram-session-mib 256 --ngram-native-sessions --request-log-jsonl log.json --default-thinking-budget 16384 --thinking-budget-message "Considering the limited time available to the user, I must stop thinking now. Time to act:" --tolerant-tool-calls
 ```
 
-Add `--prefix-cache-file PATH` to keep the prefix cache across restarts (stop the server with
-Ctrl+C). `ninfer-serve.exe --help` lists every option by category.
+Add `--prefix-cache-file PATH` to keep the prefix cache across restarts. Stop the server by
+pressing Ctrl+C twice (the first press shows a prompt at the bottom of the console). The server then
+cancels running and queued requests, saves the cache and exits; pressing Ctrl+C twice more exits
+without saving. `ninfer-serve.exe --help` lists every option by category.
 
 ## Quick start (Linux)
 
