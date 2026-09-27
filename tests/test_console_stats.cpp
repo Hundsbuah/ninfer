@@ -157,6 +157,20 @@ int main() {
         }
     }
 
+    // A session whose requests never decoded shows no decode rate and no batch, not a division by
+    // zero: one request of a single output token has no decode tokens or decode time.
+    ConsoleStatsSnapshot undecoded;
+    undecoded.completed     = 1;
+    undecoded.recent_window = 10;
+    undecoded.session.add(make_console_request_sample(outcome(100, 0, 1, 0.1, 0.05, 0.0)));
+    undecoded.recent                               = undecoded.session;
+    const std::vector<std::string> undecoded_lines = render_console_stats_panel(undecoded);
+    failures += check(undecoded_lines.size() == 3 &&
+                          contains(undecoded_lines[2], " 2.00k       -      - ") &&
+                          !contains(undecoded_lines[2], "nan") &&
+                          !contains(undecoded_lines[2], "inf"),
+                      "a session without decode did not show empty decode rate and batch cells");
+
     // The recent row appears once the session outgrows the window and covers only its requests.
     const auto logging = std::make_unique<ninfer::product::LoggingRuntime>(
         ninfer::product::LoggingOptions{.logger_name = "console-stats-test"});

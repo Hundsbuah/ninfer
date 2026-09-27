@@ -1070,6 +1070,28 @@ int test_reasoning_effort_substitution() {
             sparse.render(question).text.ends_with("[unset]"),
         "a rejected effort did not render as the nearest accepted one");
 
+    // A template that cannot render the probe (a lone user message) reveals nothing about its
+    // efforts, so none is substituted: an effort it rejects keeps the request's value and raises,
+    // where a probed template would have rendered the nearest accepted one.
+    const auto unprobed = fi::CompiledChatTemplate::resolve(
+        "{%- if messages[0].role != 'system' %}{{- raise_exception('needs a system message') }}"
+        "{%- endif %}"
+        "{%- if reasoning_effort is defined and reasoning_effort not in ('medium', 'max') %}"
+        "{{- raise_exception('unsupported effort') }}{%- endif %}"
+        "<|im_start|>system\n{{ messages[0].content }}<|im_end|>\n"
+        "<|im_start|>user\n{{ messages[1].content }}<|im_end|>\n<|im_start|>assistant\n"
+        "[{{ reasoning_effort | default('unset') }}]");
+    const std::vector<fi::ChatMessage> instructed{
+        chat_message(ninfer::ChatRole::System, "instructions"),
+        chat_message(ninfer::ChatRole::User, "question")};
+    failures += check(
+        unprobed.render(instructed, {.reasoning_effort = ReasoningEffort::Medium})
+                .text.ends_with("[medium]") &&
+            throws_invalid_argument([&] {
+                (void)unprobed.render(instructed, {.reasoning_effort = ReasoningEffort::High});
+            }),
+        "a template that fails the probe had an effort substituted");
+
     // A template that rejects every effort keeps the request's value and raises as before.
     const auto none = fi::CompiledChatTemplate::resolve(
         "{%- if reasoning_effort is defined %}{{- raise_exception('no effort') }}{%- endif %}"
