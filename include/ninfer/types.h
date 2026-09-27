@@ -746,6 +746,10 @@ struct GenerationTimings {
     double vision_seconds      = 0.0;
     double prefill_seconds     = 0.0;
     double decode_seconds      = 0.0;
+    // decode_seconds with each compact-batch unit's elapsed time divided among the requests it
+    // served. Unlike decode_seconds, summing it over concurrent requests counts each unit once, so
+    // summed decode tokens over summed shares is aggregate decode throughput.
+    double decode_share_seconds = 0.0;
     // Request wall phases at committed model-state boundaries. Prompt begins when admission and
     // its exact reuse choice are published and ends at the first accepted output token. Generation
     // spans the first through last accepted output token and therefore has N-1 token intervals.
