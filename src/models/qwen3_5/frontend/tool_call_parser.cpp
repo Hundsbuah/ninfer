@@ -371,6 +371,13 @@ const Contract::Parameter* find_parameter_contract(const Contract::Tool& tool,
     return parameter == tool.parameters.end() ? nullptr : &*parameter;
 }
 
+bool is_declared_parameter(const Contract& contract, std::string_view tool_name,
+                           std::string_view parameter_name) {
+    const Contract::Tool* tool = find_tool_contract(contract, tool_name);
+    if (tool == nullptr || !tool->unambiguous) { return false; }
+    return find_parameter_contract(*tool, parameter_name) != nullptr;
+}
+
 bool is_declared_string_parameter(const Contract& contract, std::string_view tool_name,
                                   std::string_view parameter_name) {
     const Contract::Tool* tool = find_tool_contract(contract, tool_name);
@@ -780,7 +787,7 @@ private:
         std::size_t value_end         = 0;
         std::size_t close_len         = 0;
         if (!find_parameter_close(value_begin, value_end, close_len, param_close, fn_close,
-                                  container, opaque_string)) {
+                                  container, opaque_string, call.name)) {
             if (tolerant_) {
                 // Tolerant: the region ends before the closing tag, so the output budget cut the
                 // parameter value. Keep the value up to the cut (last occurrence wins, as with a
@@ -835,8 +842,8 @@ private:
     }
 
     bool has_structural_parameter_successor(std::size_t pos, std::string_view fn_close,
-                                            FunctionContainer container,
-                                            bool relaxed_tolerant) const {
+                                            FunctionContainer container, bool relaxed_tolerant,
+                                            std::string_view fn_name) const {
         skip_format_whitespace(text_, pos);
         if (starts_with_at(text_, pos, fn_close)) {
             if (has_structural_function_successor(pos + fn_close.size(), container)) {
@@ -869,26 +876,32 @@ private:
         const std::size_t header_begin = parameter_open_header_begin(text_, pos);
         const std::string_view header =
             text_.substr(header_begin, tag_end - header_begin);
-        // A real sibling header never contains a parameter close: the chat templates emit the
-        // name verbatim between the opener prefix and the first ">", so a name carrying a
-        // close marker cannot be emitted. An opener whose header swallows one is a fake
-        // sibling in opaque data whose tag boundary was eaten by a literal close; treating
-        // that literal close as the boundary would reinterpret the value, so it stays data
-        if (header.find("</para" "m") != std::string_view::npos) { return false; }
-        return !extract_name_from_tag_header(header).empty();
+        const std::string_view sibling_name = extract_name_from_tag_header(header);
+        if (sibling_name.empty()) { return false; }
+        // A header carrying a parameter close is normally a fake sibling in opaque data whose
+        // tag boundary was eaten by a literal close; treating that literal close as the
+        // boundary would reinterpret the value, so it stays data. The exception is a sibling
+        // whose name is declared for this function: the chat templates emit declared names
+        // verbatim between the opener prefix and the first ">", and NInfer does not restrict
+        // them to a grammar excluding close markers, so only the contract can tell a real
+        // sibling from opaque data carrying the same bytes.
+        if (header.find("</para" "m") != std::string_view::npos) {
+            return is_declared_parameter(contract_, fn_name, sibling_name);
+        }
+        return true;
     }
 
     bool find_opaque_parameter_close(std::size_t value_begin, std::size_t& value_end,
                                      std::size_t& close_len, std::string_view required_close,
                                      std::string_view fn_close, FunctionContainer container,
-                                     bool relaxed_tolerant) const {
+                                     bool relaxed_tolerant, std::string_view fn_name) const {
         std::size_t scan = value_begin;
         for (;;) {
             const std::size_t candidate = text_.find(required_close, scan);
             if (candidate == std::string_view::npos) { return false; }
             const std::size_t after = candidate + required_close.size();
-            if (has_structural_parameter_successor(after, fn_close, container,
-                                                   relaxed_tolerant)) {
+            if (has_structural_parameter_successor(after, fn_close, container, relaxed_tolerant,
+                                                   fn_name)) {
                 value_end = candidate;
                 close_len = required_close.size();
                 return true;
@@ -900,7 +913,7 @@ private:
     bool find_parameter_close(std::size_t value_begin, std::size_t& value_end,
                               std::size_t& close_len, std::string_view required_close,
                               std::string_view fn_close, FunctionContainer container,
-                              bool opaque_string) const {
+                              bool opaque_string, std::string_view fn_name) const {
         if (opaque_string) {
             // Declared string parameters are opaque data. Parameter elements are siblings in the
             // Qwen grammar, not recursively nested elements, so a literal "<parameter...>" inside
@@ -918,13 +931,13 @@ private:
             // discarded tokens follow it, but never when a wrapper-foreign marker follows.
             if (find_opaque_parameter_close(value_begin, value_end, close_len, required_close,
                                             fn_close, container,
-                                            /*relaxed_tolerant*/ false)) {
+                                            /*relaxed_tolerant*/ false, fn_name)) {
                 return true;
             }
             return tolerant_ &&
                    find_opaque_parameter_close(value_begin, value_end, close_len, required_close,
                                                fn_close, container,
-                                               /*relaxed_tolerant*/ true);
+                                               /*relaxed_tolerant*/ true, fn_name);
         }
 
         // Legacy and non-string values keep the historical balanced-marker behavior.

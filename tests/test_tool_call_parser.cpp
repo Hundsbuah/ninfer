@@ -336,6 +336,69 @@ int test_literal_close_before_fake_sibling_stays_value_data() {
     return failures;
 }
 
+int test_declared_sibling_with_close_marker_in_name() {
+    // NInfer does not restrict declared parameter names to a grammar excluding close
+    // markers, and the chat templates emit them verbatim between the opener prefix and the
+    // first ">". A declared sibling whose header carries a close marker must therefore stay
+    // a real sibling; the contract is the only authority that can tell it apart from a fake
+    // sibling inside opaque data.
+    const auto contract =
+        contract_for("run", Json{{"command", Json{{"type", "string"}}},
+                                 {"x</para" "mY", Json{{"type", "integer"}}}});
+    const std::string full_text =
+        tool_call("run", {{"command", "echo ok"}, {"x</para" "mY", "7"}});
+    const std::string short_text =
+        "<tool_call>\n<function=run>\n<param=command>\necho ok\n</param>\n"
+        "<param=x</para" "mY>\n7\n</param>\n</function>\n</tool_call>";
+
+    int failures = 0;
+    for (const auto& [label, text] :
+         std::vector<std::pair<const char*, std::string>>{
+             {"full parameter syntax", full_text}, {"short param syntax", short_text}}) {
+        for (const bool tolerant : {false, true}) {
+            const auto parsed = fi::parse_qwen_tool_call_output(text, 64, contract, tolerant);
+            failures += check(
+                parsed.is_tool_call_response && parsed.tool_calls.size() == 1 &&
+                    parsed.content.empty() && parsed.tool_calls.front().name == "run",
+                (std::string("declared sibling with a close marker in its name was not "
+                             "parsed as a sibling (") +
+                 label + ")"));
+            if (!parsed.is_tool_call_response || parsed.tool_calls.size() != 1) { continue; }
+            const Json args = Json::parse(parsed.tool_calls.front().arguments_json);
+            failures += check(args.at("command") == "echo ok",
+                              (std::string("string value swallowed the declared sibling (") +
+                               label + ")"));
+            failures += check(
+                args.at("command").get<std::string>().find("</para" "m") == std::string::npos,
+                (std::string("string value carries sibling markup (") + label + ")"));
+            failures += check(args.at("x</para" "mY") == 7,
+                              (std::string("declared sibling with a close marker in its name "
+                                           "was lost (") +
+                               label + ")"));
+            failures += check(
+                parsed.diagnostics.schema_mismatch_arguments == 0 &&
+                    parsed.diagnostics.fallback_reason ==
+                        ninfer::ToolCallParseFallbackReason::None,
+                (std::string("declared sibling parse reported a spurious diagnostic (") + label +
+                 ")"));
+
+            // The streaming decoder must reach the same terminal result.
+            fi::ToolCallOutputDecoder decoder(
+                std::make_shared<const fi::ToolCallOutputContract>(contract), 64, tolerant);
+            std::string visible;
+            for (std::size_t offset = 0; offset < text.size(); offset += 7) {
+                visible += decoder.feed(std::string_view(text).substr(offset, 7));
+            }
+            const auto terminal = decoder.finish();
+            failures += check(
+                visible.empty() && terminal.content.empty() && terminal.tool_calls.size() == 1 &&
+                    Json::parse(terminal.tool_calls.front().arguments_json) == args,
+                (std::string("chunked declared sibling changed the terminal result (") + label +
+                 ")"));
+        }
+    }
+    return failures;
+}
 
 int test_declared_json_types() {
     const auto contract = contract_for(
@@ -1326,6 +1389,7 @@ int main() {
     failures += test_string_values_preserve_embedded_tool_markup();
     failures += test_declared_string_parameter_delimiters_are_opaque();
     failures += test_literal_close_before_fake_sibling_stays_value_data();
+    failures += test_declared_sibling_with_close_marker_in_name();
     failures += test_declared_json_types();
     failures += test_boolean_boundary();
     failures += test_exact_integer_boundary();

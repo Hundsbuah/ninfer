@@ -239,10 +239,15 @@ String parameters preserve function/tool-call markers and balanced nested
 `<parameter=...>...</parameter>` text as value bytes. For a parameter whose declared schema
 admits a string, parameter delimiters are opaque: a literal opener in the value does not nest,
 and a literal close ends the value only when what follows continues the call (a sibling
-parameter with a delimiter-free header, or the function close, and in tolerant mode also a
-function close followed by discarded trailing tokens or the end of the cut region); unmatched
-literal delimiters and a fake sibling whose header contains a close marker remain representable
-value bytes. Non-string and untyped parameters keep the balanced rule, where an
+parameter whose header extracts to a parameter name, or the function close, and in tolerant mode
+also a function close followed by discarded trailing tokens or the end of the cut region);
+unmatched literal delimiters and a sibling whose header contains a close marker and names no
+parameter declared for the current function remain representable value bytes. A header that
+contains a close marker and does name a declared parameter is a genuine sibling: chat templates
+emit declared names verbatim between the opener prefix and the first `>`, and NInfer does not
+restrict declared names to a grammar excluding close markers, so the current function's declared
+parameter set decides that case. Non-string and untyped parameters keep the balanced rule,
+where an
 unmatched nested opener or a standalone close makes that tool-call region ordinary content. The
 wire format has no delimiter escape, so a value that itself contains a complete closing
 boundary is ambiguous and ends the value at the first such boundary; the bytes after that
