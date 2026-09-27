@@ -4,10 +4,12 @@
 #include <cerrno>
 #include <cstdint>
 #include <cstdlib>
+#include <filesystem>
 #include <limits>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <system_error>
 
 namespace ninfer::serve {
 namespace {
@@ -95,40 +97,74 @@ std::string serve_usage_text(const char* argv0) {
            "  --device N                 CUDA device ordinal (default 0)\n"
            "\n"
            "KV CACHE\n"
-           "  --kv-capacity N|auto       KV-cache capacity in tokens (default =\n"
-           "                             --max-context; auto sizes to free VRAM,\n"
-           "                             leaving " +
+           "  --kv-capacity N|auto       KV-cache capacity in tokens (default auto, or\n"
+           "                             --max-context with the original prefix caching\n"
+           "                             system or --no-prefix-reuse; auto sizes to free\n"
+           "                             VRAM, leaving " +
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
-           " MiB of headroom; configurable via\n"
-           "                             --kv-headroom-mib)\n"
+           " MiB of headroom; configurable\n"
+           "                             via --kv-headroom-mib)\n"
            "                             (default " +
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
            ")\n"
            "  --kv-dtype T               KV storage: bf16 (default) | int8 | fp8 | nvfp4 | k8v4\n"
+           "  --no-prefix-reuse          disable prefix caching in either system below\n"
+           "                             (enabled by default); cannot be combined with any\n"
+           "                             prefix-cache option\n"
+           "\n"
+           "NEW PREFIX CACHING SYSTEM (hybrid; the default)\n"
+           "  Content-addressed 64-token KV blocks shared across requests plus sparse model\n"
+           "  state snapshots. It configures itself: free VRAM becomes Device block cache\n"
+           "  (--kv-capacity defaults to auto) and every option below is optional.\n"
+           "  --host-cache-mib N         pinned host RAM pool that KV blocks and state\n"
+           "                             snapshots share (default 8192; 0 = GPU only)\n"
+           "  --prefix-cache-file PATH   restore the host tier from PATH at startup when\n"
+           "                             present (written by this binary for the same\n"
+           "                             artifact and KV format) and save it there on clean\n"
+           "                             shutdown (Ctrl+C); relative paths resolve against\n"
+           "                             the launch directory (default off: nothing is saved)\n"
+           "  --device-snapshot-slots N  device state snapshot slots (default concurrency\n"
+           "                             + 1; + 2 without a host tier)\n"
+           "  --cache-taps-per-request N new prefill snapshots per request (default 8;\n"
+           "                             2 without a host tier)\n"
+           "  --cache-tap-ladder N       ladder base in tokens for history snapshots\n"
+           "                             (default max(4096, 2x prefill chunk))\n"
+           "  --cache-tap-min-gap N      minimum tokens between ladder snapshots\n"
+           "                             (default max(1024, prefill chunk))\n"
+           "\n"
+           "ORIGINAL PREFIX CACHING SYSTEM (upstream's checkpoint catalog, with fixes)\n"
+           "  --use-original-prefix-caching\n"
+           "                             use this system instead of the new one; the\n"
+           "                             options below require it. --kv-capacity then\n"
+           "                             defaults to --max-context\n"
+           "  --host-cache-mib N         single host RAM ceiling: sizes the host state pool\n"
+           "                             from the checkpoints the engine creates (state\n"
+           "                             capped at half the budget), spends spare state\n"
+           "                             room on more long anchors per continuation and\n"
+           "                             gives host KV the rest; cannot be combined with\n"
+           "                             --host-state-slots or --host-kv-mib\n"
            "  --device-state-slots N     extra device checkpoint slots beyond active lanes\n"
            "                             (default = --max-concurrency)\n"
            "  --host-state-slots N       host checkpoint slots (default 8)\n"
            "  --host-kv-mib N            host KV cache in MiB (default 8192)\n"
-           "  --host-cache-mib N         single host RAM ceiling for the whole prefix cache;\n"
-           "                             the engine sizes the Host state pool from the\n"
-           "                             checkpoint inventory the capture path creates (state\n"
-           "                             capped at half the budget), spends the remaining state\n"
-           "                             headroom on more long anchors per continuation, and\n"
-           "                             gives Host KV the remainder; cannot be combined with\n"
-           "                             --host-state-slots or --host-kv-mib\n"
            "  --max-private-continuations N          bounded private catalogs\n"
            "                                         (default 2x concurrency)\n"
-           "  --max-long-anchors-per-continuation N  long anchors per continuation; the engine\n"
-           "                                         anchors up to N message boundaries (default\n"
-           "                                         4; --host-cache-mib raises it within budget)\n"
-           "  --long-anchor-spacing N                minimum tokens between automatic anchors,\n"
-           "                                         doubling per anchor back from the prompt end\n"
-           "                                         (default 1024; 0 anchors every boundary)\n"
-           "  --max-shared-prefixes N          bounded shared prefix catalogs\n"
-           "                                    (default = max(concurrency," +
-           std::to_string(kMaximumPreparedPromptCacheCandidatesPerRequest) + "))\n"
-           "  --no-prefix-reuse          disable compatible-prefix caching\n"
-           "                             (enabled by default)\n"
+           "  --max-shared-prefixes N                bounded shared prefix catalogs\n"
+           "                                         (default max(concurrency," +
+           std::to_string(kMaximumPreparedPromptCacheCandidatesPerRequest) +
+           "))\n"
+           "  --max-long-anchors-per-continuation N  long anchors per continuation; the\n"
+           "                                         engine anchors up to N message\n"
+           "                                         boundaries (default 4; --host-cache-mib\n"
+           "                                         raises it within budget)\n"
+           "  --long-anchor-spacing N                minimum tokens between anchors,\n"
+           "                                         doubling per anchor back from the\n"
+           "                                         prompt end (default 1024; 0 anchors\n"
+           "                                         every boundary)\n"
+           "  defaults: device-state=max-concurrency, private=2x concurrency,\n"
+           "  shared=max(concurrency," +
+           std::to_string(kMaximumPreparedPromptCacheCandidatesPerRequest) +
+           "), anchors=4; host state=8 slots, host KV=8192 MiB\n"
            "\n"
            "SPECULATIVE DECODING (off by default)\n"
            "  --spec mtp|dflash|dflash2    speculative decoding backend\n"
@@ -194,17 +230,13 @@ std::string serve_usage_text(const char* argv0) {
            "                             strict parsers that reject choices:[] accept it\n"
            "\n"
            "NOTES\n"
-           "  --no-prefix-reuse cannot be combined with the context-cache capacity\n"
-           "  options above.\n"
+           "  prefix caching system).\n"
+           "  Options of the two prefix caching systems cannot be mixed.\n"
            "  --vision-offload on requires --vision.\n"
            "  --ngram-draft-tokens above 15 requires --max-concurrency 1.\n"
            "  --ngram-native-sessions requires --ngram-archive-mib.\n"
            "  --rope-yarn-factor is startup-fixed, finite [1,4] (default 1); it extends the\n"
            "  allowed ceiling only, not --max-context.\n"
-           "  context cache defaults: device-state=max-concurrency, private=2x concurrency,\n"
-           "  shared=max(concurrency," +
-           std::to_string(kMaximumPreparedPromptCacheCandidatesPerRequest) +
-           "), anchors=4; host state=8 slots, host KV=8192 MiB\n"
            "  sampler defaults come from the loaded model and resolved thinking mode;\n"
            "  server flags and request fields override individual values.\n"
            "  --greedy forces temperature 0 (exact argmax).\n";
@@ -229,6 +261,12 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     bool host_state_slots_explicit   = false;
     bool host_kv_mib_explicit        = false;
     bool host_cache_budget_explicit  = false;
+    bool original_cache_selected     = false;
+    // Last flag seen that belongs to only one prefix-cache mode, for the cross-mode error.
+    const char* legacy_cache_flag  = nullptr;
+    const char* hybrid_option_flag = nullptr;
+    // The hybrid prefix cache is the server default; --use-original-prefix-caching selects Legacy.
+    options.context_cache.mode = ContextCacheMode::Hybrid;
     if (argc >= 2 && (std::string(argv[1]) == "--help" || std::string(argv[1]) == "-h")) {
         options.help_requested = true;
         return options;
@@ -314,16 +352,46 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 throw std::invalid_argument("--media-preprocess-threads must be in [0,64]");
             }
             options.media_preprocess_threads = static_cast<std::uint32_t>(threads);
+        } else if (arg == "--use-original-prefix-caching") {
+            options.context_cache.mode = ContextCacheMode::Legacy;
+            original_cache_selected    = true;
+        } else if (arg == "--device-snapshot-slots") {
+            options.context_cache.hybrid.device_snapshot_slots =
+                static_cast<std::uint32_t>(parse_nonnegative_int(
+                    require_value("--device-snapshot-slots"), "device-snapshot-slots"));
+            hybrid_option_flag = "--device-snapshot-slots";
+        } else if (arg == "--cache-taps-per-request") {
+            options.context_cache.hybrid.max_new_taps =
+                static_cast<std::uint32_t>(parse_nonnegative_int(
+                    require_value("--cache-taps-per-request"), "cache-taps-per-request"));
+            hybrid_option_flag = "--cache-taps-per-request";
+        } else if (arg == "--cache-tap-ladder") {
+            options.context_cache.hybrid.tap_ladder_tokens = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--cache-tap-ladder"), "cache-tap-ladder"));
+            hybrid_option_flag = "--cache-tap-ladder";
+        } else if (arg == "--prefix-cache-file") {
+            options.context_cache.hybrid.persistent_file = require_value("--prefix-cache-file");
+            if (options.context_cache.hybrid.persistent_file.empty()) {
+                throw std::invalid_argument("--prefix-cache-file must not be empty");
+            }
+            hybrid_option_flag = "--prefix-cache-file";
+        } else if (arg == "--cache-tap-min-gap") {
+            options.context_cache.hybrid.tap_min_gap_tokens = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--cache-tap-min-gap"), "cache-tap-min-gap"));
+            hybrid_option_flag = "--cache-tap-min-gap";
         } else if (arg == "--device-state-slots") {
+            legacy_cache_flag                        = "--device-state-slots";
             options.context_cache.device_state_slots = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--device-state-slots"), "device-state-slots"));
             context_capacity_explicit = true;
         } else if (arg == "--host-state-slots") {
+            legacy_cache_flag                      = "--host-state-slots";
             options.context_cache.host_state_slots = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--host-state-slots"), "host-state-slots"));
             context_capacity_explicit = true;
             host_state_slots_explicit = true;
         } else if (arg == "--host-kv-mib") {
+            legacy_cache_flag       = "--host-kv-mib";
             const std::uint64_t mib = parse_u64(require_value("--host-kv-mib"), "host-kv-mib");
             if (mib > std::numeric_limits<std::size_t>::max() / (1ULL << 20)) {
                 throw std::invalid_argument("--host-kv-mib is out of range");
@@ -340,21 +408,25 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             context_capacity_explicit                     = true;
             host_cache_budget_explicit                    = true;
         } else if (arg == "--max-private-continuations") {
+            legacy_cache_flag = "--max-private-continuations";
             options.context_cache.max_private_continuations =
                 static_cast<std::uint32_t>(parse_nonnegative_int(
                     require_value("--max-private-continuations"), "max-private-continuations"));
             context_capacity_explicit = true;
         } else if (arg == "--max-shared-prefixes") {
+            legacy_cache_flag = "--max-shared-prefixes";
             options.context_cache.max_shared_prefixes =
                 static_cast<std::uint32_t>(parse_nonnegative_int(
                     require_value("--max-shared-prefixes"), "max-shared-prefixes"));
             context_capacity_explicit = true;
         } else if (arg == "--max-long-anchors-per-continuation") {
+            legacy_cache_flag = "--max-long-anchors-per-continuation";
             options.context_cache.max_long_anchors_per_continuation = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--max-long-anchors-per-continuation"),
                                       "max-long-anchors-per-continuation"));
             context_capacity_explicit = true;
         } else if (arg == "--long-anchor-spacing") {
+            legacy_cache_flag                                    = "--long-anchor-spacing";
             options.context_cache.long_anchor_min_spacing_tokens = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--long-anchor-spacing"),
                                       "long-anchor-spacing"));
@@ -478,16 +550,58 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         }
     }
     if (!kv_capacity_explicit) {
-        options.kv_capacity = KvCapacityPolicy::explicit_capacity(options.max_context);
+        // The hybrid cache turns every Device page no active request holds into block cache, so
+        // it sizes the KV pool to free VRAM unless a capacity is given. Without a prefix cache
+        // pages beyond the active requests would sit unused.
+        options.kv_capacity =
+            options.allow_prefix_reuse && options.context_cache.mode == ContextCacheMode::Hybrid
+                ? KvCapacityPolicy::automatic()
+                : KvCapacityPolicy::explicit_capacity(options.max_context);
     }
     if (!options.allow_prefix_reuse) {
-        if (context_capacity_explicit) {
+        if (original_cache_selected) {
             throw std::invalid_argument(
-                "--no-prefix-reuse cannot be combined with context-cache capacity options");
+                "--use-original-prefix-caching cannot be combined with --no-prefix-reuse");
+        }
+        if (context_capacity_explicit || legacy_cache_flag != nullptr ||
+            hybrid_option_flag != nullptr) {
+            throw std::invalid_argument(
+                "--no-prefix-reuse cannot be combined with prefix-cache options");
         }
         options.context_cache.enabled                = false;
+        options.context_cache.mode                   = ContextCacheMode::Legacy;
         options.context_cache.host_state_slots       = 0;
         options.context_cache.host_kv_capacity_bytes = 0;
+    } else if (options.context_cache.mode == ContextCacheMode::Hybrid) {
+        if (legacy_cache_flag != nullptr) {
+            throw std::invalid_argument(std::string(legacy_cache_flag) +
+                                        " configures the original prefix cache and requires "
+                                        "--use-original-prefix-caching");
+        }
+        std::filesystem::path& file = options.context_cache.hybrid.persistent_file;
+        if (!file.empty()) {
+            if (host_cache_budget_explicit && options.context_cache.host_cache_budget_bytes == 0) {
+                throw std::invalid_argument(
+                    "--prefix-cache-file saves the Host tier, which --host-cache-mib 0 removes");
+            }
+            // Resolved now, so the save at shutdown writes where startup read, and checked now,
+            // so an unusable location fails at launch rather than after a session of caching.
+            file = std::filesystem::absolute(file).lexically_normal();
+            std::error_code error;
+            if (std::filesystem::is_directory(file, error)) {
+                throw std::invalid_argument("--prefix-cache-file " + file.string() +
+                                            " is a directory; name a file in it");
+            }
+            if (!std::filesystem::is_directory(file.parent_path(), error)) {
+                throw std::invalid_argument("--prefix-cache-file " + file.string() +
+                                            ": the directory " + file.parent_path().string() +
+                                            " does not exist");
+            }
+        }
+    } else if (hybrid_option_flag != nullptr) {
+        throw std::invalid_argument(std::string(hybrid_option_flag) +
+                                    " configures the hybrid prefix cache and cannot be combined "
+                                    "with --use-original-prefix-caching");
     }
     if (host_cache_budget_explicit) {
         // The budget is the one host RAM ceiling; the two component flags would silently
