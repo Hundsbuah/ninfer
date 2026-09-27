@@ -400,6 +400,280 @@ int test_declared_sibling_with_close_marker_in_name() {
     return failures;
 }
 
+int test_parameter_opener_grammar_is_shared() {
+    // parse_parameter() and the opaque-string boundary detection must use one grammar:
+    // a byte sequence is a parameter opener for both stages or for neither. Prefix
+    // collisions ("<parameterX>", "<paramXYZ>") are malformed in the parameter position
+    // and are not structural siblings after a literal close.
+    const auto contract = contract_for("run", Json{{"command", Json{{"type", "string"}}}});
+    const std::string malformed_parameter =
+        "<tool_" "call>\n<func" "tion=run>\n<para" "meterX>\n7\n</para" "meter>\n</func" "tion>\n"
+        "</tool_" "call>";
+    const std::string malformed_short =
+        "<tool_" "call>\n<func" "tion=run>\n<paramXYZ>\n7\n</para" "m>\n</func" "tion>\n</tool_"
+        "call>";
+    const std::string empty_name =
+        "<tool_" "call>\n<func" "tion=run>\n<para" "meter=>\n7\n</para" "meter>\n</func" "tion>\n"
+        "</tool_" "call>";
+
+    int failures = 0;
+    for (const bool tolerant : {false, true}) {
+        failures += check_rejected(
+            malformed_parameter, contract, ninfer::ToolCallParseFallbackReason::MalformedStructure,
+            tolerant ? "tolerant accepted a prefix-collision parameter opener"
+                     : "prefix-collision parameter opener was accepted");
+        failures += check_rejected(
+            malformed_short, contract, ninfer::ToolCallParseFallbackReason::MalformedStructure,
+            tolerant ? "tolerant accepted a short prefix-collision parameter opener"
+                     : "short prefix-collision parameter opener was accepted");
+        failures += check_rejected(
+            empty_name, contract, ninfer::ToolCallParseFallbackReason::MalformedStructure,
+            tolerant ? "tolerant accepted a nameless parameter opener"
+                     : "nameless parameter opener was accepted");
+    }
+
+    // Properly delimited forms are parameter openers for both stages: a literal close
+    // before such a sibling is the value boundary, so the value is "A" and the sibling
+    // is consumed as a real parameter.
+    struct SiblingForm {
+        std::string_view open;
+        std::string_view close;
+    };
+    const SiblingForm sibling_forms[] = {
+        {"<para" "meter=timeout>", "</para" "meter>"},
+        {"<para" "meter name=\"timeout\">", "</para" "meter>"},
+        {"<param=timeout>", "</para" "m>"},
+        {"<param name=\"timeout\">", "</para" "m>"},
+    };
+    for (const auto& form : sibling_forms) {
+        const std::string text =
+            "<tool_" "call>\n<func" "tion=run>\n<para" "meter=command>\nA</para" "meter>\n" +
+            std::string(form.open) + "\n30\n" + std::string(form.close) +
+            "\n</func" "tion>\n</tool_" "call>";
+        for (const bool tolerant : {false, true}) {
+            const auto parsed = fi::parse_qwen_tool_call_output(text, 64, contract, tolerant);
+            failures += check(parsed.is_tool_call_response && parsed.tool_calls.size() == 1,
+                              "a delimited parameter opener was not recognized as a sibling");
+            if (!parsed.is_tool_call_response || parsed.tool_calls.size() != 1) { continue; }
+            const Json args = Json::parse(parsed.tool_calls.front().arguments_json);
+            failures += check(args.at("command") == "A" && args.at("timeout") == 30,
+                              "delimited sibling form changed the opaque value boundary");
+            failures += check(
+                parsed.diagnostics.fallback_reason == ninfer::ToolCallParseFallbackReason::None,
+                "delimited sibling form reported a spurious fallback reason");
+        }
+    }
+
+    // Consistency: the same prefix-collision bytes inside a declared string are data for
+    // both stages: not a sibling, so the literal close stays value bytes and the bytes
+    // are never reinterpreted as a parameter.
+    const std::string collision_in_value =
+        "<tool_" "call>\n<func" "tion=run>\n<para" "meter=command>\nA</para" "meter>\n"
+        "<para" "meterX>\n7\n</para" "meter>\n</func" "tion>\n</tool_" "call>";
+    for (const bool tolerant : {false, true}) {
+        const auto parsed =
+            fi::parse_qwen_tool_call_output(collision_in_value, 64, contract, tolerant);
+        failures += check(parsed.is_tool_call_response && parsed.tool_calls.size() == 1,
+                          "a prefix-collision opener inside a declared string broke the call");
+        if (!parsed.is_tool_call_response || parsed.tool_calls.size() != 1) { continue; }
+        const Json args = Json::parse(parsed.tool_calls.front().arguments_json);
+        failures += check(
+            args.size() == 1 && args.at("command") == "A</para" "meter>\n<para" "meterX>\n7",
+            "a prefix-collision opener inside a declared string was reinterpreted");
+    }
+    return failures;
+}
+
+int test_fake_sibling_swallowing_structural_close() {
+    // A fake sibling whose opener lacks its own terminator swallows the next structural
+    // close into its header. A genuine Qwen parameter header carries no markup, so such
+    // a header is a fake sibling: the preceding literal close stays value data and no
+    // synthetic parameter is created. This must hold for every structural close marker,
+    // not only for a swallowed "</param".
+    const auto contract = contract_for(
+        "bash", Json{{"command", Json{{"type", "string"}}},
+                     {"timeout", Json{{"type", "integer"}}}});
+    const std::string_view swallowed_markers[] = {"func" "tion", "invoke", "function_calls",
+                                                  "tool_" "call"};
+    int failures = 0;
+    for (const auto& marker : swallowed_markers) {
+        const std::string value =
+            std::string("A</para") + "meter><para" "meter=X\nB</" + std::string(marker) +
+            ">\nC";
+        const std::string text = tool_call("bash", {{"command", value}, {"timeout", "30"}});
+        for (const bool tolerant : {false, true}) {
+            const auto parsed = fi::parse_qwen_tool_call_output(text, 64, contract, tolerant);
+            failures += check(parsed.is_tool_call_response && parsed.tool_calls.size() == 1,
+                              "a fake sibling swallowing a structural close split the value");
+            if (!parsed.is_tool_call_response || parsed.tool_calls.size() != 1) { continue; }
+            const Json args = Json::parse(parsed.tool_calls.front().arguments_json);
+            failures += check(args.size() == 2 && args.at("command") == value &&
+                                  args.at("timeout") == 30,
+                              "a contaminated header derived a synthetic parameter");
+            failures += check(
+                parsed.diagnostics.fallback_reason == ninfer::ToolCallParseFallbackReason::None,
+                "a contaminated fake sibling reported a spurious fallback reason");
+
+            // The streaming decoder must reach the identical terminal result; literal
+            // delimiter strings are most likely to be split across transport chunks.
+            fi::ToolCallOutputDecoder decoder(
+                std::make_shared<const fi::ToolCallOutputContract>(contract), 64, tolerant);
+            std::string visible;
+            for (std::size_t offset = 0; offset < text.size(); offset += 7) {
+                visible += decoder.feed(std::string_view(text).substr(offset, 7));
+            }
+            const auto terminal = decoder.finish();
+            failures += check(visible.empty() && terminal.tool_calls.size() == 1 &&
+                                  Json::parse(terminal.tool_calls.front().arguments_json) == args,
+                              "chunked contaminated-header parsing diverged from one-shot");
+        }
+    }
+
+    // The same scenario in the short <param> spelling.
+    const std::string short_value = "A</para" "m><para" "m=X\nB</func" "tion>\nC";
+    const std::string short_text =
+        "<tool_" "call>\n<func" "tion=bash>\n<para" "m=command>\n" + short_value +
+        "\n</para" "m>\n<para" "m=timeout>\n30\n</para" "m>\n</func" "tion>\n</tool_" "call>";
+    for (const bool tolerant : {false, true}) {
+        const auto parsed = fi::parse_qwen_tool_call_output(short_text, 64, contract, tolerant);
+        failures += check(parsed.is_tool_call_response && parsed.tool_calls.size() == 1,
+                          "a short fake sibling swallowing a structural close split the value");
+        if (!parsed.is_tool_call_response || parsed.tool_calls.size() != 1) { continue; }
+        const Json args = Json::parse(parsed.tool_calls.front().arguments_json);
+        failures += check(args.size() == 2 && args.at("command") == short_value &&
+                              args.at("timeout") == 30,
+                          "a short contaminated header derived a synthetic parameter");
+        failures += check(
+            parsed.diagnostics.fallback_reason == ninfer::ToolCallParseFallbackReason::None,
+            "a short contaminated fake sibling reported a spurious fallback reason");
+    }
+    return failures;
+}
+
+int test_declared_suspicious_name_variants() {
+    // The contract exception for markup-contaminated headers covers every declared name
+    // that carries markup, not only names containing "</param": full close-looking
+    // names and plain nested-markup names stay genuine siblings when declared for the
+    // current function.
+    const auto contract = contract_for(
+        "run", Json{{"command", Json{{"type", "string"}}},
+                    {"x</para" "meter", Json{{"type", "integer"}}},
+                    {"a<b", Json{{"type", "integer"}}}});
+    struct SiblingCase {
+        const char* label;
+        std::string_view open;
+        std::string_view close;
+        std::string_view name;
+    };
+    const SiblingCase cases[] = {
+        {"full close-looking name", "<para" "meter=x</para" "meter>", "</para" "meter>",
+         "x</para" "meter"},
+        {"short close-looking name", "<param=x</para" "meter>", "</para" "m>",
+         "x</para" "meter"},
+        {"nested markup name", "<para" "meter=a<b>", "</para" "meter>", "a<b"},
+        {"short nested markup name", "<param=a<b>", "</para" "m>", "a<b"},
+    };
+    int failures = 0;
+    for (const auto& case_ : cases) {
+        const std::string text =
+            "<tool_" "call>\n<func" "tion=run>\n<para" "meter=command>\necho ok\n</para" "meter>\n" +
+            std::string(case_.open) + "\n7\n" + std::string(case_.close) +
+            "\n</func" "tion>\n</tool_" "call>";
+        for (const bool tolerant : {false, true}) {
+            const auto parsed = fi::parse_qwen_tool_call_output(text, 64, contract, tolerant);
+            failures += check(parsed.is_tool_call_response && parsed.tool_calls.size() == 1,
+                              (std::string("declared suspicious sibling not parsed (") +
+                               case_.label + ")"));
+            if (!parsed.is_tool_call_response || parsed.tool_calls.size() != 1) { continue; }
+            const Json args = Json::parse(parsed.tool_calls.front().arguments_json);
+            failures += check(
+                args.at("command") == "echo ok" && args.at(std::string(case_.name)) == 7 &&
+                    args.size() == 2,
+                (std::string("declared suspicious sibling changed the arguments (") +
+                 case_.label + ")"));
+            failures += check(parsed.diagnostics.schema_mismatch_arguments == 0 &&
+                                  parsed.diagnostics.fallback_reason ==
+                                      ninfer::ToolCallParseFallbackReason::None,
+                              (std::string("declared suspicious sibling reported a spurious "
+                                           "diagnostic (") +
+                               case_.label + ")"));
+
+            // The streaming decoder must reach the same terminal result.
+            fi::ToolCallOutputDecoder decoder(
+                std::make_shared<const fi::ToolCallOutputContract>(contract), 64, tolerant);
+            std::string visible;
+            for (std::size_t offset = 0; offset < text.size(); offset += 7) {
+                visible += decoder.feed(std::string_view(text).substr(offset, 7));
+            }
+            const auto terminal = decoder.finish();
+            failures += check(visible.empty() && terminal.content.empty() &&
+                                  terminal.tool_calls.size() == 1 &&
+                                  Json::parse(terminal.tool_calls.front().arguments_json) == args,
+                              (std::string("chunked declared suspicious sibling diverged (") +
+                               case_.label + ")"));
+        }
+    }
+    return failures;
+}
+
+int test_suspicious_header_requires_current_tool_contract() {
+    // A contaminated header gains structural authority only from the current function's
+    // unambiguous contract. A name declared on another tool must not make the header
+    // structural, and conflicting duplicate declarations leave the parser in
+    // contract-free legacy semantics where no suspicious header bytes are structural.
+    const std::string bash_def = tool_definition(
+        "bash", Json{{"command", Json{{"type", "string"}}},
+                     {"timeout", Json{{"type", "integer"}}}});
+    const std::string other_def = tool_definition(
+        "other_tool", Json{{"x</para" "mY", Json{{"type", "integer"}}}});
+    const auto cross_contract = contract_from_definitions({bash_def, other_def});
+
+    const std::string value = "A</para" "meter><para" "meter=x</para" "mY>\n7\nC";
+    const std::string text  = tool_call("bash", {{"command", value}, {"timeout", "30"}});
+
+    int failures = 0;
+    for (const bool tolerant : {false, true}) {
+        const auto parsed = fi::parse_qwen_tool_call_output(text, 64, *cross_contract, tolerant);
+        failures += check(parsed.is_tool_call_response && parsed.tool_calls.size() == 1,
+                          "a foreign tool declaration made a contaminated header structural");
+        if (!parsed.is_tool_call_response || parsed.tool_calls.size() != 1) { continue; }
+        const Json args = Json::parse(parsed.tool_calls.front().arguments_json);
+        failures += check(args.size() == 2 && args.at("command") == value && args.at("timeout") == 30,
+                          "a foreign tool declaration changed the opaque value boundary");
+        failures += check(parsed.diagnostics.fallback_reason ==
+                              ninfer::ToolCallParseFallbackReason::None,
+                          "the cross-tool case reported a spurious fallback reason");
+    }
+
+    // Conflicting duplicates make the tool contract ambiguous, so the declared-string
+    // path never runs and no version of the contract can authorize a suspicious header.
+    const std::string bash_string_def = tool_definition(
+        "bash", Json{{"command", Json{{"type", "string"}}},
+                     {"x</para" "mY", Json{{"type", "integer"}}}});
+    const std::string bash_integer_def = tool_definition(
+        "bash", Json{{"command", Json{{"type", "integer"}}},
+                     {"timeout", Json{{"type", "integer"}}}});
+    const auto ambiguous = contract_from_definitions({bash_string_def, bash_integer_def});
+    const std::string ambiguous_text =
+        "<tool_" "call>\n<func" "tion=bash>\n<para" "meter=command>\n"
+        "A</para" "meter><para" "meter=x</para" "mY\nB</func" "tion>\nC\n"
+        "</para" "meter>\n</func" "tion>\n</tool_" "call>";
+    const auto parsed_ambiguous =
+        fi::parse_qwen_tool_call_output(ambiguous_text, 64, *ambiguous);
+    failures += check(parsed_ambiguous.is_tool_call_response &&
+                          parsed_ambiguous.tool_calls.size() == 1,
+                      "an ambiguous contract demoted a legacy call to text");
+    if (parsed_ambiguous.is_tool_call_response && parsed_ambiguous.tool_calls.size() == 1) {
+        Json expected = Json::object();
+        expected["command"]                     = "A";
+        expected["x</para" "mY\nB</func" "tion"] = "C";
+        failures += check(
+            Json::parse(parsed_ambiguous.tool_calls.front().arguments_json) == expected,
+            "an ambiguous contract granted structural authority to a contaminated header");
+    }
+    return failures;
+}
+
 int test_declared_json_types() {
     const auto contract = contract_for(
         "configure", Json{{"count", Json{{"type", "integer"}}},
@@ -1390,6 +1664,10 @@ int main() {
     failures += test_declared_string_parameter_delimiters_are_opaque();
     failures += test_literal_close_before_fake_sibling_stays_value_data();
     failures += test_declared_sibling_with_close_marker_in_name();
+    failures += test_parameter_opener_grammar_is_shared();
+    failures += test_fake_sibling_swallowing_structural_close();
+    failures += test_declared_suspicious_name_variants();
+    failures += test_suspicious_header_requires_current_tool_contract();
     failures += test_declared_json_types();
     failures += test_boolean_boundary();
     failures += test_exact_integer_boundary();

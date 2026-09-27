@@ -147,29 +147,53 @@ std::string_view extract_name_from_tag_header(std::string_view header) {
     return unquote(header);
 }
 
-// Position of the first header byte after the "<parameter" or "<param" opener prefix at
-// pos, or npos when text does not start with a parameter opener there.
-std::size_t parameter_open_header_begin(std::string_view text, std::size_t pos) {
-    if (starts_with_at(text, pos, "<parameter")) { return pos + 10; }
-    if (starts_with_at(text, pos, "<param")) { return pos + 6; }
-    return std::string_view::npos;
+// The canonical parameter opener grammar shared by parameter parsing and structural
+// boundary detection: "<parameter" or "<param", then a byte that delimits the prefix
+// ('=', format whitespace, or '>'), then header bytes terminated by the first '>'. The
+// byte after the prefix must delimit it: a longer identifier such as "<parameterX>" is
+// not a parameter opener, so the two parser stages can never classify the same bytes
+// differently.
+struct ParameterHeader {
+    std::size_t header_begin; // first byte after the opener prefix
+    std::size_t tag_end;      // index of the header's terminating '>'
+    std::string_view name;    // extracted parameter name; empty when the header yields none
+    std::string_view close_tag;
+};
+
+bool parse_parameter_header(std::string_view text, std::size_t pos, ParameterHeader& header) {
+    std::size_t header_begin = 0;
+    std::string_view close_tag;
+    if (starts_with_at(text, pos, "<parameter")) {
+        header_begin = pos + 10;
+        close_tag    = "</parameter>";
+    } else if (starts_with_at(text, pos, "<param")) {
+        header_begin = pos + 6;
+        close_tag    = "</param>";
+    } else {
+        return false;
+    }
+    if (header_begin >= text.size()) { return false; }
+    const char separator = text[header_begin];
+    if (separator != '=' && separator != '>' && !is_format_whitespace(separator)) {
+        return false;
+    }
+    const std::size_t tag_end = text.find('>', header_begin);
+    if (tag_end == std::string_view::npos || tag_end == header_begin) {
+        return false;
+    }
+    header.header_begin = header_begin;
+    header.tag_end      = tag_end;
+    header.name         =
+        extract_name_from_tag_header(text.substr(header_begin, tag_end - header_begin));
+    header.close_tag    = close_tag;
+    return true;
 }
 
 bool is_param_open_at(std::string_view text, std::size_t pos, std::size_t& tag_end) {
-    const std::size_t header_begin = parameter_open_header_begin(text, pos);
-    if (header_begin == std::string_view::npos || header_begin >= text.size()) {
-        return false;
-    }
-    if (text[header_begin] != '=' && text[header_begin] != ' ' && text[header_begin] != '\t' &&
-        text[header_begin] != '\r' && text[header_begin] != '\n' && text[header_begin] != '>') {
-        return false;
-    }
-    const std::size_t end = text.find('>', header_begin);
-    if (end != std::string_view::npos && end != header_begin) {
-        tag_end = end;
-        return true;
-    }
-    return false;
+    ParameterHeader header;
+    if (!parse_parameter_header(text, pos, header)) { return false; }
+    tag_end = header.tag_end;
+    return true;
 }
 
 bool is_param_close_at(std::string_view text, std::size_t pos, std::size_t& tag_len) {
@@ -759,34 +783,23 @@ private:
 
     FallbackReason parse_parameter(std::size_t& pos, RawToolCall& call,
                                    std::string_view fn_close, FunctionContainer container) {
-        std::size_t header_begin = 0;
-        std::string_view param_close = "</parameter>";
-        if (starts_with_at(text_, pos, "<parameter")) {
-            header_begin = pos + 10;
-            param_close  = "</parameter>";
-        } else if (starts_with_at(text_, pos, "<param")) {
-            header_begin = pos + 6;
-            param_close  = "</param>";
-        } else {
+        // The same canonical opener grammar the structural boundary detection uses: a byte
+        // sequence that is not a parameter opener here is not one there either.
+        ParameterHeader header;
+        if (!parse_parameter_header(text_, pos, header)) {
             return FallbackReason::MalformedStructure;
         }
-
-        const std::size_t tag_end = text_.find('>', header_begin);
-        if (tag_end == std::string_view::npos || tag_end == header_begin) {
+        if (header.name.empty()) {
             return FallbackReason::MalformedStructure;
         }
-        const std::string_view header = text_.substr(header_begin, tag_end - header_begin);
-        const std::string_view name   = extract_name_from_tag_header(header);
-        if (name.empty()) {
-            return FallbackReason::MalformedStructure;
-        }
+        const std::string_view name = header.name;
 
         const bool opaque_string =
             is_declared_string_parameter(contract_, call.name, name);
-        const std::size_t value_begin = tag_end + 1;
+        const std::size_t value_begin = header.tag_end + 1;
         std::size_t value_end         = 0;
         std::size_t close_len         = 0;
-        if (!find_parameter_close(value_begin, value_end, close_len, param_close, fn_close,
+        if (!find_parameter_close(value_begin, value_end, close_len, header.close_tag, fn_close,
                                   container, opaque_string, call.name)) {
             if (tolerant_) {
                 // Tolerant: the region ends before the closing tag, so the output budget cut the
@@ -868,25 +881,23 @@ private:
         // parse_function() will classify the missing function close as a truncated tail.
         if (relaxed_tolerant && pos == text_.size()) { return true; }
 
-        std::size_t tag_end = 0;
-        if (!is_param_open_at(text_, pos, tag_end)) { return false; }
-
-        // Match parse_parameter() rather than accepting a syntactically parameter-like prefix
-        // whose header cannot actually produce a parameter name.
-        const std::size_t header_begin = parameter_open_header_begin(text_, pos);
-        const std::string_view header =
-            text_.substr(header_begin, tag_end - header_begin);
-        const std::string_view sibling_name = extract_name_from_tag_header(header);
-        if (sibling_name.empty()) { return false; }
-        // A header carrying a parameter close is normally a fake sibling in opaque data whose
-        // tag boundary was eaten by a literal close; treating that literal close as the
-        // boundary would reinterpret the value, so it stays data. The exception is a sibling
-        // whose name is declared for this function: the chat templates emit declared names
-        // verbatim between the opener prefix and the first ">", and NInfer does not restrict
-        // them to a grammar excluding close markers, so only the contract can tell a real
-        // sibling from opaque data carrying the same bytes.
-        if (header.find("</para" "m") != std::string_view::npos) {
-            return is_declared_parameter(contract_, fn_name, sibling_name);
+        // The same canonical opener grammar parse_parameter() consumes: both stages must
+        // classify a byte sequence as a parameter opener or as none alike.
+        ParameterHeader header;
+        if (!parse_parameter_header(text_, pos, header)) { return false; }
+        if (header.name.empty()) { return false; }
+        const std::string_view sibling_header =
+            text_.substr(header.header_begin, header.tag_end - header.header_begin);
+        // A genuine Qwen parameter header carries no markup: names are emitted verbatim
+        // between the opener prefix and the first ">". A '<' here means the candidate
+        // opener had no terminator of its own and swallowed structural markup from
+        // opaque data (a literal close, a function close, a wrapper close, ...), so it
+        // is a fake sibling unless the current unambiguous tool contract declares the
+        // exact extracted name; declared names are not restricted to a grammar that
+        // excludes delimiters, so only the contract can tell a real sibling from opaque
+        // data carrying the same bytes.
+        if (sibling_header.find('<') != std::string_view::npos) {
+            return is_declared_parameter(contract_, fn_name, header.name);
         }
         return true;
     }

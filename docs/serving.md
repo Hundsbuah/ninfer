@@ -241,12 +241,14 @@ admits a string, parameter delimiters are opaque: a literal opener in the value 
 and a literal close ends the value only when what follows continues the call (a sibling
 parameter whose header extracts to a parameter name, or the function close, and in tolerant mode
 also a function close followed by discarded trailing tokens or the end of the cut region);
-unmatched literal delimiters and a sibling whose header contains a close marker and names no
-parameter declared for the current function remain representable value bytes. A header that
-contains a close marker and does name a declared parameter is a genuine sibling: chat templates
-emit declared names verbatim between the opener prefix and the first `>`, and NInfer does not
-restrict declared names to a grammar excluding close markers, so the current function's declared
-parameter set decides that case. Non-string and untyped parameters keep the balanced rule,
+unmatched literal delimiters and a sibling whose header carries markup — a `<` byte before
+the header's terminating `>` — remain representable value bytes unless the header names a
+parameter declared for the current function. Markup in a header means the candidate opener
+had no terminator of its own and swallowed structural markup from value bytes (a literal
+close, a function close, or a wrapper close); chat templates emit declared names verbatim
+between the opener prefix and the first `>`, and NInfer does not restrict declared names to
+a grammar excluding markup, so only the current function's declared parameter set decides
+that case. Non-string and untyped parameters keep the balanced rule,
 where an
 unmatched nested opener or a standalone close makes that tool-call region ordinary content. The
 wire format has no delimiter escape, so a value that itself contains a complete closing
