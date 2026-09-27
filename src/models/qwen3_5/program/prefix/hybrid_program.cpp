@@ -837,7 +837,8 @@ StartResult ProgramImpl::hybrid_activate(HybridMaterializationTransaction& trans
             if (!address) { throw std::logic_error("hybrid admission has no KV address space"); }
             try {
                 if (frontier == 0) {
-                    addresses.activate(*address, entitlement, static_cast<std::int32_t>(lane));
+                    addresses.activate(*address, entitlement, static_cast<std::int32_t>(lane),
+                                       device.stream);
                     return *address;
                 }
                 std::vector<LogicalKVPageHandle> shared;

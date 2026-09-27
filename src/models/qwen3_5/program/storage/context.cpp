@@ -1463,12 +1463,16 @@ void ProgramImpl::bind_sequence_kv(SequenceState& sequence) {
     }
     try {
         if (!text_active) {
+            // The prefill that follows reads this row on the compute stream, so the block-table
+            // publish is ordered there rather than on the legacy stream.
             text_kv_addresses->activate(sequence.kv->text,
-                                        text_kv_addresses->mapped_pages(sequence.kv->text), row);
+                                        text_kv_addresses->mapped_pages(sequence.kv->text), row,
+                                        device.stream);
             if (sequence.kv->backend) {
                 backend_kv_addresses->activate(
                     *sequence.kv->backend,
-                    backend_kv_addresses->mapped_pages(*sequence.kv->backend), row);
+                    backend_kv_addresses->mapped_pages(*sequence.kv->backend), row,
+                    device.stream);
             }
         }
         set_device_i32(io.text_kv_table_row, text_kv_addresses->bound_row(sequence.kv->text));
