@@ -385,10 +385,18 @@ With `persistent_file` (`--prefix-cache-file`), the Host tier outlives the proce
 resolves the path to an absolute one at launch. It rejects a directory, a missing parent
 directory, or `--host-cache-mib 0`, so an unusable location fails before any caching:
 
-- **Save**, in the worker's orderly stop when the Engine is destroyed (clean shutdown: Ctrl+C,
-  Ctrl+Break, or closing the console window on Windows, where `ninfer-serve`'s console handler
-  stops the server and blocks while `main` unwinds; Windows ends the process about 5 s after a
-  close, and an unfinished save leaves the previous file in place).
+- **Save**, in the worker's orderly stop, which `Engine::stop()` or the Engine's destruction
+  starts. `ninfer-serve` calls `stop()` on a confirmed Ctrl+C (a second press within 5 s,
+  `serve/stop_control.h`), Ctrl+Break, `SIGTERM` or console close. Running and queued requests
+  then fail as Unavailable at the next unit boundary instead of holding the stop until they
+  finish; the worker answers them before the cleanup that saves, so no answer waits for the
+  save. One more Ctrl+C exits at once without saving: through the shared
+  `PrefixCacheSaveControl` (`HybridPrefixCacheOptions::persistent_save`) the save stops before
+  its next slab or before the rename, deletes its temporary file and ends, and `ninfer-serve`
+  waits up to 2 s for that before exiting. A save not yet begun never begins, and one still in
+  the Device drain is not waited for. The console-close handler blocks while `main` unwinds, but
+  Windows ends the process about 5 s after a close, which leaves the temporary file until the
+  next save. Either way an unfinished save leaves the previous file in place.
   `Program::shutdown_cleanup` releases every lane first, so requests still in flight write their
   committed blocks through, and saves before the cleanup drops the cache. Every Host write
   lands, then every retained (not superseded, §9.3) Host-resident snapshot whose anchor path is
@@ -1211,6 +1219,7 @@ struct HybridPrefixCacheOptions {                           // used only when mo
     std::optional<std::uint32_t> tap_min_gap_tokens;        // --cache-tap-min-gap
     std::filesystem::path persistent_file;                  // --prefix-cache-file (§5.5)
     std::string persistent_identity;                        // set by the product binary
+    PrefixCacheSaveControl persistent_save;                 // abandons the save (§5.5)
 };
 
 struct ContextCacheOptions {                  // existing struct, extended
@@ -1420,3 +1429,5 @@ None of these were A/B tested; each is a correctness, behavior or log fix.
 | A Host tier that keeps none of the file's snapshots warns `prefix cache not restored` instead of `partly restored … the most valuable snapshots were kept` | §5.5 | A restore keeps only the blocks its snapshots resume through, so keeping no snapshot restores nothing, yet the line claimed the most valuable snapshots were kept; it now names the tier the file needs and that the save at shutdown replaces the file |
 | A Host restore's per-layer events are looked up immediately before the first prefill chunk, not before the MTP bridge | §6.5 | Reported by funguf (Wallawalla47/ninfer-custom pull request 2) with an AddressSanitizer trace and 9 production crashes in `cuStreamWaitEvent` in one day (`--spec mtp`, Host tier): the view was taken before the MTP bridge, whose KV commit polls the cache, and a batch that had landed meanwhile was freed under it, so the first chunk waited on whatever the freed memory held. The report's fix copied the handles into the prefill context; looking them up at the chunk instead never hands CUDA an event the cache has recycled, needs no allocation, and skips the waits once the copies are complete. DFlash2 and no-speculation lanes run no bridge and were not exposed |
 | The chunk function takes the restore's layer events itself (`PrefillContext::take_layer_ready`), so program code never holds the view | §6.5 | Hardening. A deterministic test of the fix above was asked for, but the retired-batch path is timing-dependent and a dangling view reading a recycled handle can pass a token-equality check, so a test would need a product seam or AddressSanitizer. Moving the lookup inside the chunk call instead leaves no place for program code to take the view early |
+| A stop fails running and queued requests and answers them before the save (`Engine::stop()`; `ninfer-serve` stops on Ctrl+C pressed twice within 5 s) | §5.5 | The production log's stops at 07:48 and 07:54 left 10 and 3 requests unfinished and wrote no file: Ctrl+C waited silently for them and a second Ctrl+C killed the process. Console test, one streaming and one queued request: before, generation ran on 68.6 s after Ctrl+C; after, one press only prompts, and a confirmed pair fails both with 503 within 0.2 s, saves 99 blocks (503 MiB) in 0.1–0.2 s and exits about 0.7 s later. Answering them only after the cleanup that saves made each 503 wait for the whole save (408 blocks and 4 snapshots, 1,438 MiB: both 503s 392 ms after the stop, as the 0.3 s save ended); they are now answered first (8 ms after the stop, 447 ms before the save ended), and the `persist` real test checks that the file is not yet saved when the running generation is answered |
+| One Ctrl+C during the stop exits without saving and deletes the unfinished file (`PrefixCacheSaveControl`); the line reads `Press Ctrl+C again to exit without saving` | §5.5 | Leaving during the save needed another confirmed pair of presses, and `_Exit` left a partial `.tmp` of up to the Host tier's size beside the previous file until the next save |

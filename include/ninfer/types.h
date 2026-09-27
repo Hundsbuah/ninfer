@@ -170,6 +170,37 @@ enum class ContextCacheMode : std::uint8_t {
     Hybrid,
 };
 
+// Abandons the Host tier save of a stopping Engine (HybridPrefixCacheOptions::persistent_file)
+// from any thread, also while the Engine is being destroyed. Copies share one state: the product
+// keeps a copy from the options it passes, beyond the Engine's lifetime.
+class PrefixCacheSaveControl {
+public:
+    enum class Abandon : std::uint8_t {
+        // Nothing replaced the previous file; a save in progress deleted its unfinished file.
+        Unsaved,
+        // The save had already completed.
+        Saved,
+        // The save did not stop within the timeout; its unfinished file may remain.
+        StillWriting,
+    };
+
+    PrefixCacheSaveControl();
+
+    // Stops a save in progress, or one not begun yet, from replacing the previous file. Waits at
+    // most `timeout` for a save in progress to stop and delete its unfinished file.
+    Abandon abandon(std::chrono::milliseconds timeout) const noexcept;
+
+    // The Engine's side. A save writes only after begin() returns true, polls abandoned() while
+    // it writes, and then calls end() with whether it replaced the file.
+    [[nodiscard]] bool begin() const noexcept;
+    [[nodiscard]] bool abandoned() const noexcept;
+    void end(bool saved) const noexcept;
+
+private:
+    struct State;
+    std::shared_ptr<State> state_;
+};
+
 // Hybrid-mode tuning. Every field is optional: Engine construction derives the unset ones from
 // max_concurrency, prefill_chunk and whether a Host tier exists (host_cache_budget_bytes, default
 // kDefaultHybridHostCacheBytes, 0 disables it), and Engine::options() reports the effective
@@ -193,6 +224,8 @@ struct HybridPrefixCacheOptions {
     // state formats and `persistent_identity` (the product binary's build). Empty disables it.
     std::filesystem::path persistent_file;
     std::string persistent_identity;
+    // Lets the product abandon the save at shutdown (ninfer-serve: Ctrl+C during the stop).
+    PrefixCacheSaveControl persistent_save;
 };
 
 struct ContextCacheOptions {

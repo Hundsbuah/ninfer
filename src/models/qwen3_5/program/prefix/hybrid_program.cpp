@@ -174,7 +174,22 @@ void ProgramImpl::save_hybrid_cache_for_shutdown() noexcept {
             CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
         }
         hybrid_->drain();
-        hybrid_shutdown_save_ = public_result(hybrid_->save(hybrid_file_, hybrid_fingerprint_));
+        // The product may abandon the save (a Ctrl+C during the stop). It counts as running only
+        // from here, so an exit never waits for the Device work above.
+        const PrefixCacheSaveControl& control = context_cache.hybrid.persistent_save;
+        if (!control.begin()) {
+            hybrid_shutdown_save_ = HybridCachePersistence{.message = "abandoned before it began"};
+            return;
+        }
+        struct Ended {
+            const PrefixCacheSaveControl& control;
+            bool saved = false;
+            ~Ended() { control.end(saved); }
+        } ended{control};
+        hybrid_shutdown_save_ = public_result(hybrid_->save(
+            hybrid_file_, hybrid_fingerprint_,
+            CancellationView([&control] { return control.abandoned(); })));
+        ended.saved = hybrid_shutdown_save_->ok;
     } catch (const std::exception& error) {
         hybrid_shutdown_save_ = HybridCachePersistence{.message = error.what()};
     } catch (...) { hybrid_shutdown_save_ = HybridCachePersistence{.message = "unknown error"}; }

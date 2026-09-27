@@ -33,6 +33,7 @@ constexpr std::array<char, 8> kFooter = {'N', 'I', 'N', 'F', 'E', 'N', 'D', '1'}
 constexpr std::uint32_t kVersion      = 3;
 constexpr std::int32_t kRootIndex     = -1;
 constexpr std::uint64_t kFooterBytes  = kFooter.size() + 2U * sizeof(std::uint32_t);
+constexpr const char* kSaveAbandoned  = "abandoned; the previous file is kept";
 
 struct Geometry {
     std::uint64_t slab_bytes          = 0;
@@ -153,7 +154,8 @@ double seconds_since(std::chrono::steady_clock::time_point started) {
 } // namespace
 
 HybridPersistResult HybridPrefixCache::save(const std::filesystem::path& path,
-                                            std::string_view fingerprint) const {
+                                            std::string_view fingerprint,
+                                            const CancellationView& abandoned) const {
     HybridPersistResult out;
     const auto started = std::chrono::steady_clock::now();
     if (!host_tier()) {
@@ -163,6 +165,13 @@ HybridPersistResult HybridPrefixCache::save(const std::filesystem::path& path,
     if (!pending_.empty() || restore_.open || !landing_.empty()) {
         throw std::logic_error("hybrid prefix cache save requires idle transfers");
     }
+    if (abandoned.requested()) {
+        out.message = kSaveAbandoned;
+        return out;
+    }
+    const auto check_abandoned = [&] {
+        if (abandoned.requested()) { throw std::runtime_error(kSaveAbandoned); }
+    };
     std::vector<pc::NodeRef> nodes;
     std::vector<pc::SnapshotRef> snapshots;
     index_->collect_persistable(nodes, snapshots);
@@ -204,10 +213,12 @@ HybridPersistResult HybridPrefixCache::save(const std::filesystem::path& path,
             writer.value(view.hits);
         }
         for (const pc::NodeRef node : nodes) {
+            check_abandoned();
             writer.bytes(slab(index_->node(node).host_slab), host_layout_.slab_bytes);
         }
         for (const pc::SnapshotRef snapshot : snapshots) {
             for (const std::uint32_t slab_id : index_->snapshot(snapshot).host_slabs) {
+                check_abandoned();
                 writer.bytes(slab(slab_id), host_layout_.slab_bytes);
             }
         }
@@ -216,8 +227,11 @@ HybridPersistResult HybridPrefixCache::save(const std::filesystem::path& path,
         writer.value(static_cast<std::uint32_t>(snapshots.size()));
         writer.finish();
         out.bytes = writer.written();
+        // Abandoned after the last slab: the previous file still stays.
+        check_abandoned();
         std::filesystem::rename(temporary, path);
     } catch (const std::exception& error) {
+        // The writer is closed by now, so the temporary file can be deleted on every platform.
         std::error_code ignored;
         std::filesystem::remove(temporary, ignored);
         out.message = error.what();
