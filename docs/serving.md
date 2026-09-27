@@ -330,8 +330,10 @@ Templates accept different subsets of those values: the official Qwen3.8 templat
 anything but `low`, `medium` and `xhigh`. NInfer renders each value once when the template loads,
 and a request for a value the template rejects renders with the nearest accepted value, a tie
 rounding up: on Qwen3.8, `high` and `max` render as `xhigh` and `minimal` as `low`. This applies to
-every endpoint and to `--reasoning-effort`. A template that rejects every value keeps the request's
-value and its error. Request logs record the effort the client asked for.
+every endpoint and to `--reasoning-effort`. The values are tried on a one-message chat; a template
+that rejects every value, or cannot render that chat at all (one that requires a system message, for
+example), keeps the request's value and its error. Request logs record the effort the client asked
+for.
 
 `preserve_thinking` controls reasoning retention according to the selected template. Request
 options override server defaults set with `--no-thinking` and `--preserve-thinking`. Unspecified
