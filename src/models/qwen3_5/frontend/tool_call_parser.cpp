@@ -413,6 +413,24 @@ bool is_declared_string_parameter(const Contract& contract, std::string_view too
            admits_type(parameter->types, SchemaType::String);
 }
 
+// Conservative ordinary parameter identifier, used only to decide whether an undeclared
+// candidate sibling may terminate an opaque string. Official chat templates emit
+// parameter headers as "<parameter=<name>" with identifier-like names; a name carrying
+// markup, format whitespace, control bytes, or other non-identifier bytes can only be
+// the product of a fake opener that found its first ">" in value data. Declared names
+// are governed by the tool contract, not by this grammar.
+bool is_ordinary_parameter_name(std::string_view name) {
+    if (name.empty()) { return false; }
+    for (const char byte : name) {
+        const unsigned char c = static_cast<unsigned char>(byte);
+        const bool identifier =
+            (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+            c == '_' || c == '.' || c == '-' || c == ':';
+        if (!identifier) { return false; }
+    }
+    return true;
+}
+
 std::string_view remove_parameter_framing_newlines(std::string_view text) {
     std::size_t begin = 0;
     std::size_t end   = text.size();
@@ -886,20 +904,19 @@ private:
         ParameterHeader header;
         if (!parse_parameter_header(text_, pos, header)) { return false; }
         if (header.name.empty()) { return false; }
-        const std::string_view sibling_header =
-            text_.substr(header.header_begin, header.tag_end - header.header_begin);
-        // A genuine Qwen parameter header carries no markup: names are emitted verbatim
-        // between the opener prefix and the first ">". A '<' here means the candidate
-        // opener had no terminator of its own and swallowed structural markup from
-        // opaque data (a literal close, a function close, a wrapper close, ...), so it
-        // is a fake sibling unless the current unambiguous tool contract declares the
-        // exact extracted name; declared names are not restricted to a grammar that
-        // excludes delimiters, so only the contract can tell a real sibling from opaque
-        // data carrying the same bytes.
-        if (sibling_header.find('<') != std::string_view::npos) {
-            return is_declared_parameter(contract_, fn_name, header.name);
-        }
-        return true;
+        // A genuine Qwen parameter header is "<parameter=<name>": the official chat
+        // templates emit the declared name verbatim between "=" and the first ">". A
+        // candidate whose name the current unambiguous tool contract does not declare
+        // therefore establishes a structural boundary only while the name is still a
+        // plausible ordinary parameter identifier. A name that is not - embedded
+        // markup, format whitespace, control bytes - may only be the product of a fake
+        // opener scanning through value data to a later ">" (a comparison operator, a
+        // shell redirection, ...), so the preceding literal close remains value data.
+        // Declared names are not subject to the plausibility grammar: NInfer does not
+        // restrict declared names to a grammar that excludes markup, so the contract
+        // alone decides that case.
+        return is_declared_parameter(contract_, fn_name, header.name) ||
+               is_ordinary_parameter_name(header.name);
     }
 
     bool find_opaque_parameter_close(std::size_t value_begin, std::size_t& value_end,

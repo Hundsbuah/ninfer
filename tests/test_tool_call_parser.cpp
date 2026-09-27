@@ -756,6 +756,104 @@ int test_literal_markup_in_declared_string_arguments() {
     return failures;
 }
 
+int test_fake_sibling_borrowing_ordinary_greater_sign() {
+    // A fake parameter opener inside a declared string argument can find its first ">" in
+    // ordinary source data - a comparison operator, a shell redirection, more code after a
+    // newline - instead of in structural markup. Its extracted header therefore carries no
+    // "<" and the markup-contamination heuristic does not trigger; the extracted name is
+    // still not a plausible ordinary parameter identifier, so the candidate must not
+    // terminate the opaque string. Verified in strict and tolerant mode and in the
+    // streaming decoder, which must equal one-shot parsing.
+    const auto bash_contract = contract_from_definitions({
+        tool_definition("bash", Json{{"command", Json{{"type", "string"}}},
+                                   {"timeout", Json{{"type", "integer"}}}})});
+    int failures = 0;
+    const auto check_fake = [&](const char* label, const char* literal) {
+        const std::string value(literal);
+        for (const bool tolerant : {false, true}) {
+            const std::string call = tool_call("bash", {{"command", value}, {"timeout", "30"}});
+            const auto parsed =
+                fi::parse_qwen_tool_call_output(call, 64, *bash_contract, tolerant);
+            failures += check(parsed.is_tool_call_response && parsed.tool_calls.size() == 1 &&
+                                  parsed.tool_calls.front().name == "bash",
+                              (std::string("fake sibling borrowing a '>(") + label +
+                               ") demoted the call to text"));
+            if (parsed.is_tool_call_response && parsed.tool_calls.size() == 1) {
+                const Json args = Json::parse(parsed.tool_calls.front().arguments_json);
+                failures += check(args.size() == 2 && args.at("command") == value &&
+                                      args.at("timeout") == 30,
+                                  (std::string("fake sibling borrowing a '>(") + label +
+                                   ") created a synthetic parameter"));
+                failures += check(parsed.diagnostics.schema_mismatch_arguments == 0 &&
+                                      parsed.diagnostics.fallback_reason ==
+                                          ninfer::ToolCallParseFallbackReason::None,
+                                  (std::string("fake sibling borrowing a '>(") + label +
+                                   ") reported a spurious diagnostic"));
+
+                fi::ToolCallOutputDecoder decoder(std::make_shared<const fi::ToolCallOutputContract>(
+                                                      *bash_contract),
+                                                  64, tolerant);
+                std::string visible;
+                for (std::size_t offset = 0; offset < call.size(); offset += 7) {
+                    visible += decoder.feed(std::string_view(call).substr(offset, 7));
+                }
+                const auto terminal = decoder.finish();
+                failures += check(visible.empty() && terminal.content.empty() &&
+                                      terminal.tool_calls.size() == 1 &&
+                                      Json::parse(terminal.tool_calls.front().arguments_json) == args,
+                                  (std::string("chunked fake sibling borrowing a '>(") + label +
+                                   ") diverged from one-shot"));
+            }
+        }
+    };
+    check_fake("comparison operator", "A</para" "meter><para" "meter=X\nif (a > b) C");
+    check_fake("shell redirection", "A</para" "meter><para" "meter=X\necho hello > output.txt");
+    check_fake("newline and space", "A</para" "meter><para" "meter=X\nsomething > rest");
+    check_fake("tab", "A</para" "meter><para" "meter=X\tsomething > rest");
+
+    // An ordinary undeclared parameter keeps its current behavior: a simple undeclared
+    // name after a literal close still terminates the opaque string and remains
+    // structured with its schema mismatch.
+    {
+        const std::string call =
+            tool_call("bash", {{"command", "ls -la"}, {"extra", "value"}, {"timeout", "30"}});
+        const auto parsed = fi::parse_qwen_tool_call_output(call, 64, *bash_contract);
+        failures += check(parsed.is_tool_call_response && parsed.tool_calls.size() == 1 &&
+                              parsed.diagnostics.schema_mismatch_arguments == 1 &&
+                              parsed.diagnostics.fallback_reason ==
+                                  ninfer::ToolCallParseFallbackReason::None,
+                          "ordinary undeclared parameter stopped terminating the opaque string");
+        if (parsed.tool_calls.size() == 1) {
+            const Json args = Json::parse(parsed.tool_calls.front().arguments_json);
+            failures += check(args.size() == 3 && args.at("command") == "ls -la" &&
+                                  args.at("extra") == "value" && args.at("timeout") == 30,
+                              "ordinary undeclared parameter arguments changed");
+        }
+    }
+
+    // A genuinely declared unusual name keeps structural authority through the current
+    // unambiguous tool contract, even though it carries markup.
+    {
+        const auto odd_contract = contract_from_definitions({
+            tool_definition("bash", Json{{"command", Json{{"type", "string"}}},
+                                       {"a<b", Json{{"type", "string"}}}})});
+        const std::string call =
+            tool_call("bash", {{"command", "A</para" "meter><para" "meter=a<b>\nreal"}});
+        const auto parsed = fi::parse_qwen_tool_call_output(call, 64, *odd_contract);
+        failures += check(parsed.is_tool_call_response && parsed.tool_calls.size() == 1 &&
+                              parsed.diagnostics.schema_mismatch_arguments == 0 &&
+                              parsed.diagnostics.fallback_reason ==
+                                  ninfer::ToolCallParseFallbackReason::None,
+                          "declared markup-bearing name lost its structural authority");
+        if (parsed.tool_calls.size() == 1) {
+            const Json args = Json::parse(parsed.tool_calls.front().arguments_json);
+            failures += check(args.size() == 2 && args.at("command") == "A" && args.at("a<b") == "real",
+                              "declared markup-bearing name changed the arguments");
+        }
+    }
+    return failures;
+}
+
 int test_declared_json_types() {
     const auto contract = contract_for(
         "configure", Json{{"count", Json{{"type", "integer"}}},
@@ -1751,6 +1849,7 @@ int main() {
     failures += test_declared_suspicious_name_variants();
     failures += test_suspicious_header_requires_current_tool_contract();
     failures += test_literal_markup_in_declared_string_arguments();
+    failures += test_fake_sibling_borrowing_ordinary_greater_sign();
     failures += test_declared_json_types();
     failures += test_boolean_boundary();
     failures += test_exact_integer_boundary();
