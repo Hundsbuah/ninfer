@@ -43,22 +43,17 @@ bool StopControl::handle(StopEvent event, Clock::time_point now) {
         if (phase_ == Phase::Serving) { begin_stop_locked(false); }
         return true;
     }
+    // The stop already asked for confirmation: one more Ctrl+C exits.
+    if (phase_ == Phase::Stopping) {
+        exit_locked();
+        return true;
+    }
     if (!confirm_until_ || now > *confirm_until_) {
         confirm_until_ = now + kConfirmWindow;
         actions_.show(prompt_line_locked());
         return true;
     }
-    confirm_until_.reset();
-    if (phase_ == Phase::Serving) {
-        begin_stop_locked(true);
-        return true;
-    }
-    actions_.record({.severity = OperationalSeverity::Warning,
-                     .message  = std::string("Ctrl+C: exiting before the stop finished") +
-                                (saves_prefix_cache_ ? " | an unfinished prefix cache save is "
-                                                       "abandoned; the previous file is kept"
-                                                     : "")});
-    actions_.exit_now();
+    begin_stop_locked(true);
     return true;
 }
 
@@ -74,33 +69,51 @@ std::optional<StopControl::Clock::time_point> StopControl::expire(Clock::time_po
 void StopControl::begin_stop_locked(bool interrupt) {
     phase_ = Phase::Stopping;
     confirm_until_.reset();
-    actions_.record({.severity = OperationalSeverity::Info,
-                     .message  = std::string(interrupt ? "Ctrl+C: " : "") +
-                                "stopping | running and queued requests are cancelled" +
-                                (saves_prefix_cache_
-                                     ? " | Ctrl+C twice exits without saving the prefix cache"
-                                     : "")});
+    actions_.record(
+        {.severity = OperationalSeverity::Info,
+         .message  = std::string(interrupt ? "Ctrl+C: " : "") +
+                    "stopping | running and queued requests are cancelled" +
+                    (saves_prefix_cache_
+                         ? " | Press Ctrl+C again to exit without saving the prefix cache"
+                         : "")});
     actions_.show(resting_line_locked());
     // Only closes a socket and signals the Engine's worker; it does not wait.
     if (stop_server_) { stop_server_(); }
 }
 
-StopConsoleLine StopControl::prompt_line_locked() const {
-    if (phase_ == Phase::Serving) {
-        return {.text   = kWithin + (saves_prefix_cache_ ? "save the prefix cache and close"
-                                                         : "close"),
-                .prompt = true};
+void StopControl::exit_locked() {
+    std::string message = "Ctrl+C: exiting before the stop finished";
+    if (saves_prefix_cache_) {
+        const PrefixCacheSaveControl::Abandon result =
+            actions_.abandon_save ? actions_.abandon_save() : PrefixCacheSaveControl::Abandon::Unsaved;
+        switch (result) {
+        case PrefixCacheSaveControl::Abandon::Unsaved:
+            message = "Ctrl+C: exiting without saving the prefix cache | the previous file is kept";
+            break;
+        case PrefixCacheSaveControl::Abandon::Saved:
+            message += " | the prefix cache was already saved";
+            break;
+        case PrefixCacheSaveControl::Abandon::StillWriting:
+            message = "Ctrl+C: exiting without saving the prefix cache | the save did not stop in "
+                      "time, so its unfinished .tmp file may remain; the previous file is kept";
+            break;
+        }
     }
-    return {.text   = kWithin + (saves_prefix_cache_ ? "exit without saving the prefix cache"
-                                                     : "exit without waiting"),
+    actions_.record({.severity = OperationalSeverity::Warning, .message = std::move(message)});
+    actions_.exit_now();
+}
+
+StopConsoleLine StopControl::prompt_line_locked() const {
+    return {.text   = kWithin + (saves_prefix_cache_ ? "save the prefix cache and close" : "close"),
             .prompt = true};
 }
 
 StopConsoleLine StopControl::resting_line_locked() const {
     if (phase_ != Phase::Stopping) { return {}; }
     return {.text = saves_prefix_cache_
-                        ? "Closing: saving the prefix cache | Ctrl+C twice exits without saving"
-                        : "Closing | Ctrl+C twice exits at once"};
+                        ? "Closing: saving the prefix cache | Press Ctrl+C again to exit without "
+                          "saving"
+                        : "Closing | Press Ctrl+C again to exit at once"};
 }
 
 } // namespace ninfer::serve

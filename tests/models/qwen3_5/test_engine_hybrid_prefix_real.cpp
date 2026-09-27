@@ -12,6 +12,7 @@
 #include <exception>
 #include <filesystem>
 #include <iostream>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -162,8 +163,9 @@ int exercise_restore_exact(const char* artifact, ninfer::SpeculativeBackend back
 
 // A restarted Engine resumes from the Host tier its predecessor saved when stopped mid-generation:
 // the restored snapshot is the same bytes, so greedy generation matches an Engine that never
-// restarted. A file written for a different build identity is ignored, and a Host tier one slab
-// smaller than the file restores some but not all of its snapshots.
+// restarted. A file written for a different build identity is ignored, a Host tier one slab
+// smaller than the file restores some but not all of its snapshots, and an abandoned save keeps
+// the previous file and leaves no temporary one.
 int exercise_persist(const char* artifact) {
     const std::filesystem::path file =
         std::filesystem::temp_directory_path() / "ninfer-hybrid-persist-real-test.bin";
@@ -319,6 +321,55 @@ int exercise_persist(const char* artifact) {
             ++failures;
         }
         (void)engine.generate(engine.prepare_tokens(second), greedy(4));
+    }
+    // A Ctrl+C during ninfer-serve's stop abandons the save: the unfinished file is deleted and
+    // the previous file stays as it was, whether the save was writing or had not begun.
+    std::filesystem::path temporary = file;
+    temporary += ".tmp";
+    const auto unchanged = [&, bytes = std::filesystem::file_size(file),
+                            time = std::filesystem::last_write_time(file)] {
+        std::error_code error;
+        return !std::filesystem::exists(temporary, error) &&
+               std::filesystem::file_size(file, error) == bytes &&
+               std::filesystem::last_write_time(file, error) == time;
+    };
+    using Abandon = ninfer::PrefixCacheSaveControl::Abandon;
+    {
+        ninfer::EngineOptions writing = options("persist-test");
+        const ninfer::PrefixCacheSaveControl control = writing.context_cache.hybrid.persistent_save;
+        std::optional<Abandon> result;
+        {
+            ninfer::Engine engine(std::move(writing));
+            (void)engine.generate(engine.prepare_tokens(first), greedy(8));
+            std::thread interrupt([&] {
+                const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+                std::error_code error;
+                while (!std::filesystem::exists(temporary, error) &&
+                       std::chrono::steady_clock::now() < deadline) {}
+                result = control.abandon(std::chrono::seconds(5));
+            });
+            engine.stop();
+            interrupt.join();
+        }
+        if (result != Abandon::Unsaved || !unchanged()) {
+            std::cerr << "persist: a save abandoned while writing left its file or replaced the "
+                         "previous one\n";
+            ++failures;
+        }
+    }
+    {
+        ninfer::EngineOptions early = options("persist-test");
+        const ninfer::PrefixCacheSaveControl control = early.context_cache.hybrid.persistent_save;
+        Abandon result = Abandon::StillWriting;
+        {
+            ninfer::Engine engine(std::move(early));
+            (void)engine.generate(engine.prepare_tokens(first), greedy(8));
+            result = control.abandon(std::chrono::milliseconds(0));
+        }
+        if (result != Abandon::Unsaved || !unchanged()) {
+            std::cerr << "persist: a save abandoned before it began still wrote a file\n";
+            ++failures;
+        }
     }
     std::filesystem::remove(file, ignored);
     std::filesystem::remove(partial, ignored);

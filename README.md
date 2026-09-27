@@ -92,8 +92,8 @@ ninfer-serve.exe qwen3_8_27b_nvfp4-nvidia.ninfer --host 127.0.0.1 --port 8080 --
 
 Add `--prefix-cache-file PATH` to keep the prefix cache across restarts. Stop the server by
 pressing Ctrl+C twice (the first press shows a prompt at the bottom of the console). The server then
-cancels running and queued requests, saves the cache and exits; pressing Ctrl+C twice more exits
-without saving. `ninfer-serve.exe --help` lists every option by category.
+cancels running and queued requests, saves the cache and exits; pressing Ctrl+C once more exits
+without saving and deletes the unfinished file. `ninfer-serve.exe --help` lists every option by category.
 
 ## Quick start (Linux)
 

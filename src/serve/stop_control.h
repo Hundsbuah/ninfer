@@ -4,11 +4,13 @@
 // kConfirmWindow, shown on the console's transient bottom line, so one stray press never cancels
 // running requests. Ctrl+Break, closing the console window and SIGTERM stop at once. The stop
 // closes the listener and fails running and queued requests; the Engine then saves the prefix
-// cache (--prefix-cache-file). While that runs, a confirmed Ctrl+C exits at once and abandons it.
+// cache (--prefix-cache-file). While that runs, one more Ctrl+C abandons the save, whose
+// unfinished file the Engine deletes, and exits at once.
 //
 // This is the state machine only: platform code delivers events with the current time, calls
 // expire() when the pending deadline passes, and supplies the console and process actions.
 
+#include "ninfer/types.h"
 #include "serve/operational_log.h"
 
 #include <chrono>
@@ -36,6 +38,9 @@ struct StopConsoleLine {
 struct StopControlActions {
     std::function<void(const StopConsoleLine&)> show;
     std::function<void(const OperationalRecord&)> record;
+    // Abandons the Engine's prefix cache save before an early exit and waits, briefly, for its
+    // unfinished file to be deleted. Called only with a prefix cache file.
+    std::function<PrefixCacheSaveControl::Abandon()> abandon_save;
     // Ends the process at once; production never returns from it.
     std::function<void()> exit_now;
 };
@@ -67,6 +72,7 @@ private:
     enum class Phase : std::uint8_t { Inactive, Serving, Stopping };
 
     void begin_stop_locked(bool interrupt);
+    void exit_locked();
     [[nodiscard]] StopConsoleLine prompt_line_locked() const;
     [[nodiscard]] StopConsoleLine resting_line_locked() const;
 

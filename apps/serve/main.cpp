@@ -252,6 +252,9 @@ int main(int argc, char** argv) {
     // (redirected, or not a terminal) logs them instead.
     const std::shared_ptr<ninfer::product::TerminalProgress> console_line =
         logging.terminal_progress();
+    // Shares its state with the Engine's copy of the options, and outlives the Engine.
+    const ninfer::PrefixCacheSaveControl save_control =
+        options.context_cache.hybrid.persistent_save;
     StopControl stop_control(
         !options.context_cache.hybrid.persistent_file.empty(),
         {.show =
@@ -270,6 +273,9 @@ int main(int argc, char** argv) {
          .record = [&](const ninfer::serve::OperationalRecord& record) {
              operational_log.write(record);
          },
+         // The writer checks between slabs of a few MiB, so it lets go within milliseconds unless
+         // the disk stalls.
+         .abandon_save = [save_control] { return save_control.abandon(std::chrono::seconds(2)); },
          .exit_now =
              [&] {
                  logging.flush();

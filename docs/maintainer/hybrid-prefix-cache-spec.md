@@ -137,6 +137,7 @@ prompt tokens from cache but prefilled 5.02M tokens (994 s). It showed three pro
 | Prefetch of the blocked head's Host-only blocks | `d9b8d437` | §6.6 | admission Host restores −22 % (seed 42, 62.4 → 48.6 GB) and −25 % (seed 43, 68.4 → 51.3 GB), 10–11 GB prefetched per run; TTFT without queue wait −3 % and −6 %; decode rounds/s unchanged (57.8 vs 57.8, one request decoding) | kept |
 | Stop cancels running and queued requests before the save (`Engine::stop()`; `ninfer-serve` stops on Ctrl+C pressed twice within 5 s) | "fix(serve): stop on a confirmed Ctrl+C …" (2026-09-27) | §5.5 | a correctness fix, not A/B tested. The production log's stops at 07:48 and 07:54 left 10 and 3 requests unfinished and wrote no file: Ctrl+C waited silently for them and a second Ctrl+C killed the process. Console test, one streaming and one queued request: before, generation ran on 68.6 s after Ctrl+C; after, one press only prompts, and a confirmed pair fails both with 503 within 0.2 s, saves 99 blocks (503 MiB) in 0.1–0.2 s and exits about 0.7 s later | kept |
 | A Host tier smaller than the saved file restores its most valuable snapshots and only their paths (file format 3, tables before slab bytes), with a startup warning | "fix(prefix-cache): restore the most valuable snapshots …" (2026-09-27) | §5.5 | a correctness fix, not A/B tested. Format 2 restored every block before any snapshot, in file order, and still reported the file restored. For the production file (15,807 blocks and 98 snapshots of 91–92 slabs of 2.06 MiB, 49.97 GiB, saved at `--host-cache-mib 52000`), any tier below about 32,800 MiB filled with blocks and kept no snapshot, so nothing was resumable; between that and about 51,200 MiB the snapshots kept depended on file order | kept |
+| One Ctrl+C during the stop exits without saving and deletes the unfinished file (`PrefixCacheSaveControl`); the line reads `Press Ctrl+C again to exit without saving` | "fix(serve): one more Ctrl+C during the stop exits …" (2026-09-27) | §5.5 | a behavior change, not A/B tested. Before, leaving during the save needed another confirmed pair of presses, the console said `Ctrl+C twice exits without saving`, and `_Exit` left a partial `.tmp` of up to the Host tier's size beside the previous file until the next save | kept |
 
 Fix 3 was measured on top of the backfill proof. The build that combined all three against the
 base: at the 16 GB Host tier, prompt tokens prefilled −13.9 % (seed 42) and −2.7 % (seed 43), TTFT
@@ -515,9 +516,13 @@ directory, or `--host-cache-mib 0`, so an unusable location fails before any cac
   starts. `ninfer-serve` calls `stop()` on a confirmed Ctrl+C (a second press within 5 s,
   `serve/stop_control.h`), Ctrl+Break, `SIGTERM` or console close. Running and queued requests
   then fail as Unavailable at the next unit boundary instead of holding the stop until they
-  finish. Another confirmed Ctrl+C exits at once. The console-close handler blocks while `main`
-  unwinds, but Windows ends the process about 5 s after a close. Either way an unfinished save
-  leaves the previous file in place.
+  finish. One more Ctrl+C exits at once without saving: through the shared
+  `PrefixCacheSaveControl` (`HybridPrefixCacheOptions::persistent_save`) the save stops before
+  its next slab or before the rename, deletes its temporary file and ends, and `ninfer-serve`
+  waits up to 2 s for that before exiting. A save not yet begun never begins, and one still in
+  the Device drain is not waited for. The console-close handler blocks while `main` unwinds, but
+  Windows ends the process about 5 s after a close, which leaves the temporary file until the
+  next save. Either way an unfinished save leaves the previous file in place.
   `Program::shutdown_cleanup` releases every lane first, so requests still in flight write their
   committed blocks through, and saves before the cleanup drops the cache. Every Host write
   lands, then every retained (not superseded, §9.3) Host-resident snapshot whose anchor path is
@@ -1341,6 +1346,7 @@ struct HybridPrefixCacheOptions {                           // used only when mo
     std::optional<std::uint32_t> tap_min_gap_tokens;        // --cache-tap-min-gap
     std::filesystem::path persistent_file;                  // --prefix-cache-file (§5.5)
     std::string persistent_identity;                        // set by the product binary
+    PrefixCacheSaveControl persistent_save;                 // abandons the save (§5.5)
 };
 
 struct ContextCacheOptions {                  // existing struct, extended

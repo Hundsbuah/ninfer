@@ -210,9 +210,12 @@ public:
 
     // ---- persistence (hybrid_persist.cpp) -------------------------------------------------------
     // Writes every Host-backed snapshot and the block paths it anchors on to `path` (through a
-    // temporary file renamed into place). Requires no restore or write in flight.
+    // temporary file renamed into place). Requires no restore or write in flight. Once `abandoned`
+    // reports a request, at the latest after the slab being written, the temporary file is
+    // deleted and the previous file stays.
     [[nodiscard]] HybridPersistResult save(const std::filesystem::path& path,
-                                           std::string_view fingerprint) const;
+                                           std::string_view fingerprint,
+                                           const CancellationView& abandoned) const;
     // Rebuilds a saved Host tier into this empty cache when the file's fingerprint and geometry
     // match. A mismatch or damaged file loads nothing; a smaller Host tier restores the snapshots
     // it values most and only their paths, reading nothing else. Reading a file whose header
