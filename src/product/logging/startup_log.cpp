@@ -72,6 +72,10 @@ PhasePresentation phase_presentation(StartupPhase phase) noexcept {
         return {"pinning host KV", "host KV pinned", PhaseVisibility::Info, true, false};
     case StartupPhase::CudaGraphPrepare:
         return {"preparing CUDA graphs", "CUDA graphs ready", PhaseVisibility::Info, false, false};
+    case StartupPhase::PrefixCacheLoad:
+        // "read", not "loaded": a file damaged part way through still completes the phase, and
+        // the engine-ready summary reports whether the tier was restored.
+        return {"loading prefix cache", "prefix cache read", PhaseVisibility::Info, true, true};
     case StartupPhase::EngineFinalize:
         return {"finalizing engine", "engine finalized", PhaseVisibility::Debug, false, false};
     }

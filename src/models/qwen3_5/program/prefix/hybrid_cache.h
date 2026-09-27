@@ -209,8 +209,10 @@ public:
                                            std::string_view fingerprint) const;
     // Rebuilds a saved Host tier into this empty cache when the file's fingerprint and geometry
     // match. A mismatch or damaged file loads nothing; a smaller Host tier loads what fits.
+    // Reading a file whose header matches publishes StartupPhase::PrefixCacheLoad to `observer`.
     [[nodiscard]] HybridPersistResult load(const std::filesystem::path& path,
-                                           std::string_view fingerprint);
+                                           std::string_view fingerprint,
+                                           const StartupObserver& observer);
 
     // PrefixIndexBackend
     void release_device_block(std::uint32_t device_id) noexcept override;

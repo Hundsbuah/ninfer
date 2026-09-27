@@ -587,8 +587,9 @@ void Program::set_hybrid_coalesce_wait_limit(double seconds) {
 }
 
 HybridCachePersistence Program::attach_hybrid_cache_file(const std::filesystem::path& path,
-                                                         std::string fingerprint) {
-    return impl_->attach_hybrid_cache_file(path, std::move(fingerprint));
+                                                         std::string fingerprint,
+                                                         const StartupObserver& observer) {
+    return impl_->attach_hybrid_cache_file(path, std::move(fingerprint), observer);
 }
 
 std::optional<HybridCachePersistence> Program::hybrid_shutdown_save() const {

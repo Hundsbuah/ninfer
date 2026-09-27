@@ -212,8 +212,40 @@ int exercise_persist(const char* artifact) {
         std::cerr << "persist: the Engine did not save its Host tier\n";
         return 1;
     }
+    // The file read is published as one startup phase: the whole file, never a failure (a failed
+    // phase would be logged as a failed startup).
+    std::vector<ninfer::StartupEvent> load_events;
+    const auto observed = [&](const char* identity) {
+        load_events.clear();
+        ninfer::EngineOptions result      = options(identity);
+        result.startup_observer.callback = [&](const ninfer::StartupEvent& event) {
+            if (event.phase == ninfer::StartupPhase::PrefixCacheLoad) {
+                load_events.push_back(event);
+            }
+        };
+        return result;
+    };
     {
-        ninfer::Engine loader(options("persist-test"));
+        const std::uint64_t file_bytes = std::filesystem::file_size(file);
+        ninfer::Engine loader(observed("persist-test"));
+        bool monotonic = true;
+        for (std::size_t index = 1; index < load_events.size(); ++index) {
+            monotonic = monotonic && load_events[index].current >= load_events[index - 1].current &&
+                        load_events[index].current <= file_bytes;
+        }
+        if (load_events.size() < 2 ||
+            load_events.front().status != ninfer::StartupStatus::Begin ||
+            load_events.front().total != file_bytes ||
+            load_events.back().status != ninfer::StartupStatus::Complete ||
+            load_events.back().current != file_bytes || !monotonic ||
+            std::any_of(load_events.begin() + 1, load_events.end() - 1,
+                        [](const ninfer::StartupEvent& event) {
+                            return event.status != ninfer::StartupStatus::Progress;
+                        })) {
+            std::cerr << "persist: the file read was not published as one complete phase ("
+                      << load_events.size() << " events)\n";
+            ++failures;
+        }
         const ninfer::LoadSummary summary = loader.load_summary();
         const ninfer::GenerationResult resumed =
             loader.generate(loader.prepare_tokens(second), greedy(24));
@@ -235,8 +267,12 @@ int exercise_persist(const char* artifact) {
         }
     }
     {
-        ninfer::Engine foreign(options("another-build"));
+        ninfer::Engine foreign(observed("another-build"));
         const ninfer::LoadSummary summary = foreign.load_summary();
+        if (!load_events.empty()) {
+            std::cerr << "persist: a file from another build published a load phase\n";
+            ++failures;
+        }
         if (summary.prefix_cache.restored || summary.prefix_cache.message.empty() ||
             foreign.generate(foreign.prepare_tokens(second), greedy(4)).reused_prompt_tokens != 0) {
             std::cerr << "persist: a file from another build was not ignored\n";

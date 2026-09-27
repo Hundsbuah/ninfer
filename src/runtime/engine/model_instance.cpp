@@ -342,7 +342,7 @@ ConstructedModel construct_model(const EngineOptions& options, DeviceContext& de
         if (!file.empty()) {
             const models::qwen3_5::HybridCachePersistence loaded =
                 instance->program->attach_hybrid_cache_file(
-                    file, hybrid_cache_fingerprint(options, signature));
+                    file, hybrid_cache_fingerprint(options, signature), options.startup_observer);
             restore = LoadSummary::PrefixCacheRestore{
                 .attempted = true,
                 .restored  = loaded.ok,

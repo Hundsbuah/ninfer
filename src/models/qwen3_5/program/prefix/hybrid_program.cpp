@@ -150,10 +150,11 @@ HybridCachePersistence public_result(const HybridPersistResult& result) {
 } // namespace
 
 HybridCachePersistence ProgramImpl::attach_hybrid_cache_file(const std::filesystem::path& path,
-                                                             std::string fingerprint) {
+                                                             std::string fingerprint,
+                                                             const StartupObserver& observer) {
     if (!hybrid_) { return {.message = "the hybrid prefix cache is not enabled"}; }
     if (path.empty()) { throw std::invalid_argument("hybrid prefix cache file path is empty"); }
-    HybridCachePersistence loaded = public_result(hybrid_->load(path, fingerprint));
+    HybridCachePersistence loaded = public_result(hybrid_->load(path, fingerprint, observer));
     hybrid_file_                  = path;
     hybrid_fingerprint_           = std::move(fingerprint);
     return loaded;

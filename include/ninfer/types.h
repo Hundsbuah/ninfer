@@ -107,6 +107,7 @@ enum class StartupPhase : std::uint8_t {
     HostStatePin,
     HostKvPin,
     CudaGraphPrepare,
+    PrefixCacheLoad,
     EngineFinalize,
 };
 

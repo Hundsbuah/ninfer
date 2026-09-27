@@ -195,7 +195,8 @@ HybridPersistResult HybridPrefixCache::save(const std::filesystem::path& path,
 }
 
 HybridPersistResult HybridPrefixCache::load(const std::filesystem::path& path,
-                                            std::string_view fingerprint) {
+                                            std::string_view fingerprint,
+                                            const StartupObserver& observer) {
     HybridPersistResult out;
     const auto started = std::chrono::steady_clock::now();
     if (!host_tier()) {
@@ -211,6 +212,9 @@ HybridPersistResult HybridPrefixCache::load(const std::filesystem::path& path,
             "no saved prefix cache at " + path.string() + " yet; it is written at shutdown";
         return out;
     }
+    // Opened once the header matches, so a missing or foreign file shows only the reason it was
+    // not restored. A file damaged part way through completes it with the bytes that were read.
+    std::optional<StartupPhaseScope> phase;
     try {
         std::array<char, 8> magic{};
         reader.bytes(magic.data(), magic.size());
@@ -233,6 +237,9 @@ HybridPersistResult HybridPrefixCache::load(const std::filesystem::path& path,
             out.message = "saved prefix cache has a different Host geometry";
             return out;
         }
+        const std::uint64_t file_bytes = std::filesystem::file_size(path);
+        phase.emplace(observer, StartupPhase::PrefixCacheLoad, StartupProgressUnit::Bytes,
+                      file_bytes);
         const auto node_count     = reader.value<std::uint32_t>();
         const auto snapshot_count = reader.value<std::uint32_t>();
 
@@ -241,6 +248,7 @@ HybridPersistResult HybridPrefixCache::load(const std::filesystem::path& path,
         std::vector<std::optional<pc::NodeRef>> restored(node_count);
         std::array<TokenId, pc::kBlockTokens> tokens{};
         for (std::uint32_t index = 0; index < node_count; ++index) {
+            phase->progress(reader.read(), file_bytes);
             const auto parent = reader.value<std::int32_t>();
             const auto hash   = reader.value<std::uint64_t>();
             const auto extra  = reader.value<std::uint64_t>();
@@ -264,6 +272,7 @@ HybridPersistResult HybridPrefixCache::load(const std::filesystem::path& path,
             ++out.blocks;
         }
         for (std::uint32_t index = 0; index < snapshot_count; ++index) {
+            phase->progress(reader.read(), file_bytes);
             const auto anchor   = reader.value<std::int32_t>();
             const auto frontier = reader.value<std::uint32_t>();
             const auto tail_len = reader.value<std::uint32_t>();
@@ -303,7 +312,9 @@ HybridPersistResult HybridPrefixCache::load(const std::filesystem::path& path,
             reader.value<std::uint32_t>() != snapshot_count) {
             throw std::runtime_error("prefix cache file footer is damaged");
         }
+        phase->complete(reader.read());
     } catch (const std::exception& error) {
+        if (phase) { phase->complete(reader.read()); }
         // Partially restored entries may hold unread slab bytes: drop them all.
         clear();
         out         = HybridPersistResult{};

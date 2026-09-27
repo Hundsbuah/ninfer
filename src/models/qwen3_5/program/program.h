@@ -1126,9 +1126,10 @@ public:
     void set_hybrid_coalesce_wait_limit(double seconds);
     // Restores a saved Host tier before the first request and attaches the file, so
     // shutdown_cleanup saves the tier back to it. `fingerprint` names everything the saved bytes
-    // depend on.
+    // depend on; `observer` receives the file read as StartupPhase::PrefixCacheLoad.
     [[nodiscard]] HybridCachePersistence attach_hybrid_cache_file(const std::filesystem::path& path,
-                                                                  std::string fingerprint);
+                                                                  std::string fingerprint,
+                                                                  const StartupObserver& observer);
     [[nodiscard]] std::optional<HybridCachePersistence> hybrid_shutdown_save() const;
 
     [[nodiscard]] runtime::ProgramResourceRevision resource_revision() const noexcept;

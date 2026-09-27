@@ -701,7 +701,8 @@ public:
     }
 
     [[nodiscard]] HybridCachePersistence attach_hybrid_cache_file(const std::filesystem::path& path,
-                                                                  std::string fingerprint);
+                                                                  std::string fingerprint,
+                                                                  const StartupObserver& observer);
 
     [[nodiscard]] std::optional<HybridCachePersistence> hybrid_shutdown_save() const {
         return hybrid_shutdown_save_;

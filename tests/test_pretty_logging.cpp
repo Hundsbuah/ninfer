@@ -184,6 +184,16 @@ int main() {
                                .current       = 16ULL << 30,
                                .total         = 16ULL << 30,
                                .elapsed_ns    = 2'000'000'000});
+            observer.callback({.phase         = ninfer::StartupPhase::PrefixCacheLoad,
+                               .status        = ninfer::StartupStatus::Begin,
+                               .progress_unit = ninfer::StartupProgressUnit::Bytes,
+                               .total         = 24ULL << 30});
+            observer.callback({.phase         = ninfer::StartupPhase::PrefixCacheLoad,
+                               .status        = ninfer::StartupStatus::Complete,
+                               .progress_unit = ninfer::StartupProgressUnit::Bytes,
+                               .current       = 24ULL << 30,
+                               .total         = 24ULL << 30,
+                               .elapsed_ns    = 4'000'000'000});
             observer.callback({.phase      = ninfer::StartupPhase::EngineStartup,
                                .status     = ninfer::StartupStatus::Complete,
                                .elapsed_ns = 3'000'000'000});
@@ -196,10 +206,13 @@ int main() {
         startup_output = capture.finish();
     }
     failures += check(
-        line_count(startup_output) == 4 &&
+        line_count(startup_output) == 6 &&
             startup_output.find("starting engine") != std::string::npos &&
             startup_output.find("loading weights | 16.0 GiB") != std::string::npos &&
             startup_output.find("weights ready | 16.0 GiB | 2.0s | 8.00 GiB/s") !=
+                std::string::npos &&
+            startup_output.find("loading prefix cache | 24.0 GiB") != std::string::npos &&
+            startup_output.find("prefix cache read | 24.0 GiB | 4.0s | 6.00 GiB/s") !=
                 std::string::npos &&
             startup_output.find("engine ready | qwen3.6-27b | total 3.0s | weights 16.0 GiB") !=
                 std::string::npos &&

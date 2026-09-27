@@ -532,7 +532,9 @@ directory, or `--host-cache-mib 0`, so an unusable location fails before any cac
   are rebuilt Host-only, parents before children, without evicting anything: a smaller Host tier
   restores a prefix of the file, and its first requests restore blocks and images through the
   ordinary Host restore path. A damaged file loads nothing.
-- The startup log reports what was restored or why nothing was; the shutdown log reports the save.
+- The startup log shows the read of an accepted file as a progress phase (`loading prefix cache`,
+  then `prefix cache read | bytes | time | rate`), then reports what was restored or why nothing
+  was; the shutdown log reports the save.
 
 ---
 
