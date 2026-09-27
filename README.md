@@ -60,6 +60,13 @@ for creating NInfer!
 17. includes the fixes from a code audit (September 2026), among them a race that could let an
     aborted prefill write into another conversation's cached prefix, and an ngram index built off
     the engine worker (median time to first token 16 % lower on the agentic benchmark).
+18. includes upstream's September 2026 rewrite of every linear kernel (`e31bc99b`) with the fork's
+    decode tuning carried over on top: decode rounds are 2-4.5 % faster than upstream at 1 to 8
+    concurrent requests
+19. prefills 3-4.6 % faster on the NVIDIA NVFP4/FP8 artifact from 2048-token prompts with a
+    TMA-staged FP8 GEMM (upstream PR #167 by Michael Dementii)
+20. keeps what the next turns reuse in the hybrid cache's host tier and prefetches a waiting
+    request's host blocks (9 % fewer prompt tokens prefilled at a 52 GB host tier)
 
 I recommend using this with the NVIDIA NVFP4 artifact I’ve uploaded here, which runs a bit faster
 than the original artifact based on the Unsloth quant and takes up less VRAM:
@@ -109,12 +116,12 @@ file into the Linux filesystem first.
 
 ## Performance: this fork vs upstream
 
-Both benchmarks below compare this fork with **upstream + Windows port**: upstream at the commit
-this fork last merged (`bace20dc`) plus only the Windows port (commit `96da12bb` on the branch
-`ab/upstream-windows-port-bace20dc`). Everything ran on an RTX 5090 under Windows with the
-official Qwen3.8-27B NVFP4 artifact (`qwen3_8_27b_nvfp4-official.ninfer`).
+Both benchmarks below compare this fork (master `40a04df5`) with **upstream + Windows port**:
+upstream at the commit this fork last merged (`e31bc99b`) plus only the Windows port (commit
+`16b82280` on the branch `upstream-Windows-Port`). Everything ran on an RTX 5090 under Windows with
+the official Qwen3.8-27B NVFP4 artifact (`qwen3_8_27b_nvfp4-official.ninfer`), in September 2026.
 
-### Agentic coding workload (September 2026)
+### Agentic coding workload
 
 The closed-loop suite in [`bench/agentic_ab/`](bench/agentic_ab/README.md) replays three
 coding-agent sessions plus eleven subagents: 130 requests with fan-outs, a concurrent subagent
@@ -126,119 +133,125 @@ turns whatever its speed. Every arm completed every request on each of three wor
 
 Settings:
 
-- **Fork arms** (build `e36f7ee0`): the production launch flags, identical in both arms except
-  for the prefix cache. The hybrid-cache arm was then selected with `--use-alt-prefix-caching`;
-  today it is the default and the original-cache arm needs `--use-original-prefix-caching`. The
-  run also passed `--cuda-graph-allowance-mib 500`, an option since removed now that the
-  allowance is measured, and `--vram-headroom-mib` was then named `--kv-headroom-mib`.
-  `--fast-prefill-kernel` has since become the int8 default and was removed.
+- **Fork arm:** the launch flags of `LaunchQwen3.8-27B-official-dflash2-ngram.bat`:
 
   ```text
-  --max-context 160000 --max-concurrency 2 --spec dflash2 --draft-tokens 7 --lm-head-draft
-  --ngram-draft-tokens 15 --ngram-min-match 12 --kv-dtype int8 --fast-prefill-kernel
-  --preserve-thinking --host-cache-mib 52000 --pending-timeout-ms 900000 --prefill-chunk 4096
-  --kv-capacity auto --vram-headroom-mib 0 --ngram-archive-mib 2048 --ngram-session-mib 256
-  --ngram-native-sessions --default-thinking-budget 16384
-  --thinking-budget-message "Considering the limited time available to the user, I must stop
-  thinking now. Time to act:" --tolerant-tool-calls
+  --max-context 170000 --max-concurrency 2 --spec dflash2 --draft-tokens 7 --lm-head-draft
+  --ngram-draft-tokens 15 --ngram-min-match 12 --kv-dtype int8 --preserve-thinking
+  --host-cache-mib 52000 --pending-timeout-ms 900000 --prefill-chunk 4096 --kv-capacity auto
+  --vram-headroom-mib 0 --ngram-archive-mib 2048 --ngram-session-mib 256 --ngram-native-sessions
+  --default-thinking-budget 16384 --thinking-budget-message "Considering the limited time
+  available to the user, I must stop thinking now. Time to act:" --tolerant-tool-calls
   ```
 
 - **Upstream arm:** the same flags minus those upstream does not have, with the host RAM split
   the fork's original cache resolves from the same 52,000 MiB passed as explicit flags:
 
   ```text
-  --max-context 160000 --max-concurrency 2 --spec dflash2 --draft-tokens 7 --lm-head-draft
+  --max-context 170000 --max-concurrency 2 --spec dflash2 --draft-tokens 7 --lm-head-draft
   --kv-dtype int8 --preserve-thinking --pending-timeout-ms 900000 --prefill-chunk 4096
-  --kv-capacity auto --default-thinking-budget 16384 --host-state-slots 115 --host-kv-mib 30515
-  --max-private-continuations 4 --max-long-anchors-per-continuation 25 --max-shared-prefixes 7
+  --kv-capacity auto --default-thinking-budget 16384 --host-state-slots 123 --host-kv-mib 29020
+  --max-private-continuations 4 --max-long-anchors-per-continuation 27 --max-shared-prefixes 7
   ```
 
-- **Context:** 160,000 tokens, the largest context the upstream build starts with under these
-  flags. **Sampling:** temperature 1.0, top_p 0.95, top_k 20, `max_tokens: 64000` on agent turns.
+- **Context:** 170,000 tokens, the largest context the upstream build starts with under these
+  flags; at it the fork's device KV holds 228,288 tokens and upstream's 176,064. **Sampling:**
+  temperature 1.0, top_p 0.95, top_k 20, `max_tokens: 64000` on agent turns.
 
 Each cell is the mean over the three seeds, with the lowest and highest seed in brackets; changes
 are computed per seed against that seed's upstream run.
 
-| Metric | Upstream + Windows port | Fork, original cache | Fork, hybrid cache (default) |
-|---|---|---|---|
-| Average time to first token (s) | 15.7 (12.4-19.0) | 7.0 (6.6-7.7), −54 % | 3.3 (3.0-3.5), −78 % |
-| Median time to first token (s) | 10.0 (5.9-14.4) | 2.2 (1.8-2.8), −74 % | 0.8 (0.6-1.0), −90 % |
-| 90th-percentile time to first token (s) | 37.4 (31.9-47.3) | 21.3 (16.4-24.4), −40 % | 8.8 (7.0-9.8), −75 % |
-| Average TTFT, continuing-session turns (s) | 16.4 (12.7-20.1) | 6.9 (6.0-7.7), −57 % | 3.2 (2.9-3.5), −80 % |
-| Average TTFT, new long prompts (s) | 13.2 (12.8-13.6) | 11.9 (10.4-14.3), −10 % | 8.2 (8.1-8.4), −37 % |
-| Prompt tokens served from cache | 67.2 % (65.3-69.2) | 75.1 % (74.4-76.3) | 90.2 % (90.1-90.3) |
-| Prompt tokens prefilled | 1.93M (1.73-2.07) | 1.46M (1.35-1.53), −24 % | 0.56M (0.54-0.57), −71 % |
-| Main-session turns that re-prefilled the whole prompt (of 75) | 15 (10-19) | 11 (10-12) | 1 (1-1) |
-| Subagent turns that re-prefilled the whole prompt (of 37) | 25.7 (24-29) | 2 (1-3) | 0 |
-| Prefill tok/s, requests with no cache hit in any arm | 4,969 (4,765-5,130) | 6,050 (5,890-6,165), +22 % | 7,464 (7,363-7,526), +50 % |
-| Output tok/s, one request decoding | 185 (175-193) | 189 (186-191), +3 % | 209 (188-222), +13 % |
-| Decode rounds/s, one request decoding (engine speed) | 54.1 (53.5-54.6) | 54.0 (53.2-55.2), −0.2 % | 54.8 (54.4-55.3), +1.2 % |
-| Tokens per round, one request decoding (acceptance) | 3.41 (3.26-3.56) | 3.50 (3.45-3.56) | 3.82 (3.44-4.08) |
-| Output tok/s, two requests decoding (combined) | 315 (305-324) | 295 (290-303), −6 % | 314 (304-320), 0 % |
-| Decode rounds/s, two requests decoding (engine speed) | 51.4 (51.3-51.4) | 45.9 (45.0-46.6), −11 % | 47.8 (46.8-48.5), −7 % |
-| Output tok/s, all decoding at the run's own batching | 197 (186-203) | 234 (225-248), +19 % | 253 (247-257), +28 % |
-| Workload wall time (min) | 21.6 (19.9-23.1) | 18.0 (16.1-19.8), −17 % | 13.6 (12.6-15.1), −37 % |
+| Metric | Upstream + Windows port | Fork |
+|---|---|---|
+| Average time to first token (s) | 12.7 (11.2-14.9) | 2.7 (2.4-3.0), −78 % |
+| Median time to first token (s) | 7.62 (6.31-9.27) | 0.62 (0.51-0.68), −92 % |
+| 90th-percentile time to first token (s) | 32.3 (30.7-34.9) | 8.1 (7.9-8.2), −75 % |
+| Average TTFT, continuing-session turns (s) | 13.27 (11.74-15.44) | 2.60 (2.32-2.93), −80 % |
+| Average TTFT, new long prompts (s) | 12.8 (12.7-13.0) | 7.5 (7.4-7.6), −42 % |
+| Prompt tokens served from cache | 70.8 % (68.5-74.7) | 90.9 % (90.5-91.3) |
+| Prompt tokens prefilled | 1.68M (1.47-1.82) | 0.53M (0.51-0.55), −68 % |
+| Main-session turns that re-prefilled the whole prompt (of 75) | 13 (10-16) | 0 |
+| Subagent turns that re-prefilled the whole prompt (of 37) | 25.7 (19-32) | 0 |
+| Prefill tok/s, requests with no cache hit in any arm | 5,054 (5,024-5,095) | 7,769 (7,766-7,775), +54 % |
+| Prefill tok/s, the same requests from 32K tokens | 4,872 (4,840-4,917) | 7,612 (7,607-7,619), +56 % |
+| Output tok/s, one request decoding | 188 (177-197) | 216 (206-230), +15 % |
+| Decode rounds/s, one request decoding (engine speed) | 54.8 (54.4-55.0) | 56.4 (55.9-56.8), +2.9 % |
+| Tokens per round, one request decoding (acceptance) | 3.43 (3.22-3.58) | 3.82 (3.65-4.04) |
+| Output tok/s, two requests decoding (combined) | 327¹ | 337 (329-348) |
+| Decode rounds/s, two requests decoding (engine speed) | 54.3¹ | 50.1 (49.2-51.0) |
+| Decode rounds that ran two requests | 9.8 % (5.0-12.3) | 36.5 % (28.1-43.9) |
+| Output tok/s, all decoding at the run's own batching | 200 (184-211) | 258 (244-276), +29 % |
+| Workload wall time (min) | 19.7 (18.4-21.0) | 12.5 (11.9-13.2), −37 % |
 
-- Time to first token includes queueing: up to seven requests are in flight on two lanes, and
-  the average queue wait was 12.8 s / 4.7 s / 2.6 s.
+¹ Upstream decoded two requests together for 55 s and 45 s on two seeds and never on the third,
+too little for a range.
+
+- Time to first token includes queueing: up to seven requests are in flight on two lanes. The
+  average queue wait was 10.3 s upstream and 2.0 s on the fork, and without it the average time
+  to first token was 2.40 s and 0.71 s.
 - Output tok/s counts decode tokens per second of the engine's own decode time. It splits into
   decode rounds/s (engine speed) and tokens per round (speculative acceptance, which moves with
-  what the model happened to write). The fork's ngram drafting supplied 8-11 % of its output;
+  what the model happened to write). The fork's ngram drafting supplied 9-15 % of its output;
   upstream has none.
-- The two-request decode rows predate the concurrent decode fix (`824e5976`), and upstream
-  decoded two requests together for only 25-65 s per seed. The benchmark below measures
-  concurrent decode directly, after the fix.
+- With two requests decoding, the fork's rounds also carry ngram drafting for both, which costs
+  host time per round; upstream ran such rounds for under a minute per seed. The concurrent
+  decode benchmark below compares two-request decode without ngram drafting.
+- The same run also measured the fork's previous release (`21388ff2`, before this upstream
+  merge): the current fork finished the workload in 12.5 instead of 14.1 minutes, with an average
+  time to first token of 2.7 instead of 3.2 s and 6 % faster prefill on requests with no cache hit.
 
-### Concurrent decode (September 2026)
+### Concurrent decode
 
 The decode-saturation suite of `tools/bench/run_serve_concurrency.py` starts a fresh server at
 each `--max-concurrency` C and decodes C requests at once, each up to 8,192 tokens, with DFlash2
 K=7 and `--lm-head-draft` (no ngram drafting), stochastic sampling, `--max-context 32768
---kv-capacity auto`. The fork (with `824e5976`) and upstream alternated point by point in two
-passes, C=1 to 8 and back.
+--kv-capacity auto`. The builds alternated point by point in two passes, C=1 to 8 and back.
 
 | C | Upstream tok/s | Fork tok/s | Fork time per decode round vs upstream (pass 1, pass 2) |
 |---|---|---|---|
-| 1 | 169.6 | 173.6 | −3.4 %, −1.6 % |
-| 2 | 322.9 | 323.5 | −1.6 %, −1.6 % |
-| 3 | 433.5 | 440.8 | −0.9 %, −1.0 % |
-| 4 | 557.8 | 552.0 | −0.9 %, −0.8 % |
-| 5 | 653.2 | 659.3 | −1.2 %, −0.7 % |
-| 6 | 753.7 | 754.4 | −0.7 %, −0.7 % |
-| 7 | 835.9 | 846.6 | −0.9 %, −0.8 % |
-| 8 | 926.0 | 940.6 | −1.0 %, −0.7 % |
+| 1 | 187.9 | 184.2 | −2.8 %, −2.9 % |
+| 2 | 341.6 | 347.0 | −2.2 %, −2.2 % |
+| 3 | 479.7 | 500.9 | −3.1 %, −3.1 % |
+| 4 | 605.5 | 634.3 | −3.6 %, −3.5 % |
+| 5 | 701.7 | 745.3 | −4.4 %, −4.5 % |
+| 6 | 808.4 | 841.1 | −2.9 %, −2.9 % |
+| 7 | 917.5 | 928.6 | −2.9 %, −3.0 % |
+| 8 | 999.2 | 1016.2 | −3.1 %, −3.1 % |
 
 Tok/s is the mean of both passes. The fork's decode rounds are faster at every concurrency; tok/s
-also moves with speculative acceptance on the sampled text, which is why C=4 is lower despite
-faster rounds.
+also moves with speculative acceptance on the sampled text, which is why C=1 is lower despite
+faster rounds (3.00 against 3.15 tokens per round). The fork's previous release (`21388ff2`) took
+4-10 % longer per round than upstream + Windows port from C=2: upstream's unified linear kernels
+had overtaken the fork's older ones, and merging them with the fork's decode tuning on top put
+the fork ahead again.
 
 ### Running the benchmarks
 
 Commits: [`535fe58`][c-bench-agentic], [`e488da7`][c-bench-concurrency], [`5b297fb`][c-bench-ab].
 
-Build this fork, then the upstream control from the branch `ab/upstream-windows-port-bace20dc`
+Build this fork, then the upstream control from the branch `upstream-Windows-Port`
 ([details](bench/agentic_ab/README.md#running-it)); stop any other server on the port first:
 
 ```bat
 build_native.bat configure
 build_native.bat build
-git worktree add C:\ab\control\src ab/upstream-windows-port-bace20dc
+git worktree add C:\ab\control\src upstream-Windows-Port
 set AB_CONTROL_SRC=C:\ab\control\src
 set AB_CONTROL_BUILD=C:\ab\control\build
 bench\agentic_ab\build_control.bat configure
 bench\agentic_ab\build_control.bat build
 ```
 
-Agentic workload (about 2.7 hours for three arms on three seeds). The runner reads the model path
-and launch flags from `AB_LAUNCH_BAT`, calibrates
-the largest context the control starts with, and writes `report.md` under
-`profiles\bench\agentic_ab\`. `treatment` is the fork with its default hybrid cache, `alt` the fork
-with `--use-original-prefix-caching`, and `control` upstream:
+Agentic workload (about 1.6 hours for the two arms on three seeds). The runner reads the model
+path and launch flags from `AB_LAUNCH_BAT`, calibrates the largest context the control starts
+with, and writes `report.md` under `profiles\bench\agentic_ab\`. `treatment` is the fork and
+`control` upstream; an optional `alt` arm runs another build (`AB_ALT_EXE`) or the fork with
+other flags (`AB_ALT_EXTRA_FLAGS`, default `--use-original-prefix-caching`):
 
 ```bat
 set AB_CONTROL_EXE=C:\ab\control\build\apps\Release\ninfer-serve.exe
 set AB_LAUNCH_BAT=<a launch .bat with the fork flags above>
-py -3.11 bench\agentic_ab\runner.py --arms treatment,alt,control --seeds 42,43,44
+py -3.11 bench\agentic_ab\runner.py --arms treatment,control --seeds 42,43,44
 ```
 
 Concurrent decode, one call per build (repeat `--concurrency` to sweep, or alternate single-point
@@ -263,8 +276,10 @@ did.
 
 **Picking individual changes.** This fork's
 [history](https://github.com/Wallawalla47/ninfer-custom/commits/master) is one commit per change on
-top of upstream `bace20dc`, in dependency order, and each item below links to its commit. Each
-commit message lists the earlier commits it builds on, so a change can be cherry-picked into
+top of upstream `bace20dc`, in dependency order, then a merge of upstream `e31bc99b` followed by
+commits that carry fork changes onto the kernels upstream rewrote (see
+[Kept in sync with upstream](#kept-in-sync-with-upstream)). Each item below links to its commit.
+Each commit message lists the earlier commits it builds on, so a change can be cherry-picked into
 another fork together with those prerequisites.
 
 ### Hybrid prefix cache (the default)
@@ -297,6 +312,17 @@ The cache keeps the two apart and stores each as cheaply as it can
 - **Parallel requests with a new shared prefix prefill it once.** Later requests wait for the
   first one's snapshot where the prompts diverge. Four requests with a new 13.9K-token system
   prompt: mean time to first token 1.48 s instead of 3.52 s.
+- **Host eviction keeps what the next turns reuse.** Superseded conversation endpoints are
+  evicted first, and an entry is valued against the ancestors that stay cached, so the host tier
+  no longer keeps stale endpoints while dropping shared system/tools prefixes and fresh endpoints.
+  On the agentic workload at a 16 GB host tier: 10.8 % / 3.4 % fewer prompt tokens prefilled (two
+  seeds), main-session turns that re-prefilled the whole prompt 3 → 1.
+  Commit: [`39bc99c`][c-host-eviction].
+- **A request waiting for a lane prefetches its host-only blocks.** Its restores then no longer
+  happen at admission: host-to-GPU restores at admission −22 % / −25 %, time to first token
+  (excluding queue wait) −3 % / −6 %, decode speed unchanged. With both changes at the 52 GB
+  production tier: prompt tokens prefilled −9.2 %, workload wall time −7.8 %.
+  Commit: [`d9b8d43`][c-head-prefetch].
 - Everything except `--host-cache-mib` is derived from `--max-concurrency` and `--prefill-chunk`;
   `--device-snapshot-slots`, `--cache-taps-per-request`, `--cache-tap-ladder` and
   `--cache-tap-min-gap` are optional overrides.
@@ -391,15 +417,20 @@ BF16 KV.
   about 70 µs per round on Windows is now a kernel, and the engine no longer waits for the
   recurrent-state fold before preparing the next round. Output is unchanged token for token;
   greedy decode is 2.2-2.5 % faster per round (DFlash2 K=7, 16K and 60K context). Ideas tried and
-  dropped are in [`RESEARCH_NOTES.md`](RESEARCH_NOTES.md).
-  Commit: [`710673d`][c-pdl].
+  dropped are in [`RESEARCH_NOTES.md`](RESEARCH_NOTES.md). On upstream's unified linear kernels
+  the same call sites launch as dependents; every other launch stays serialized as upstream has
+  it.
+  Commits: [`710673d`][c-pdl], [`03e3a9b`][c-pdl-unified].
 - **Decode kernels sized for verification widths.** Measured one change at a time with DFlash2
   K=7 decode saturation on the NVIDIA NVFP4 artifact, as time per round at 1/2/4/8 concurrent
   requests: narrower four-stage tiles for the N=5120 FP8 residual projections up to 128 tokens
-  (`216ecc7a`) take 0/0/-7.6/-6.4 %; a third pipeline stage for the NVFP4 down projection
-  (`57be0068`) takes -1.4/-1.2/-1.1/-0.9 %; sharing each staged activation across two 16-row
-  tiles in the FP8 head and Q8 DFlash2 drafter K-splits (`07f2bad2`) takes 0/0/-0.9/-0.2 %.
-  Perplexity is unchanged bit for bit.
+  take 0/0/-7.6/-6.4 %; a third pipeline stage for the NVFP4 down projection takes
+  -1.4/-1.2/-1.1/-0.9 %; sharing each staged activation across two 16-row tiles in the FP8 head
+  and Q8 DFlash2 drafter K-splits takes 0/0/-0.9/-0.2 %. Perplexity is unchanged bit for bit.
+  All three now sit on upstream's unified templates. With the third stage, the NVFP4 linear_add
+  also takes the A4 route from 8 tokens at K=6144, where upstream starts it at 17 (21.1 µs
+  against 23.1-31.3 µs on the A16 route at 8-16 tokens).
+  Commits: [`c0f6b8e`][c-fp8-narrow], [`be00419`][c-nvfp4-stages], [`410eb4b`][c-row-tiles].
 - **Ngram copy drafting with more than one concurrent request.** Ngram drafting proposes the next
   tokens by copying matching text from earlier in the context, alongside MTP/DFlash/DFlash2. The
   single-request version is the original work of [remesis](https://github.com/remesis) in the
@@ -414,15 +445,23 @@ BF16 KV.
 - **Short prefill steps over long contexts use split-KV attention**: 32 new tokens against 180K
   cached tokens take 1.06 ms per attention layer instead of 9.5 ms.
   Commit: [`c1a59aa`][c-small-prefill].
-- **Kernel tuning from upstream PRs:** the fused SwiGLU TMA partial tile (#264), sigmoid gate in
-  the causal reduce (#268) and text `rmsnorm_rope` route (#273), by Michael Dementii; tuned Q6
-  34,816×5120 dispatch (#284, [bingchengcc](https://github.com/bingchengcc)); Q5 linear K-split
-  sized to the token count (#292, [giveen](https://github.com/giveen)); and, adapted from
+- **TMA-staged FP8 prefill GEMM** (upstream PR #167 by Michael Dementii, carried onto upstream's
+  unified FP8 template): the FP8 A8 projections of the attention and GDN inputs and the output
+  projections run a 256-token tile fed by TMA from 1024 tokens where its cost model favours it,
+  and from 2048 tokens always. Prefill on the NVIDIA NVFP4/FP8 artifact is 3-4.6 % faster from
+  2048-token prompts (3.1-3.5 % at 32K). Its results equal those of the existing kernel's
+  partial-tile path bit for bit.
+  Commit: [`64a4e4f`][c-fp8-tma].
+- **Kernel tuning from upstream PRs:** the sigmoid gate in the causal reduce (#268) and text
+  `rmsnorm_rope` route (#273), by Michael Dementii; a Q6 34,816×5120 shape for the fused MLP
+  gate_up (#284, [bingchengcc](https://github.com/bingchengcc)); and, adapted from
   [llmq](https://github.com/IST-DASLab/llmq) (IST-DASLab, Erik Schultheis) by
   [DuncanBetts](https://github.com/DuncanBetts), a fused NVFP4 RMSNorm + quantise for the attention
-  input projection (#305) and a single-pass target log-probability kernel (#307).
-  Commits: [`322427b`][c-pr264], [`39a8890`][c-pr268], [`9e364fc`][c-pr273], [`7c22a71`][c-pr284],
-  [`0674560`][c-pr292], [`27436f5`][c-pr305], [`ae604a8`][c-pr307].
+  input projection (#305) and a single-pass target log-probability kernel (#307). #284 and #305
+  now run on upstream's unified Q6 and NVFP4 A4 TMA kernels.
+  Commits: [`39a8890`][c-pr268], [`9e364fc`][c-pr273], [`7c22a71`][c-pr284],
+  [`05c15f3`][c-pr284-unified], [`27436f5`][c-pr305], [`5b444b1`][c-pr305-a4],
+  [`ae604a8`][c-pr307].
 
 ### Tool calls and reasoning output
 
@@ -501,7 +540,7 @@ BF16 KV.
   scale-search method for groupwise quantisation.
   Commits: [`7c22a71`][c-pr284], [`bd592af`][c-grouped-mse].
 - **Q8 MTP** and a **general BF16 GEMM fallback** for shapes without a dedicated kernel.
-  Commits: [`43af79f`][c-q8-mtp], [`795466e`][c-bf16-gemm].
+  Commits: [`43af79f`][c-q8-mtp], [`66dd62a`][c-q8-mtp-unified], [`795466e`][c-bf16-gemm].
 - **`--rope-yarn-factor F`** for YaRN context extension (F from 1 to 4, up to 1M tokens of context).
   Commit: [`0860e8d`][c-yarn].
 - **`--vision-offload on`** keeps the vision tower in pinned system RAM instead of VRAM and streams
@@ -571,8 +610,9 @@ the ones that were wrong or not worth their cost, and fixed these:
   up the other lane's decode, for about 13 ms on the preparing thread. Proposals are identical.
   Commit: [`4bb7844`][c-ngram-index].
 - **Checkpoints with another RoPE theta or RMSNorm epsilon** no longer get the fused q/k kernel's
-  built-in 1e7 and 1e-6 at widths up to 256 tokens, which include every decode step. Shipped
-  Qwen3.x artifacts use both values and are unaffected.
+  built-in 1e7 and 1e-6; that kernel then served widths up to 256 tokens, which include every
+  decode step, and now serves every width. Shipped Qwen3.x artifacts use both values and are
+  unaffected.
   Commit: [`0f5b953`][c-rope-guard].
 - **`--fast-prefill-kernel` required `--kv-dtype int8`** and startup said so; with another KV
   format it used to shrink the prefill chunk to 3584 for a kernel that never ran. INT8 KV now takes
@@ -610,10 +650,55 @@ Checked against the previous master (`600d8ac9`) on the RTX 5090 with the produc
 All unit and GPU tests pass on Windows (139) and on Linux under WSL2 (143), and so do the
 real-model tests on Windows.
 
+A second pass took the lower-value findings:
+
+- **Faster attention and q/k normalisation.** Batched decode verification applies the attention
+  output gate in the chunked small-T reduce instead of a separate launch (-3.9 / -2.9 / -1.2 % per
+  full-attention layer at 2 / 4 / 8 requests). The fused text q/k RMSNorm + RoPE computes each
+  rotary coefficient pair once per head (-9 to -19 %) and serves every width instead of stopping
+  at 256 tokens, which makes it 14-22 % faster than the three separate calls at the 3584-token
+  prefill chunk. Output is bit-identical.
+  Commits: [`74fb70a`][c-gate-small-t], [`2d3f48f`][c-rope-sincos], [`3cb2be3`][c-rope-width].
+- **Less work on the Engine worker.** Ngram proposals from the archive test a contiguous probe
+  per source and stop at a match nothing later can beat (4.7-5.1 µs instead of 12.3-14.3 µs on a
+  hit, identical proposals), and the hybrid cache's chained block keys are computed once, on the
+  request's own thread while the prompt is prepared, instead of on every quote and again at
+  staging.
+  Commits: [`72a64d8`][c-ngram-probe], [`edb7d5b`][c-block-keys].
+- **Fixes.** A workspace scope opened before an arena reset no longer rolls the next phase's
+  allocations back; finishing a hybrid lane checks that its KV can be released before the cache
+  takes its endpoint image, where a failed release used to terminate the process; Anthropic
+  `count_tokens` and Responses `input_tokens` requests are bounded like generation requests; and
+  tests settle the default stream after writing their buffers (a rare ngram test failure). The
+  serving guide describes how worker failures end.
+  Commits: [`8e6c8de`][c-arena-generation], [`477c798`][c-lane-release], [`c005b5e`][c-count-bound],
+  [`9f879de`][c-test-stream], [`bd254bf`][c-dflash-test], [`08cae72`][c-worker-failures].
+
+This pass also moved the NVFP4 SwiGLU prefill kernel's start to 1440 tokens and removed a fence
+from the NVFP4 TMA linear kernel; upstream's rewritten NVFP4 kernels replaced both (see below).
+
 ### Kept in sync with upstream
 
-Upstream `master` is merged regularly. Once upstream adopts a change listed above, it is removed
-from this README.
+Upstream `master` is merged regularly; the latest merge is `e31bc99b` (September 2026). Once
+upstream adopts a change listed above, it is removed from this README.
+
+Where upstream rewrote code that this fork had changed, the merge takes upstream's version and
+later commits carry the fork's change over to it, so every fork change stays a commit ahead of
+upstream. The merge of `e31bc99b` is the largest so far: upstream replaced every per-format linear
+kernel (Q4, Q5, Q6, Q8, FP8, NVFP4, BF16) with unified templates, reworked GDN prefill into two
+stages and added KDA. On top of it:
+
+- the Windows build stages the descriptors of upstream's new TMA kernels
+  ([`67462ef`][c-merge-windows]);
+- programmatic dependent launches return at the fork's call sites ([`03e3a9b`][c-pdl-unified]);
+- the decode-width tuning, the fused attention RMSNorm + NVFP4 quantize (#305), the Q8 MTP shape
+  and the Q6 gate_up shape (#284) are ported to the new templates (listed with each change above);
+- fork kernels that upstream's templates made redundant are removed
+  ([`c1313e2`][c-q5-dead]).
+
+Replaced by upstream and dropped, because upstream's kernels measured faster: the fused SwiGLU TMA
+partial last tile (#264), the Q5 K-split ladder (#292) and the fork's NVFP4 prefill routing.
+Prefill runs 3-6 % faster than the fork's own kernels did at 300 to 32,768-token prompts.
 
 ## Model artifacts
 
@@ -670,11 +755,9 @@ well, and for the work this branch builds on.
 [c-ngram-concurrency]: https://github.com/Wallawalla47/ninfer-custom/commit/39498066667393102b846dd1e17686958499ae65
 [c-concurrent-prefill]: https://github.com/Wallawalla47/ninfer-custom/commit/651f4a92a6bed98b89fef2f8b09cc5e5d4654997
 [c-small-prefill]: https://github.com/Wallawalla47/ninfer-custom/commit/c1a59aaa3db63b0a6800d03cbdd283ebd63fff6b
-[c-pr264]: https://github.com/Wallawalla47/ninfer-custom/commit/322427b29749085f79e5557b5e4f8cee8c42022e
 [c-pr268]: https://github.com/Wallawalla47/ninfer-custom/commit/39a8890ebeaa6a31f87fcf7a7ba6afe4217fd571
 [c-pr273]: https://github.com/Wallawalla47/ninfer-custom/commit/9e364fcb899359734dee217fafb065c690fc06ae
 [c-pr284]: https://github.com/Wallawalla47/ninfer-custom/commit/7c22a714bdf53c22bb2325bae150b12b5352eee3
-[c-pr292]: https://github.com/Wallawalla47/ninfer-custom/commit/067456056d9700dc95208280aff499a5f73276dd
 [c-pr305]: https://github.com/Wallawalla47/ninfer-custom/commit/27436f5fdc9e9683ee908e2a4890756e97de1c11
 [c-pr307]: https://github.com/Wallawalla47/ninfer-custom/commit/ae604a86468ea46180f313235b860cfee99aaa6d
 [c-xml-tools]: https://github.com/Wallawalla47/ninfer-custom/commit/84fcf17acb9c794e5719dbbbfa8604f46b1fbaeb
@@ -732,6 +815,29 @@ well, and for the work this branch builds on.
 [c-graph-test]: https://github.com/Wallawalla47/ninfer-custom/commit/a085261ea61c5d6db0b673853a9391022eae10b4
 [c-wrap-skip]: https://github.com/Wallawalla47/ninfer-custom/commit/abe5ffeae7fa6f4256615664da784523206d6bda
 [c-runner-flags]: https://github.com/Wallawalla47/ninfer-custom/commit/dfba788e91eb9af4e9d882891c01652c587539b4
+[c-pdl-unified]: https://github.com/Wallawalla47/ninfer-custom/commit/03e3a9b2d8387a1257486e6902afffeda5dea527
+[c-fp8-narrow]: https://github.com/Wallawalla47/ninfer-custom/commit/c0f6b8e12c93767fa359d833373108c891c406f2
+[c-nvfp4-stages]: https://github.com/Wallawalla47/ninfer-custom/commit/be00419e1f418a855601f0ebc30713f3230f22ab
+[c-pr284-unified]: https://github.com/Wallawalla47/ninfer-custom/commit/05c15f38638b571c33fee21f109898d19c208696
+[c-pr305-a4]: https://github.com/Wallawalla47/ninfer-custom/commit/5b444b1768879615424384a6b306251fdac438de
+[c-q8-mtp-unified]: https://github.com/Wallawalla47/ninfer-custom/commit/66dd62a17572524b0e6fafa9cbc79d013b94f471
+[c-merge-windows]: https://github.com/Wallawalla47/ninfer-custom/commit/67462efcfc4de9647fa793092bd82b8e729001ff
+[c-q5-dead]: https://github.com/Wallawalla47/ninfer-custom/commit/c1313e23ec2b2d3d125e52b0733b72c82b266670
+[c-gate-small-t]: https://github.com/Wallawalla47/ninfer-custom/commit/74fb70ae7b2ec7648df00bffd808a1027b654d9b
+[c-rope-sincos]: https://github.com/Wallawalla47/ninfer-custom/commit/2d3f48f6997ef6cb6b145e7a1dbf60cccbf72055
+[c-rope-width]: https://github.com/Wallawalla47/ninfer-custom/commit/3cb2be3977dfe1714d4a5ccef35b980e353c0f56
+[c-ngram-probe]: https://github.com/Wallawalla47/ninfer-custom/commit/72a64d887e8f64c6f0a0f1aca5294dfae0406720
+[c-block-keys]: https://github.com/Wallawalla47/ninfer-custom/commit/edb7d5b3220729dae5dcc66b0158e634334c88f9
+[c-arena-generation]: https://github.com/Wallawalla47/ninfer-custom/commit/8e6c8de65cd9b2bce6e0fbb53db32853b7aa4503
+[c-lane-release]: https://github.com/Wallawalla47/ninfer-custom/commit/477c79897d54420e44d8e16b0057e120d287690c
+[c-count-bound]: https://github.com/Wallawalla47/ninfer-custom/commit/c005b5eaf6d568816c94179cfa939cb9ba4c4aaa
+[c-test-stream]: https://github.com/Wallawalla47/ninfer-custom/commit/9f879de18ffd367be17ca3e63d27a87bb5bb913a
+[c-dflash-test]: https://github.com/Wallawalla47/ninfer-custom/commit/bd254bf05c276d9055af59412147341dce2e9057
+[c-worker-failures]: https://github.com/Wallawalla47/ninfer-custom/commit/08cae7273e61504c51486c0aab713a7595b1f8e4
+[c-row-tiles]: https://github.com/Wallawalla47/ninfer-custom/commit/410eb4bfd7479cc51a554aca318dc2fdd193ca83
+[c-host-eviction]: https://github.com/Wallawalla47/ninfer-custom/commit/39bc99c488925b1bb508bba63a2e6c69fd49e6f3
+[c-head-prefetch]: https://github.com/Wallawalla47/ninfer-custom/commit/d9b8d437ca2d1269cf14be9588c1caed7e5aa3c3
+[c-fp8-tma]: https://github.com/Wallawalla47/ninfer-custom/commit/64a4e4f486f0c7ae31c1a21166472d8d0a2fdbe0
 
 ---
 
@@ -739,7 +845,7 @@ well, and for the work this branch builds on.
 
 Everything below is a copy of the upstream
 [NInfer README](https://github.com/Neroued/ninfer/blob/master/README.md) as of the latest upstream
-sync (`bace20dc` on `origin/master`), unchanged except for one added link to the fork's
+sync (`e31bc99b` on `origin/master`), unchanged except for one added link to the fork's
 [ngram copy proposals](docs/ngram.md) guide.
 
 # NInfer
