@@ -971,7 +971,7 @@ more than ten have completed, one over the last ten:
 | TTFT | mean time to first token |
 | cached | prefix-cache hit tokens / prompt tokens |
 | prefill | computed (non-cached) prompt tokens / prefill seconds, in tok/s |
-| decode | output tokens after the first / decode seconds, in tok/s (per-request rate, not batch throughput) |
+| decode | aggregate decode throughput in tok/s: output tokens after the first / decode seconds, where each batched decode round's time is split across the requests in it, so concurrent requests add up rather than each showing its per-stream rate |
 | `<DRAFTER>`, acc/rnd | model-drafter (MTP or DFlash) accepted / drafted tokens, and accepted tokens per model-drafted round; n-gram rounds are excluded |
 | ngram, ng rnds | n-gram accepted / drafted tokens and verification rounds |
 | archive | n-gram archive accepted / drafted tokens, shown once the archive has drafted |

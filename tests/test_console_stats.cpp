@@ -31,6 +31,7 @@ GenerationOutcome outcome(int prompt, std::uint32_t cache_hit, int completion, d
     result.metrics.ttft_seconds            = ttft;
     result.metrics.prefill_seconds         = prefill_seconds;
     result.metrics.decode_seconds          = decode_seconds;
+    result.metrics.decode_share_seconds    = decode_seconds;
     return result;
 }
 
@@ -87,6 +88,17 @@ int main() {
                       "prefill rate must pair tokens only with requests that ran prefill");
     failures += check(totals.sum.decode_tokens == 30 && totals.sum.decode_seconds == 1.5,
                       "decode rate must pair tokens only with requests that ran decode");
+
+    // Two requests decoding in the same batched rounds each see 1 s of per-stream decode time but
+    // own half of it; the panel rate is their combined throughput, not either stream's rate.
+    ConsoleStatsTotals batched;
+    for (int index = 0; index < 2; ++index) {
+        GenerationOutcome lane             = outcome(10, 0, 51, 0.1, 0.01, 1.0);
+        lane.metrics.decode_share_seconds  = 0.5;
+        batched.add(make_console_request_sample(lane));
+    }
+    failures += check(batched.sum.decode_tokens == 100 && batched.sum.decode_seconds == 1.0,
+                      "decode rate must count each shared batched round once");
 
     ConsoleStatsSnapshot snapshot;
     snapshot.completed           = 1;

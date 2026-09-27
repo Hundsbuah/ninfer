@@ -125,11 +125,12 @@ ConsoleRequestSample make_console_request_sample(const GenerationOutcome& outcom
         .computed_prefill_tokens = saturating_sub(prompt_tokens, cache_hit_tokens),
         .prefill_seconds         = metrics.prefill_seconds,
         // The first output token comes from prefill; the decode rate covers the rest, as the
-        // request-done record does.
+        // request-done record does. The time is this request's share of each batched decode unit,
+        // so the summed rate is aggregate throughput, not the per-stream rate the record prints.
         .decode_tokens  = outcome.completion_tokens > 0
                               ? static_cast<std::uint64_t>(outcome.completion_tokens - 1)
                               : 0,
-        .decode_seconds = metrics.decode_seconds,
+        .decode_seconds = metrics.decode_share_seconds,
         .model_rounds   = saturating_sub(metrics.speculative_rounds, metrics.ngram_rounds),
         .model_drafted_tokens =
             saturating_sub(metrics.speculative_draft_tokens, metrics.ngram_drafted_tokens),
