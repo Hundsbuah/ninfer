@@ -2,6 +2,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <array>
 #include <initializer_list>
 #include <iostream>
 #include <memory>
@@ -69,8 +70,9 @@ tool_call(std::string_view tool_name,
 }
 
 int check_rejected(const std::string& text, const fi::ToolCallOutputContract& contract,
-                   ninfer::ToolCallParseFallbackReason reason, std::string_view message) {
-    const auto parsed = fi::parse_qwen_tool_call_output(text, 64, contract);
+                   ninfer::ToolCallParseFallbackReason reason, std::string_view message,
+                   bool tolerant = false) {
+    const auto parsed = fi::parse_qwen_tool_call_output(text, 64, contract, tolerant);
     return check(!parsed.is_tool_call_response && parsed.content == text &&
                      parsed.tool_calls.empty() && parsed.diagnostics.marker_seen &&
                      parsed.diagnostics.fallback_reason == reason,
@@ -421,15 +423,18 @@ int test_parameter_opener_grammar_is_shared() {
         failures += check_rejected(
             malformed_parameter, contract, ninfer::ToolCallParseFallbackReason::MalformedStructure,
             tolerant ? "tolerant accepted a prefix-collision parameter opener"
-                     : "prefix-collision parameter opener was accepted");
+                     : "prefix-collision parameter opener was accepted",
+            tolerant);
         failures += check_rejected(
             malformed_short, contract, ninfer::ToolCallParseFallbackReason::MalformedStructure,
             tolerant ? "tolerant accepted a short prefix-collision parameter opener"
-                     : "short prefix-collision parameter opener was accepted");
+                     : "short prefix-collision parameter opener was accepted",
+            tolerant);
         failures += check_rejected(
             empty_name, contract, ninfer::ToolCallParseFallbackReason::MalformedStructure,
             tolerant ? "tolerant accepted a nameless parameter opener"
-                     : "nameless parameter opener was accepted");
+                     : "nameless parameter opener was accepted",
+            tolerant);
     }
 
     // Properly delimited forms are parameter openers for both stages: a literal close
@@ -670,6 +675,83 @@ int test_suspicious_header_requires_current_tool_contract() {
         failures += check(
             Json::parse(parsed_ambiguous.tool_calls.front().arguments_json) == expected,
             "an ambiguous contract granted structural authority to a contaminated header");
+    }
+    return failures;
+}
+
+int test_literal_markup_in_declared_string_arguments() {
+    // The real-world failure that exposed this bug class: a coding agent emits literal
+    // tool-call markup (a fake sibling whose unterminated opener swallowed a function
+    // close) inside a declared string argument. The embedded markers must remain value
+    // bytes: no early termination, no synthetic parameter, no synthetic boundary, no
+    // fallback reason, no demotion to text. Verified for the write.content and
+    // bash.command shapes, in strict and tolerant mode, and in the streaming decoder.
+    const std::string literal = "A</para" "meter><para" "meter=X\nB</func" "tion>\nC";
+    const auto write_contract = contract_from_definitions({
+        tool_definition("write", Json{{"content", Json{{"type", "string"}}},
+                                      {"path", Json{{"type", "string"}}}})});
+    const auto bash_contract = contract_from_definitions({
+        tool_definition("bash", Json{{"command", Json{{"type", "string"}}},
+                                   {"timeout", Json{{"type", "integer"}}}})});
+    const std::string write_call =
+        tool_call("write", {{"content", literal}, {"path", "test.cpp"}});
+    const std::string bash_call = tool_call("bash", {{"command", literal}, {"timeout", "30"}});
+
+    int failures = 0;
+    for (const bool tolerant : {false, true}) {
+        const auto write_parsed =
+            fi::parse_qwen_tool_call_output(write_call, 64, *write_contract, tolerant);
+        failures += check(write_parsed.is_tool_call_response && write_parsed.tool_calls.size() == 1 &&
+                              write_parsed.tool_calls.front().name == "write",
+                          "literal markup in write.content demoted the call to text");
+        if (write_parsed.is_tool_call_response && write_parsed.tool_calls.size() == 1) {
+            const Json args = Json::parse(write_parsed.tool_calls.front().arguments_json);
+            failures += check(args.size() == 2 && args.at("content") == literal &&
+                                  args.at("path") == "test.cpp",
+                              "literal markup in write.content changed the arguments");
+            failures += check(write_parsed.diagnostics.fallback_reason ==
+                                  ninfer::ToolCallParseFallbackReason::None,
+                              "literal markup in write.content reported a fallback reason");
+
+            fi::ToolCallOutputDecoder write_decoder(
+                std::make_shared<const fi::ToolCallOutputContract>(*write_contract), 64, tolerant);
+            std::string visible;
+            for (std::size_t offset = 0; offset < write_call.size(); offset += 7) {
+                visible += write_decoder.feed(std::string_view(write_call).substr(offset, 7));
+            }
+            const auto terminal = write_decoder.finish();
+            failures += check(visible.empty() && terminal.content.empty() &&
+                                  terminal.tool_calls.size() == 1 &&
+                                  Json::parse(terminal.tool_calls.front().arguments_json) == args,
+                              "chunked write.content literal markup diverged from one-shot");
+        }
+
+        const auto bash_parsed =
+            fi::parse_qwen_tool_call_output(bash_call, 64, *bash_contract, tolerant);
+        failures += check(bash_parsed.is_tool_call_response && bash_parsed.tool_calls.size() == 1 &&
+                              bash_parsed.tool_calls.front().name == "bash",
+                          "literal markup in bash.command demoted the call to text");
+        if (bash_parsed.is_tool_call_response && bash_parsed.tool_calls.size() == 1) {
+            const Json args = Json::parse(bash_parsed.tool_calls.front().arguments_json);
+            failures += check(args.size() == 2 && args.at("command") == literal &&
+                                  args.at("timeout") == 30,
+                              "literal markup in bash.command created a synthetic parameter");
+            failures += check(bash_parsed.diagnostics.fallback_reason ==
+                                  ninfer::ToolCallParseFallbackReason::None,
+                              "literal markup in bash.command reported a fallback reason");
+
+            fi::ToolCallOutputDecoder bash_decoder(
+                std::make_shared<const fi::ToolCallOutputContract>(*bash_contract), 64, tolerant);
+            std::string visible;
+            for (std::size_t offset = 0; offset < bash_call.size(); offset += 7) {
+                visible += bash_decoder.feed(std::string_view(bash_call).substr(offset, 7));
+            }
+            const auto terminal = bash_decoder.finish();
+            failures += check(visible.empty() && terminal.content.empty() &&
+                                  terminal.tool_calls.size() == 1 &&
+                                  Json::parse(terminal.tool_calls.front().arguments_json) == args,
+                              "chunked bash.command literal markup diverged from one-shot");
+        }
     }
     return failures;
 }
@@ -1668,6 +1750,7 @@ int main() {
     failures += test_fake_sibling_swallowing_structural_close();
     failures += test_declared_suspicious_name_variants();
     failures += test_suspicious_header_requires_current_tool_contract();
+    failures += test_literal_markup_in_declared_string_arguments();
     failures += test_declared_json_types();
     failures += test_boolean_boundary();
     failures += test_exact_integer_boundary();
