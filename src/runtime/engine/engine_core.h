@@ -887,6 +887,20 @@ private:
         try { request->cv.notify_one(); } catch (...) {}
     }
 
+    // Ends the consumer's wait with `error` while the worker still owns the request. The worker
+    // completes the request later with force_complete_error, which keeps this answer.
+    void answer_error(const std::shared_ptr<Request>& request,
+                      const std::exception_ptr& error) noexcept {
+        try {
+            std::lock_guard lock(request->mutex);
+            if (!request->response_done) {
+                request->error         = error;
+                request->response_done = true;
+            }
+        } catch (...) {}
+        try { request->cv.notify_one(); } catch (...) {}
+    }
+
     void complete_success(const std::shared_ptr<Request>& request, FinishReason reason) {
         HostPhaseMeasurement completion = begin_host_phase();
         double prompt_wall_seconds      = 0.0;
@@ -2209,6 +2223,16 @@ private:
         const std::shared_ptr<Request> materializing_request =
             materializing_ ? materializing_->request : nullptr;
         try { materializing_.reset(); } catch (...) {}
+        // An orderly stop saves the prefix cache during the Program cleanup, which takes seconds
+        // for a large Host tier: answer every request first rather than after the save.
+        if (cleanup == ProgramCleanup::Shutdown) {
+            for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+                if (slots_[lane] != nullptr) { answer_error(slots_[lane], error); }
+            }
+            if (materializing_request != nullptr) { answer_error(materializing_request, error); }
+            for (const auto& request : pending) { force_complete_error(request, error); }
+            pending.clear();
+        }
         cleanup_program_locked(cleanup);
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
             if (slots_[lane] != nullptr) {

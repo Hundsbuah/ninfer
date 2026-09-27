@@ -206,6 +206,12 @@ int exercise_persist(const char* artifact) {
             std::cerr << "persist: a running generation was not ended as Unavailable by stop()\n";
             ++failures;
         }
+        // The answer comes before the Host tier is saved (seconds for a large one), so the file
+        // is not in place yet.
+        if (std::filesystem::exists(file)) {
+            std::cerr << "persist: stop() answered the running generation only after the save\n";
+            ++failures;
+        }
         if (!fails_unavailable([&] { (void)saver.submit(saver.prepare_tokens(second), greedy(4)); })) {
             std::cerr << "persist: a stopped Engine accepted a request\n";
             ++failures;
