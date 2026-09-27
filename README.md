@@ -447,6 +447,12 @@ BF16 KV.
 - **Short prefill steps over long contexts use split-KV attention**: 32 new tokens against 180K
   cached tokens take 1.06 ms per attention layer instead of 9.5 ms.
   Commit: [`c1a59aa`][c-small-prefill].
+- **FP8 Tensor Core MMA on the MX datapath** (upstream PR #328 by
+  [DuncanBetts](https://github.com/DuncanBetts)): the shared E4M3 MMA helper issues the
+  block-scaled `kind::mxf8f6f4` form with unit scales, which computes the same dot products bit
+  for bit on a faster datapath. Paired runs on RTX 5090: FP8 A8 projections -18 to -38 % at
+  256-4096 tokens and unchanged at decode widths, K8V4 decode attention -2 %, prefill 10-12 %
+  faster end to end with K8V4 KV, decode unchanged. Perplexity is bit-identical.
 - **TMA-staged FP8 prefill GEMM** (upstream PR #167 by Michael Dementii, carried onto upstream's
   unified FP8 template): the FP8 A8 projections of the attention and GDN inputs and the output
   projections run a 256-token tile fed by TMA from 1024 tokens where its cost model favours it,
