@@ -52,7 +52,7 @@ every other value is derived from the rest of the configuration (§14.2).
 | reuse-loss attribution | done: the request log's `materialization` record carries `cached_prefix_tokens` (longest cached block prefix, reusable or not), and `restored_host_bytes` |
 | §7.2–§7.3 zero-split GDN state tap and phase alignment | not implemented: an exact tap costs one prefill split (about 15 ms per turn on 27B); flexible taps avoid it, and requests resuming from an endpoint skip the opener tap (§7.1) |
 | §11.2 KV transfer Op | copy-engine path only (`cudaMemcpy2DAsync` runs over consecutive pages and slabs) |
-| §6.3 persistent backfill proof | not issued: a blocked FIFO head is never overtaken |
+| §6.3 persistent backfill proof | not issued: a blocked FIFO head is never overtaken (a proof with a growth reserve was tried and reverted, 2026-09-27) |
 | §6.6 prefetching the blocked head | done: Host-only path blocks copied into spare Device cache while the FIFO head waits |
 | §12 optional features other than 12.2, §13.2 Op qualification | not implemented |
 | §13.3 real-artifact scenarios | `ninfer_qwen3_5_hybrid_prefix_real_test`: Host vs Device restore exactness (with and without MTP), generation-opener and system-block reuse, Device-only mode, protocol cache hints, Vision, persistence across a restart; `NINFER_HYBRID_KV_DTYPE` runs them for every KV storage (bf16, int8, fp8, nvfp4, k8v4 pass). `ninfer_ngram_concurrent_real` runs on Hybrid with `NINFER_NGRAM_TEST_CONTEXT_CACHE=hybrid` |
@@ -110,6 +110,87 @@ once the context holds 64 visible keys per new token (80 for 16 query heads). Th
 
 Under two clients, ~11.4K-token Host revisits went from a 45.7 ms to a 30.1 ms median TTFT. Cold
 prefill is unchanged (10.1k vs 10.2k tok/s).
+
+### Changes from the production agent log (2026-09-26)
+
+A production request log (889 requests over 70 min, 27B NVIDIA NVFP4 + DFlash2, INT8 KV, C=2,
+`--host-cache-mib 52000`, 247K-token Device pool) of an agent harness with about ten concurrent
+conversations (17-tool subagents of 30K–208K tokens and a 20-tool orchestrator) served 94.9 % of
+prompt tokens from cache but prefilled 5.02M tokens (994 s). It showed three problems:
+
+1. **Host eviction kept the wrong snapshots.** The Host tier was full from minute 4. The GDSF value
+   of a snapshot counted only aligned ancestors, so tailed endpoints were priced as full
+   re-prefills from the root: about 100 stale chain endpoints (~19 GB) stayed, while shared
+   system/tools taps and fresh endpoints went first. 68 turns re-prefilled 758K tokens because
+   their resume point was stuck at an old aligned tap while the suffix grew to 42K tokens, and 24
+   subagent turns prefilled from the root next to a cached 19.8K-token shared prefix.
+2. **Only one lane ran for half the wall time.** Two 150K–200K contexts do not fit in the Device
+   pool together, and Hybrid mode never issued a backfill proof: the average decode batch was
+   1.27 of 2.
+3. **Every turn restored its whole context from the Host tier**: 2.59 TB in total, 2.7 GB per turn
+   (median), while the FIFO head had usually been waiting seconds to minutes.
+
+| change | commit | section | A/B result | status |
+|---|---|---|---|---|
+| Superseded snapshots evicted first; valuation against the nearest retained ancestor | `39bc99c4` | §9.3 | prompt tokens prefilled −10.8 % (seed 42) and −3.4 % (seed 43); main-session turns that re-prefilled the whole prompt 3 → 1 (seed 42); TTFT without queue wait −6 % and −3 % | kept |
+| Persistent backfill proof with a 16K-token growth reserve | not merged (branch `feat/hybrid-cache-policy-rebased`, `c974e5ec`) | §6.3 | targeted scenario: four 12K-token requests queued behind a blocked 90K-token head finish in 1.6 s instead of 35–36 s; the long request already decoding takes 4.7 s (12 %) longer, about the borrowers' prefill time, and the head starts that much later (its answer ends at the same time); no answer is cut short. Agentic workload: 0–9 backfills per run, effect within sampling noise | reverted: a trade-off, not a win (below) |
+| Prefetch of the blocked head's Host-only blocks | `d9b8d437` | §6.6 | admission Host restores −22 % (seed 42, 62.4 → 48.6 GB) and −25 % (seed 43, 68.4 → 51.3 GB), 10–11 GB prefetched per run; TTFT without queue wait −3 % and −6 %; decode rounds/s unchanged (57.8 vs 57.8, one request decoding) | kept |
+
+Fix 3 was measured on top of the backfill proof. The build that combined all three against the
+base: at the 16 GB Host tier, prompt tokens prefilled −13.9 % (seed 42) and −2.7 % (seed 43), TTFT
+without queue wait 0.82 → 0.74 s and 0.75 → 0.73 s; at 52 GB (seed 42), prompt tokens prefilled
+−9.2 % (623,853 → 566,189), served from cache 89.1 → 90.1 %, no turn prefilled from the root beside
+cached blocks (3 before), TTFT without queue wait 0.68 → 0.60 s (−12 %), workload wall time −7.8 %
+for the same output volume (130K tokens). That 52 GB arm's mean TTFT including queue wait rose from
+2.1 to 2.8 s: in a closed loop, turns that finish sooner re-queue sooner, and the queue-wait
+increase was spread over requests that no change touches. Backfill triggered at most twice in it.
+
+**Why the backfill proof was reverted.** Backfill lets a shorter request start beside a long one
+while a longer FIFO head waits for pages. The GPU time the borrower uses comes out of the long
+requests: the one decoding slows by about the borrower's prefill time, and the blocked head starts
+that much later. Short requests gain a lot, long ones lose a little, and aggregate throughput hardly
+moves. When long main-agent requests dominate, the proof rarely passes (two long contexts never
+fit, and the growth reserve leaves room only for small borrowers; in the production log about
+225 of the 2,122 s spent with one lane decoding and requests waiting), and when it passes the
+latency cost falls on those long requests. Hybrid mode therefore still issues no backfill proof.
+A version worth revisiting has to remove the trade-off rather than move it; see §6.3.
+
+The merged commits are on master after `64a4e4f4` (upstream merge and PR #167). The measured
+builds are the same changes on `410eb4bf`; the only other difference is the PR #167 FP8 prefill
+GEMM. On master `ninfer_prefix_cache_index_test`, `ninfer_qwen3_5_hybrid_prefix_real_test` (all
+scenarios) and `ninfer_qwen3_5_prefix_real_test` (original prefix cache) pass, and the merged build
+(fixes 1 and 3 only) ran the pressure workload at scale 0.3 (54 requests, no failures, 1.2 GB
+prefetched). It was not A/B tested on its own.
+
+Measurement: `bench/agentic_ab` (3 interleaved sessions and 11 subagents, 130 requests; seeds 42
+and 43) on the production flags with the Device pool and Host tier scaled down to that workload
+(`--kv-capacity 160000`, `--max-context 160000`, `--host-cache-mib 16000`; `--vram-headroom-mib`
+dropped, since it requires `--kv-capacity auto`), RTX 5090, CUDA 13.4, Windows. Each change is
+compared with the build before it at a 16 GB Host tier, where eviction matters, and all three with
+the base at 52 GB, where it rarely does. A change that does not improve its target metric, or that
+regresses another, is reverted and recorded in this table with the reason: the backfill proof was
+reverted as a trade-off rather than a win. The policy
+does not depend on the tier size (`--host-cache-mib` 0 to 230 GiB): snapshot count is bounded by
+`host_cache_bytes / image_bytes` (about 1,300 at 230 GiB), and victim selection is a scan over
+snapshots.
+
+Run notes:
+
+- Seed 42, first run (2026-09-27 00:15–01:06): the fix-1 arm (about 00:34–00:37) and the second
+  half of the fix-3 arm (00:58–01:06) ran under outside CPU load; tokenization, which none of
+  these changes touch, was up to 2.3× slower, and their decode host time per round (204 and 338 µs
+  against 80 µs) was not the builds'. Both arms were rerun with per-process CPU logging and the
+  rerun values are the ones above; their tokenization matched the base.
+- Backfill needs a blocked FIFO head with a shorter request behind it while a long answer decodes.
+  The workload's lock-step sessions rarely queue that way (one lane decoding with requests waiting
+  for 3–13 % of a run, against 50 % in the production log), so a targeted scenario measures it: a
+  100K-token request answering with a count to 2,400, then a 90K-token request, then four 12K-token
+  requests, greedy, `max_tokens` 64000, two repetitions per build, identical to within a second.
+  In seed 43 the two long requests that borrowers overtook waited 6 and 8 s longer (23 s for one in
+  the fix-3 arm) while the borrowers saved about 1 s each; output lengths differ between arms, so
+  this is not attributable, but it is worth watching in production.
+- The Host-to-Device link of the measuring machine runs at PCIe 5.0 x8 (the GPU supports x16), so
+  restores and prefetches move about 25 GB/s.
 
 ## 0. Summary
 
@@ -507,6 +588,32 @@ This is the same classification as today, computed by arithmetic.
 
 **Backfill proof** (engine-architecture §5.2) uses the same arithmetic:
 `need(borrower) + need(head root) ≤ free + all_evictable + Σ donor entitlements released`.
+Hybrid mode does not issue it: a blocked FIFO head is never overtaken.
+
+*Tried and not adopted (2026-09-27).* A proof with this arithmetic plus a growth reserve was
+implemented and measured (the change record near the top of this document). Without the reserve,
+a borrower can take the pages a long answer would grow into, and that answer then ends early
+(bounded completion, paged-kv §6.2). The reserve kept every active sequence, the borrower and the
+head able to grow by 16K more tokens:
+
+```text
+Σ_active (entitlement + G) + entitlement(c) + G(c)                      ≤ capacity   // now
+Σ_borrowers (entitlement + G) + entitlement(c) + G(c) + root(h) + G(h)  ≤ capacity   // donors ended
+G(x) = min(pages to x's lease ceiling beyond its entitlement, pages of 16K tokens)
+```
+
+It was safe (no answer cut short), but it moved latency rather than removing it. Queued short
+requests finished in 1.6 s instead of 35 s. The long request already decoding was slower by about
+their prefill time, and the blocked long head started that much later. For workloads dominated by
+long main-agent requests that is a loss where it matters, so it was reverted. A version worth
+revisiting needs a clear win, for example:
+
+- bound the borrower's cost to the donor: only borrowers whose whole service (prefill and expected
+  answer) is small against the donor's remaining time, so the head's delay stays negligible;
+- keep donor decode rounds running while a borrower prefills (prefill in short slices between
+  rounds), since most of the donor's slowdown was the borrower's prefill blocking its rounds;
+- make the reserve unnecessary by suspending a borrower to the Host tier when a donor needs its
+  pages (a product change: active-request preemption).
 
 Every unpinned Device-resident cache entry (node or snapshot tail) owns its page bundle
 exclusively, so evicting one returns exactly one page to each pool and the arithmetic is exact.
