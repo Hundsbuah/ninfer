@@ -253,9 +253,45 @@ supported explicit type retain untyped inference. NInfer does not apply defaults
 properties, perform recursive JSON Schema validation, or use constrained decoding.
 
 String parameters preserve function/tool-call markers and balanced nested
-`<parameter=...>...</parameter>` text as value bytes. The Qwen wire format has no delimiter escape,
-so an unmatched nested parameter opener or a standalone `</parameter>` cannot be represented
-unambiguously; either makes that tool-call region ordinary content. Later content is still examined:
+`<parameter=...>...</parameter>` text as value bytes. One marker grammar decides discovery,
+structural boundary detection, and parsing alike, in both modes: a `<function`, `<invoke`,
+`<parameter`, or `<param` prefix opens a marker only when the next byte delimits the prefix
+(`=`, any format whitespace - tab, carriage return and line break included - or `>`) and the
+header payload validates as a whole, so a longer identifier such as `<functionbash>` opens
+nothing. The header is either a direct `=name` (a quoted name must enclose the whole
+remainder) or a run of `name=` attributes separated by whitespace, where format whitespace
+may also separate an attribute name from its `=` and the `=` from its value; attribute
+values are single- or double-quoted (a quoted value may contain `>` and may be empty) or
+unquoted (up to the next whitespace, and not empty); an attribute without `=`, a value
+that runs into the next attribute, or any other trailing byte invalidates the header.
+Function-name validity is
+mode-independent; strict mode additionally requires the name to be a declared tool.
+For a parameter whose declared schema admits a string, parameter delimiters are opaque: a
+literal opener in the value does not nest, and a literal close ends the value only when what
+follows continues the call (a sibling parameter whose header validates as a parameter
+opener, or the function close, and in tolerant mode also a function close followed by
+discarded trailing tokens or the end of the cut region); unmatched literal delimiters, a
+sibling whose header is not a valid opener, and a sibling whose name is neither declared
+for the current function nor an ordinary parameter identifier remain representable value
+bytes.
+A non-ordinary name - embedded markup, format whitespace, control bytes - means
+the candidate opener had no terminator of its own and found its first `>` in value data
+(structural markup swallowed from a literal close, a function close, or a wrapper close,
+or an ordinary byte such as a comparison operator or a shell redirection); chat templates
+emit declared names verbatim between the opener prefix and the first `>`, and NInfer does
+not restrict declared names to a grammar excluding markup, so the current function's
+declared parameter set alone decides names that are not ordinary.
+Two formerly accepted permissive forms are rejected deliberately: a bare space-separated
+name without `=` or a quoted attribute (for example `<function NAME>`) and a direct name
+containing a double-quote character (for example `<parameter=a"b>`); the Qwen chat
+templates emit names verbatim between `=` and the first `>`, so neither form belongs to
+the wire format and both would re-open the fake-opener ambiguity this grammar removes.
+Non-string and untyped parameters keep the balanced rule, where an
+unmatched nested opener or a standalone close makes that tool-call region ordinary content. The
+wire format has no delimiter escape, so a value that itself contains a complete closing
+boundary is ambiguous and ends the value at the first such boundary; the bytes after that
+boundary may then be parsed as further parameters or calls, and that reinterpretation produces
+no fallback reason. Later content is still examined:
 the first tool-call region (any accepted marker form) that parses becomes the structured turn, and any
 quoted markup before it stays ordinary content. Generated reasoning closes only at a `</think>`
 followed by a line break or the end of the turn, so a marker the model quotes while reasoning (followed
@@ -268,6 +304,10 @@ malformed, a single final call is cut by the output budget before its closing ta
 bracket after the function name is missing: the recovered call is reported structurally with a
 `truncated_tail` diagnostic (logged at Info severity) rather than demoted to text, and an
 undeclared tool name stays structured for the consumer to judge.
+A function opener that lost its leading `<` (doubled or missing, including a leaked `im_start`
+turn marker) is recovered in tolerant mode and is structural in exactly the places a canonical
+opener is: it can begin a call and, after the function close of a complete call, end a declared
+string value.
 
 Messages enter the selected template in their input order. The maintained Qwen templates keep
 system/developer messages at their original positions. A final assistant message is an assistant

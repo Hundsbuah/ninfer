@@ -17,8 +17,10 @@ using NormalizationPolicy = Contract::NormalizationPolicy;
 using SchemaType          = Contract::SchemaType;
 using TypeSet             = Contract::TypeSet;
 
-constexpr std::string_view kToolOpen      = "<tool_call>";
-constexpr std::string_view kToolClose     = "</tool_call>";
+constexpr std::string_view kToolOpen        = "<tool_call>";
+constexpr std::string_view kToolClose       = "</tool_call>";
+constexpr std::string_view kFunctionCallsOpen  = "<function_calls>";
+constexpr std::string_view kFunctionCallsClose = "</function_calls>";
 
 struct RawParameter {
     std::string_view name;
@@ -28,6 +30,12 @@ struct RawParameter {
 struct RawToolCall {
     std::string_view name;
     std::vector<RawParameter> parameters;
+};
+
+enum class FunctionContainer : std::uint8_t {
+    ToolCall,
+    FunctionCalls,
+    TopLevel,
 };
 
 enum class JsonValueKind : std::uint8_t {
@@ -51,6 +59,10 @@ struct NormalizedParameter {
     std::string json_value;
 };
 
+// ---------------------------------------------------------------------------
+// Byte utilities
+// ---------------------------------------------------------------------------
+
 constexpr bool is_format_whitespace(char byte) {
     return byte == ' ' || byte == '\t' || byte == '\r' || byte == '\n';
 }
@@ -59,6 +71,12 @@ constexpr bool is_ascii_digit(char byte) { return byte >= '0' && byte <= '9'; }
 
 constexpr bool is_ascii_alphanumeric(char byte) {
     return (byte >= 'a' && byte <= 'z') || (byte >= 'A' && byte <= 'Z') || is_ascii_digit(byte);
+}
+
+// The opener boundary delimiter: the byte right after a "<function", "<invoke", "<parameter"
+// or "<param" prefix that proves the prefix is not a longer identifier.
+constexpr bool is_opener_delimiter(char byte) {
+    return byte == '=' || byte == '>' || is_format_whitespace(byte);
 }
 
 std::string_view trim_format_whitespace(std::string_view text) {
@@ -83,137 +101,451 @@ bool starts_with_at(std::string_view text, std::size_t pos, std::string_view pre
     return pos <= text.size() && text.substr(pos, prefix.size()) == prefix;
 }
 
-std::string_view unquote(std::string_view str) {
-    str = trim_format_whitespace(str);
-    if (str.size() >= 2) {
-        if ((str.front() == '"' && str.back() == '"') ||
-            (str.front() == '\'' && str.back() == '\'')) {
-            return trim_format_whitespace(str.substr(1, str.size() - 2));
-        }
-    }
-    return str;
-}
+// ---------------------------------------------------------------------------
+// Tag header recognition (shared by tokenization, parsing, and lookahead)
+// ---------------------------------------------------------------------------
 
-std::string_view extract_name_from_tag_header(std::string_view header) {
-    header = trim_format_whitespace(header);
-    if (header.starts_with('=')) {
-        return unquote(header.substr(1));
-    }
-    for (std::size_t i = 0; i < header.size();) {
-        if (is_format_whitespace(header[i])) {
-            ++i;
+// Quote-aware scan for the byte that terminates an opening tag: the first '>' outside a
+// single- or double-quoted attribute or direct-name value. A quote is closed only by the
+// same quote; there is no escape syntax (the wire format has none). Returns false when no
+// unquoted '>' exists or EOF is reached with a quote still open - both are invalid headers.
+bool find_tag_end(std::string_view text, std::size_t begin, std::size_t& tag_end) {
+    char quote = '\0';
+    for (std::size_t i = begin; i < text.size(); ++i) {
+        const char byte = text[i];
+        if (quote != '\0') {
+            if (byte == quote) { quote = '\0'; }
             continue;
         }
-        const std::size_t attr_begin = i;
-        while (i < header.size() && header[i] != '=' && !is_format_whitespace(header[i]) && header[i] != '>') {
-            ++i;
+        if (byte == '\'' || byte == '"') {
+            quote = byte;
+            continue;
         }
-        const std::string_view attr_name = header.substr(attr_begin, i - attr_begin);
-        skip_format_whitespace(header, i);
-        if (i < header.size() && header[i] == '=') {
-            ++i;
-            skip_format_whitespace(header, i);
-            if (i >= header.size()) break;
-            std::string_view val;
-            if (header[i] == '"' || header[i] == '\'') {
-                const char q = header[i];
-                const std::size_t q_start = i + 1;
-                const std::size_t q_end = header.find(q, q_start);
-                if (q_end != std::string_view::npos) {
-                    val = header.substr(q_start, q_end - q_start);
-                    i = q_end + 1;
-                } else {
-                    val = header.substr(q_start);
-                    i = header.size();
-                }
-            } else {
-                const std::size_t val_begin = i;
-                while (i < header.size() && !is_format_whitespace(header[i]) && header[i] != '/' && header[i] != '>') {
-                    ++i;
-                }
-                val = header.substr(val_begin, i - val_begin);
-            }
-            if (attr_name == "name") {
-                return val;
-            }
+        if (byte == '>') {
+            tag_end = i;
+            return true;
         }
     }
-    return unquote(header);
+    return false;
 }
 
-bool is_param_open_at(std::string_view text, std::size_t pos, std::size_t& tag_end) {
+constexpr bool is_attr_name_start(char byte) {
+    return (byte >= 'a' && byte <= 'z') || (byte >= 'A' && byte <= 'Z') || byte == '_';
+}
+
+constexpr bool is_attr_name_rest(char byte) {
+    return is_attr_name_start(byte) || is_ascii_digit(byte) || byte == '.' || byte == ':' ||
+           byte == '-';
+}
+
+enum class HeaderSyntax : std::uint8_t {
+    DirectName,
+    Attributes,
+};
+
+struct NameHeaderPayload {
+    std::string_view name;
+    HeaderSyntax syntax;
+};
+
+// Validates the complete payload between an opener prefix and its quote-aware terminating
+// '>'. Every payload byte must belong to the syntax: a name that is found is not a header
+// that is valid. The two accepted forms:
+//
+//   direct:   "=name" - the name may be quoted ("='name'", '="name"'), where the quote must
+//             enclose the whole remainder; an unquoted name is the whole remainder, so a
+//             declared unusual name ("=a<b") keeps working, and a fake opener that scans
+//             through value data to a later ">" (="X\nif (a") yields a name that is not a
+//             plausible identifier.
+//   attrs:    whitespace-separated attributes "name="value""; values may be single- or
+//             double-quoted (a quoted value may contain '>') or unquoted (up to whitespace);
+//             an attribute without '=' or trailing junk makes the whole header invalid; the
+//             first name= attribute supplies the name and must be non-empty. Whitespace may
+//             separate an attribute name from its '=' and an attribute value from the next
+//             attribute; a quoted value may be empty, an unquoted value may not.
+bool parse_name_header_payload(std::string_view payload, NameHeaderPayload& parsed) {
+    payload = trim_format_whitespace(payload);
+    if (payload.starts_with('=')) {
+        const std::string_view rest = payload.substr(1);
+        if (rest.empty()) { return false; }
+        if (rest.front() == '"' || rest.front() == '\'') {
+            const char quote = rest.front();
+            if (rest.size() < 3 || rest.back() != quote) { return false; }
+            const std::string_view name =
+                trim_format_whitespace(rest.substr(1, rest.size() - 2));
+            if (name.empty()) { return false; }
+            parsed.name   = name;
+            parsed.syntax = HeaderSyntax::DirectName;
+            return true;
+        }
+        parsed.name   = rest;
+        parsed.syntax = HeaderSyntax::DirectName;
+        return true;
+    }
+
+    std::string_view name;
+    bool has_name = false;
+    std::size_t i  = 0;
+    while (i < payload.size()) {
+        while (i < payload.size() && is_format_whitespace(payload[i])) { ++i; }
+        if (i >= payload.size()) { break; }
+        const std::size_t attr_begin = i;
+        while (i < payload.size() && payload[i] != '=' && !is_format_whitespace(payload[i])) {
+            ++i;
+        }
+        const std::string_view attr_name = payload.substr(attr_begin, i - attr_begin);
+        if (attr_begin >= i || !is_attr_name_start(payload[attr_begin]) ||
+            std::any_of(attr_name.begin() + 1, attr_name.end(),
+                        [](char byte) { return !is_attr_name_rest(byte); })) {
+            return false;
+        }
+        skip_format_whitespace(payload, i);
+        if (i >= payload.size() || payload[i] != '=') { return false; }
+        ++i;
+        skip_format_whitespace(payload, i);
+        std::string_view value;
+        if (i < payload.size() && (payload[i] == '"' || payload[i] == '\'')) {
+            const char quote   = payload[i];
+            const std::size_t q_start = i + 1;
+            i = q_start;
+            while (i < payload.size() && payload[i] != quote) { ++i; }
+            if (i >= payload.size()) { return false; }
+            value = payload.substr(q_start, i - q_start);
+            ++i;
+        } else {
+            const std::size_t v_begin = i;
+            while (i < payload.size() && !is_format_whitespace(payload[i])) { ++i; }
+            value = payload.substr(v_begin, i - v_begin);
+            if (value.empty()) { return false; }
+        }
+        if (attr_name == "name" && !has_name) {
+            if (value.empty()) { return false; }
+            name     = value;
+            has_name = true;
+        }
+        if (i < payload.size() && !is_format_whitespace(payload[i])) { return false; }
+    }
+    if (!has_name) { return false; }
+    parsed.name   = name;
+    parsed.syntax = HeaderSyntax::Attributes;
+    return true;
+}
+
+enum class FunctionTagKind : std::uint8_t {
+    Function,
+    Invoke,
+};
+
+// The strict opener boundary: the byte after "<function" or "<invoke" must delimit the
+// prefix ('=', format whitespace, or '>'). True when the text opens a function tag at pos;
+// reports the prefix end, the matching close tag, and the tag kind.
+bool function_opener_prefix_at(std::string_view text, std::size_t pos, std::size_t& prefix_end,
+                               std::string_view& close_tag, FunctionTagKind& kind) {
+    if (starts_with_at(text, pos, "<function")) {
+        prefix_end = pos + 9;
+        close_tag  = "</function>";
+        kind       = FunctionTagKind::Function;
+    } else if (starts_with_at(text, pos, "<invoke")) {
+        prefix_end = pos + 7;
+        close_tag  = "</invoke>";
+        kind       = FunctionTagKind::Invoke;
+    } else {
+        return false;
+    }
+    if (prefix_end >= text.size()) { return false; }
+    return is_opener_delimiter(text[prefix_end]);
+}
+
+// Tolerant malformed-opener recovery: a dropped or doubled leading '<', a leaked ChatML
+// turn marker, or a dropped 'function'/'invoke' keyword, followed by '=' or a name. True
+// when the recovered prefix is plausible enough to enter the payload stage; a form that
+// yields no valid name is rejected by the payload stage, so prose after a marker cannot
+// pass.
+bool recover_function_prefix(std::string_view text, std::size_t pos, std::size_t& prefix_end,
+                             std::string_view& close_tag, FunctionTagKind& kind) {
+    std::size_t scan = pos;
+    while (scan < text.size() && text[scan] == '<') { ++scan; }
+    if (starts_with_at(text, scan, "|im_start|>")) { scan += 11; }
+    std::size_t kw_len = 0;
+    if (starts_with_at(text, scan, "function")) {
+        kw_len = 8;
+    } else if (starts_with_at(text, scan, "invoke")) {
+        kw_len = 6;
+    } else {
+        return false;
+    }
+    scan += kw_len;
+    if (scan >= text.size() || (text[scan] != '=' && !is_format_whitespace(text[scan]))) {
+        return false;
+    }
+    if (text[scan] == '=') { ++scan; }
+    prefix_end = scan;
+    close_tag  = kw_len == 8 ? "</function>" : "</invoke>";
+    kind       = kw_len == 8 ? FunctionTagKind::Function : FunctionTagKind::Invoke;
+    return true;
+}
+
+// One recognized tool marker in the token stream. begin/end span the whole opener (a
+// recovered function opener ends at the whitespace that terminates its name); name is the
+// validated header name; close_kind is the matching close marker for openers.
+struct Marker {
+    enum class Kind : std::uint8_t {
+        ToolCallOpen,
+        FunctionCallsOpen,
+        FunctionOpen,
+        InvokeOpen,
+        ParameterOpen,
+        ToolCallClose,
+        FunctionCallsClose,
+        FunctionClose,
+        InvokeClose,
+        ParameterClose,
+        ParamClose,
+    };
+    Kind kind              = Kind::ToolCallClose;
+    Kind close_kind        = Kind::ToolCallClose;
+    std::size_t begin      = 0;
+    std::size_t end        = 0;
+    std::string_view name;
+    bool recovered         = false;
+};
+
+constexpr bool is_region_open_kind(Marker::Kind kind) {
+    return kind == Marker::Kind::ToolCallOpen || kind == Marker::Kind::FunctionCallsOpen ||
+           kind == Marker::Kind::FunctionOpen || kind == Marker::Kind::InvokeOpen;
+}
+
+// The canonical parameter opener grammar: "<parameter" or "<param", then a byte that
+// delimits the prefix, then a header payload terminated by the quote-aware tag end and
+// fully validated by parse_name_header_payload(). The byte after the prefix must delimit
+// it: a longer identifier such as "<parameterX>" is not a parameter opener. Because the
+// payload is validated as a whole, a fake opener that finds its ">" in value data is
+// rejected by this one grammar - so tokenization, parsing, and boundary detection can
+// never classify the same bytes differently.
+bool parse_parameter_open(std::string_view text, std::size_t pos, Marker& marker) {
     std::size_t header_begin = 0;
+    Marker::Kind close_kind   = Marker::Kind::ParameterClose;
     if (starts_with_at(text, pos, "<parameter")) {
         header_begin = pos + 10;
     } else if (starts_with_at(text, pos, "<param")) {
         header_begin = pos + 6;
+        close_kind   = Marker::Kind::ParamClose;
     } else {
         return false;
     }
     if (header_begin >= text.size()) { return false; }
-    if (text[header_begin] != '=' && text[header_begin] != ' ' && text[header_begin] != '\t' &&
-        text[header_begin] != '\r' && text[header_begin] != '\n' && text[header_begin] != '>') {
+    if (!is_opener_delimiter(text[header_begin])) { return false; }
+    std::size_t tag_end = 0;
+    if (!find_tag_end(text, header_begin, tag_end) || tag_end == header_begin) {
         return false;
     }
-    const std::size_t end = text.find('>', header_begin);
-    if (end != std::string_view::npos && end != header_begin) {
-        tag_end = end;
-        return true;
+    NameHeaderPayload payload;
+    if (!parse_name_header_payload(text.substr(header_begin, tag_end - header_begin), payload)) {
+        return false;
     }
-    return false;
+    marker.kind       = Marker::Kind::ParameterOpen;
+    marker.close_kind = close_kind;
+    marker.begin      = pos;
+    marker.end        = tag_end + 1;
+    marker.name       = payload.name;
+    return true;
 }
 
-bool is_param_close_at(std::string_view text, std::size_t pos, std::size_t& tag_len) {
+// The canonical function opener grammar: "<function" or "<invoke", then the strict opener
+// boundary (or, in tolerant mode, the recovered malformed form), then the validated
+// payload. The missing-'> recovery (tolerant mode) fires before the payload parse and
+// supplies both the tag end and the name: the model sometimes drops the '>' after the
+// function name (for example a name followed directly by a newline and a parameter tag),
+// so it recovers by scanning the identifier run and accepting it when format whitespace
+// separates it from the next '<' or end of region. A header that fails here fails in
+// every stage alike: no function name is validated here, so name validity stays a policy
+// decision of the consumer and of the boundary lookahead alike.
+bool parse_function_open(std::string_view text, std::size_t pos, std::size_t max_name_length,
+                         bool tolerant, Marker& marker) {
+    std::size_t prefix_end = 0;
+    std::string_view close_tag;
+    FunctionTagKind kind = FunctionTagKind::Function;
+    if (!function_opener_prefix_at(text, pos, prefix_end, close_tag, kind)) {
+        if (!tolerant || !recover_function_prefix(text, pos, prefix_end, close_tag, kind)) {
+            return false;
+        }
+    }
+    std::size_t tag_end = 0;
+    const bool found_gt = find_tag_end(text, prefix_end, tag_end);
+    if (tolerant) {
+        std::size_t scan = prefix_end;
+        while (scan < text.size() && text[scan] == '=') { ++scan; }
+        const std::size_t ident_begin = scan;
+        while (scan < text.size() && scan - prefix_end < max_name_length) {
+            const char byte = text[scan];
+            if (!is_ascii_alphanumeric(byte) && byte != '_' && byte != '-') { break; }
+            ++scan;
+        }
+        if (scan > ident_begin && scan < text.size() && is_format_whitespace(text[scan]) &&
+            (!found_gt || scan < tag_end)) {
+            std::size_t after = scan;
+            while (after < text.size() && is_format_whitespace(text[after])) { ++after; }
+            if (after >= text.size() || text[after] == '<') {
+                marker.kind      = kind == FunctionTagKind::Function ? Marker::Kind::FunctionOpen
+                                                                     : Marker::Kind::InvokeOpen;
+                marker.close_kind = marker.kind;
+                marker.begin     = pos;
+                marker.end       = scan;
+                marker.name      = text.substr(ident_begin, scan - ident_begin);
+                marker.recovered = true;
+                return true;
+            }
+        }
+    }
+    if (!found_gt || tag_end == prefix_end) { return false; }
+    NameHeaderPayload payload;
+    if (!parse_name_header_payload(text.substr(prefix_end, tag_end - prefix_end), payload)) {
+        return false;
+    }
+    marker.kind      = kind == FunctionTagKind::Function ? Marker::Kind::FunctionOpen
+                                                         : Marker::Kind::InvokeOpen;
+    marker.close_kind = marker.kind;
+    marker.begin     = pos;
+    marker.end       = tag_end + 1;
+    marker.name      = payload.name;
+    return true;
+}
+
+bool close_marker_at(std::string_view text, std::size_t pos, Marker& marker) {
+    if (starts_with_at(text, pos, kToolClose)) {
+        marker.kind = Marker::Kind::ToolCallClose;
+        marker.begin = pos;
+        marker.end   = pos + kToolClose.size();
+        return true;
+    }
+    if (starts_with_at(text, pos, kFunctionCallsClose)) {
+        marker.kind = Marker::Kind::FunctionCallsClose;
+        marker.begin = pos;
+        marker.end   = pos + kFunctionCallsClose.size();
+        return true;
+    }
     if (starts_with_at(text, pos, "</parameter>")) {
-        tag_len = 12;
+        marker.kind = Marker::Kind::ParameterClose;
+        marker.begin = pos;
+        marker.end   = pos + 12;
         return true;
     }
     if (starts_with_at(text, pos, "</param>")) {
-        tag_len = 8;
+        marker.kind = Marker::Kind::ParamClose;
+        marker.begin = pos;
+        marker.end   = pos + 8;
+        return true;
+    }
+    if (starts_with_at(text, pos, "</function>")) {
+        marker.kind = Marker::Kind::FunctionClose;
+        marker.begin = pos;
+        marker.end   = pos + 11;
+        return true;
+    }
+    if (starts_with_at(text, pos, "</invoke>")) {
+        marker.kind = Marker::Kind::InvokeClose;
+        marker.begin = pos;
+        marker.end   = pos + 9;
         return true;
     }
     return false;
 }
 
-static constexpr std::string_view kToolMarkers[] = {
-    "<tool_call>",
-    "<function_calls>",
-    "<function=",
-    "<function ",
-    "<function>",
-    "<function=\"",
-    "<function=\'",
-    "<invoke=",
-    "<invoke ",
-    "<invoke>",
-    "<invoke=\"",
-    "<invoke=\'",
-};
-
-bool is_prefix_of_any_marker(std::string_view prefix) {
-    for (const auto& marker : kToolMarkers) {
-        if (marker.starts_with(prefix)) { return true; }
-    }
-    return false;
+// One region-open candidate: a wrapper open, or the function/invoke opener prefix with a
+// delimiting byte. This is the single definition of a top-level tool-call marker, shared
+// by one-shot candidate discovery and the streaming decoder.
+bool is_region_open_at(std::string_view text, std::size_t pos) {
+    if (starts_with_at(text, pos, kToolOpen)) { return true; }
+    if (starts_with_at(text, pos, kFunctionCallsOpen)) { return true; }
+    std::size_t prefix_end = 0;
+    std::string_view close_tag;
+    FunctionTagKind kind;
+    return function_opener_prefix_at(text, pos, prefix_end, close_tag, kind);
 }
 
-bool matches_any_marker(std::string_view text) {
-    for (const auto& marker : kToolMarkers) {
-        if (text.starts_with(marker)) { return true; }
+std::size_t find_first_region_open(std::string_view text) {
+    for (std::size_t pos = 0; pos < text.size(); ++pos) {
+        if (is_region_open_at(text, pos)) { return pos; }
     }
-    return false;
+    return std::string_view::npos;
 }
 
-std::size_t find_first_tool_marker(std::string_view text) {
-    std::size_t earliest = std::string_view::npos;
-    for (const auto& marker : kToolMarkers) {
-        std::size_t idx = text.find(marker);
-        if (idx != std::string_view::npos && (earliest == std::string_view::npos || idx < earliest)) {
-            earliest = idx;
+// Tokenize a tool region: one pass over the text, emitting every recognized marker and
+// advancing past each (a marker's header bytes are consumed opaquely, so a close marker
+// inside a fake header is never a structural token). Wrapper opens are literal tokens; a
+// function open token starts exactly where the shared recognition succeeds, so a dispatch
+// or successor position that does not align with a token is a failed attempt there - the
+// bytes after it (a doubled '<', ...) are not re-recognized at that position.
+void tokenize_markers(std::string_view text, std::size_t max_name_length, bool tolerant,
+                      std::vector<Marker>& markers) {
+    std::size_t pos = 0;
+    while (pos < text.size()) {
+        Marker marker;
+        if (starts_with_at(text, pos, kToolOpen)) {
+            marker.kind    = Marker::Kind::ToolCallOpen;
+            marker.begin   = pos;
+            marker.end     = pos + kToolOpen.size();
+            markers.push_back(marker);
+            pos = marker.end;
+            continue;
+        }
+        if (starts_with_at(text, pos, kFunctionCallsOpen)) {
+            marker.kind    = Marker::Kind::FunctionCallsOpen;
+            marker.begin   = pos;
+            marker.end     = pos + kFunctionCallsOpen.size();
+            markers.push_back(marker);
+            pos = marker.end;
+            continue;
+        }
+        if (close_marker_at(text, pos, marker)) {
+            markers.push_back(marker);
+            pos = marker.end;
+            continue;
+        }
+        if (parse_parameter_open(text, pos, marker)) {
+            markers.push_back(marker);
+            pos = marker.end;
+            continue;
+        }
+        if (parse_function_open(text, pos, max_name_length, tolerant, marker)) {
+            markers.push_back(marker);
+            pos = marker.end;
+            continue;
+        }
+        ++pos;
+    }
+}
+
+// The same marker grammar the one-shot parser discovers: a pending byte run is a marker
+// when it equals a wrapper open, or extends an opener prefix by one delimiting byte.
+bool marker_confirmed(std::string_view pending) {
+    if (pending == kToolOpen || pending == kFunctionCallsOpen) { return true; }
+    for (const std::string_view root : {std::string_view("<function"), std::string_view("<invoke")}) {
+        if (pending.size() == root.size() + 1 && pending.starts_with(root) &&
+            is_opener_delimiter(pending[root.size()])) {
+            return true;
         }
     }
-    return earliest;
+    return false;
 }
+
+// A pending byte run may still become a confirmed marker.
+bool marker_possible(std::string_view pending) {
+    if (kToolOpen.starts_with(pending)) { return true; }
+    if (kFunctionCallsOpen.starts_with(pending)) { return true; }
+    for (const std::string_view root : {std::string_view("<function"), std::string_view("<invoke")}) {
+        if (root.starts_with(pending)) { return true; }
+        if (pending.size() == root.size() + 1 && pending.starts_with(root) &&
+            is_opener_delimiter(pending[root.size()])) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// ---------------------------------------------------------------------------
+// Name policy
+// ---------------------------------------------------------------------------
 
 bool valid_function_name(std::string_view name, std::size_t max_name_length) {
     if (name.empty() || name.size() > max_name_length) { return false; }
@@ -221,6 +553,10 @@ bool valid_function_name(std::string_view name, std::size_t max_name_length) {
         return is_ascii_alphanumeric(byte) || byte == '_' || byte == '-';
     });
 }
+
+// ---------------------------------------------------------------------------
+// Schema and normalization utilities
+// ---------------------------------------------------------------------------
 
 constexpr std::uint8_t type_bit(SchemaType type) { return static_cast<std::uint8_t>(type); }
 
@@ -360,6 +696,43 @@ const Contract::Parameter* find_parameter_contract(const Contract::Tool& tool,
         std::find_if(tool.parameters.begin(), tool.parameters.end(),
                      [&](const auto& candidate) { return candidate.name == parameter_name; });
     return parameter == tool.parameters.end() ? nullptr : &*parameter;
+}
+
+bool is_declared_parameter(const Contract& contract, std::string_view tool_name,
+                           std::string_view parameter_name) {
+    const Contract::Tool* tool = find_tool_contract(contract, tool_name);
+    if (tool == nullptr || !tool->unambiguous) { return false; }
+    return find_parameter_contract(*tool, parameter_name) != nullptr;
+}
+
+bool is_declared_string_parameter(const Contract& contract, std::string_view tool_name,
+                                  std::string_view parameter_name) {
+    const Contract::Tool* tool = find_tool_contract(contract, tool_name);
+    if (tool == nullptr || !tool->unambiguous) { return false; }
+
+    const Contract::Parameter* parameter = find_parameter_contract(*tool, parameter_name);
+    return parameter != nullptr &&
+           parameter->policy == NormalizationPolicy::DeclaredTypes &&
+           admits_type(parameter->types, SchemaType::String);
+}
+
+// Fallback trust policy for undeclared candidate siblings. After a literal close, a
+// following parameter opener is structural only when the current tool contract declares
+// its name (trusted by definition). An undeclared name is trusted only as a fallback,
+// and only while it is still a plausible ordinary parameter identifier - the form the
+// official chat templates emit as "<parameter=<name>". A name carrying markup, format
+// whitespace, control bytes, or other non-identifier bytes can only be the product of a
+// fake opener that found its first ">" in value data, so it terminates nothing.
+bool is_ordinary_parameter_name(std::string_view name) {
+    if (name.empty()) { return false; }
+    for (const char byte : name) {
+        const unsigned char c = static_cast<unsigned char>(byte);
+        const bool identifier =
+            (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+            c == '_' || c == '.' || c == '-' || c == ':';
+        if (!identifier) { return false; }
+    }
+    return true;
 }
 
 std::string_view remove_parameter_framing_newlines(std::string_view text) {
@@ -535,72 +908,97 @@ NormalizedParameter normalize_parameter(std::string_view encoded_value,
     return {.json_value = encode_json_string(value)};
 }
 
+// ---------------------------------------------------------------------------
+// Region parsing over the marker token stream
+// ---------------------------------------------------------------------------
+
 class QwenToolRegionParser {
 public:
     QwenToolRegionParser(std::string_view text, std::size_t max_name_length,
                          const Contract& contract, bool tolerant)
         : text_(text), max_name_length_(max_name_length), contract_(contract),
-          tolerant_(tolerant) {}
+          tolerant_(tolerant) {
+        tokenize_markers(text_, max_name_length_, tolerant_, markers_);
+    }
 
     [[nodiscard]] std::uint32_t duplicate_parameters_repaired() const noexcept {
         return duplicate_parameters_repaired_;
     }
 
     FallbackReason parse(std::vector<RawToolCall>& calls) {
-        std::size_t pos = 0;
-        for (;;) {
-            skip_format_whitespace(text_, pos);
-            if (pos == text_.size()) {
-                return calls.empty() ? FallbackReason::MalformedStructure : FallbackReason::None;
+        std::size_t idx = 0;
+        while (idx < markers_.size()) {
+            // Any byte run before a marker that is not a region open, and a marker that is
+            // not a region open, are ordinary text at dispatch level: a function prefix
+            // there is a failed function attempt (its reason is reported), anything else is
+            // trailing content.
+            const std::size_t from = idx > 0 ? markers_[idx - 1].end : 0;
+            if (has_content_between(from, markers_[idx].begin) ||
+                !is_region_open_kind(markers_[idx].kind)) {
+                return dispatch_gap_failure(calls, from, markers_[idx].begin);
             }
-            if (starts_with_at(text_, pos, "<tool_call>")) {
+            switch (markers_[idx].kind) {
+            case Marker::Kind::ToolCallOpen: {
                 RawToolCall call;
-                const FallbackReason terminal = finish_call(calls, call, parse_tool_call(pos, call));
+                const FallbackReason terminal = finish_call(calls, call, parse_tool_call(idx, call));
                 if (terminal != FallbackReason::None) { return terminal; }
-            } else if (starts_with_at(text_, pos, "<function_calls>")) {
-                pos += 16;
-                bool had_calls = false;
-                for (;;) {
-                    skip_format_whitespace(text_, pos);
-                    if (consume(pos, "</function_calls>")) { break; }
-                    if (pos == text_.size()) {
-                        // Tolerant: an unclosed wrapper after one or more complete calls is a
-                        // truncation; the strict parser keeps the hard structural failure.
-                        if (tolerant_ && had_calls) { return FallbackReason::TruncatedTail; }
-                        return FallbackReason::MalformedStructure;
-                    }
-                    RawToolCall call;
-                    const FallbackReason terminal = finish_call(calls, call, parse_function(pos, call));
-                    if (terminal != FallbackReason::None) { return terminal; }
-                    had_calls = true;
-                }
-                if (!had_calls) { return FallbackReason::MalformedStructure; }
-            } else if (starts_with_at(text_, pos, "<function") || starts_with_at(text_, pos, "<invoke")) {
+                break;
+            }
+            case Marker::Kind::FunctionCallsOpen: {
+                const FallbackReason terminal = parse_function_calls(idx, calls);
+                if (terminal != FallbackReason::None) { return terminal; }
+                break;
+            }
+            case Marker::Kind::FunctionOpen:
+            case Marker::Kind::InvokeOpen: {
                 RawToolCall call;
-                const FallbackReason terminal = finish_call(calls, call, parse_function(pos, call));
+                const FallbackReason terminal =
+                    finish_call(calls, call, parse_function(idx, call, FunctionContainer::TopLevel));
                 if (terminal != FallbackReason::None) { return terminal; }
-            } else {
-                // Tolerant: a trailing suffix after one or more complete calls is discarded
-                // rather than failing the whole output.
-                if (tolerant_ && !calls.empty()) { return FallbackReason::TruncatedTail; }
-                return calls.empty() ? FallbackReason::MalformedStructure
-                                     : FallbackReason::TrailingContent;
+                break;
+            }
             }
         }
+        const std::size_t last = markers_.empty() ? 0 : markers_.back().end;
+        if (has_content_between(last, text_.size())) {
+            return dispatch_gap_failure(calls, last, text_.size());
+        }
+        return calls.empty() ? FallbackReason::MalformedStructure : FallbackReason::None;
     }
 
 private:
-    bool consume(std::size_t& pos, std::string_view token) const {
-        if (!starts_with_at(text_, pos, token)) { return false; }
-        pos += token.size();
+    bool has_content_between(std::size_t a, std::size_t b) const {
+        if (a >= b) { return false; }
+        return !trim_format_whitespace(text_.substr(a, b - a)).empty();
+    }
+
+    std::size_t first_non_whitespace(std::size_t a, std::size_t b) const {
+        std::size_t at = a;
+        while (at < b && is_format_whitespace(text_[at])) { ++at; }
+        return at;
+    }
+
+    // The same opener grammar parse_function_open() consumes, applied to a boundary
+    // candidate: an opener that does not parse here does not parse in the consumer
+    // either. The only policy overlay is the declared-tool identity in strict mode;
+    // name validity itself is mode-independent.
+    bool function_name_policy(std::string_view name) const {
+        if (!valid_function_name(name, max_name_length_)) { return false; }
+        if (!tolerant_ && contract_.enforce_declared_names &&
+            find_tool_contract(contract_, name) == nullptr) {
+            return false;
+        }
         return true;
     }
 
-    // True when nothing but trailing whitespace remains after `pos` in the tool region.
-    bool at_region_end(std::size_t pos) const {
-        std::size_t at = pos;
-        skip_format_whitespace(text_, at);
-        return at == text_.size();
+    // A genuine Qwen parameter header is "<parameter=<name>": the official chat
+    // templates emit the declared name verbatim between "=" and the first ">". A
+    // candidate whose name the current unambiguous tool contract does not declare
+    // therefore establishes a structural boundary only while the name is still a
+    // plausible ordinary parameter identifier.
+    bool parameter_sibling_policy(std::string_view fn_name, std::string_view name) const {
+        return is_declared_parameter(contract_, fn_name, name) ||
+               is_ordinary_parameter_name(name);
     }
 
     // Applies tolerant recovery to a sub-parse result and reports whether parse() should
@@ -623,151 +1021,185 @@ private:
         return failure;
     }
 
-    FallbackReason parse_tool_call(std::size_t& pos, RawToolCall& call) {
-        if (!consume(pos, "<tool_call>")) { return FallbackReason::MalformedStructure; }
-        skip_format_whitespace(text_, pos);
-        const FallbackReason failure = parse_function(pos, call);
+    // A failed function attempt at a position where a function open is expected and none
+    // was tokenized: the prefix boundary (or the tolerant recovery) reached the payload
+    // stage and found no valid header - InvalidToolName in both modes - or the bytes do
+    // not even open a function tag - MalformedStructure.
+    FallbackReason function_entry_failure(std::size_t at) const {
+        std::size_t prefix_end = 0;
+        std::string_view close_tag;
+        FunctionTagKind kind;
+        if (function_opener_prefix_at(text_, at, prefix_end, close_tag, kind)) {
+            return FallbackReason::InvalidToolName;
+        }
+        if (tolerant_ && recover_function_prefix(text_, at, prefix_end, close_tag, kind)) {
+            return FallbackReason::InvalidToolName;
+        }
+        return FallbackReason::MalformedStructure;
+    }
+
+    // The expected-function contexts (inside a wrapper, inside a function_calls container)
+    // call the consumer on any position: a failed attempt there is a structural failure,
+    // never trailing text.
+    FallbackReason expected_function_failure(const std::vector<RawToolCall>& calls,
+                                             std::size_t from, std::size_t to) const {
+        const FallbackReason failure = function_entry_failure(first_non_whitespace(from, to));
+        if (tolerant_ && !calls.empty()) { return FallbackReason::TruncatedTail; }
+        return failure;
+    }
+
+
+    // Top-level trailing text: tolerant discards a suffix after one or more complete
+    // calls; a function prefix that opens no tag keeps the hard structural failure.
+    FallbackReason dispatch_gap_failure(const std::vector<RawToolCall>& calls, std::size_t from,
+                                        std::size_t to) const {
+        const std::size_t at = first_non_whitespace(from, to);
+        if (at < to && (starts_with_at(text_, at, "<function") ||
+                        starts_with_at(text_, at, "<invoke"))) {
+            const FallbackReason failure = function_entry_failure(at);
+            if (tolerant_ && !calls.empty()) { return FallbackReason::TruncatedTail; }
+            return failure;
+        }
+        return trailing_failure(calls);
+    }
+
+    FallbackReason trailing_failure(const std::vector<RawToolCall>& calls) const {
+        if (tolerant_ && !calls.empty()) { return FallbackReason::TruncatedTail; }
+        return calls.empty() ? FallbackReason::MalformedStructure
+                             : FallbackReason::TrailingContent;
+    }
+
+    FallbackReason parse_tool_call(std::size_t& idx, RawToolCall& call) {
+        // markers_[idx] is the wrapper open.
+        const std::size_t open_end = markers_[idx].end;
+        if (idx + 1 >= markers_.size()) {
+            return function_entry_failure(open_end);
+        }
+        // The expected function position is the first non-whitespace byte after the wrapper
+        // open. Only a function open token aligned there is the attempt the single-position
+        // consumer would make: a token that starts later (a doubled '<' before a valid
+        // opener) is not it, and the attempt at the expected position is reported as such.
+        const std::size_t expected = first_non_whitespace(open_end, markers_[idx + 1].begin);
+        if (expected != markers_[idx + 1].begin ||
+            (markers_[idx + 1].kind != Marker::Kind::FunctionOpen &&
+             markers_[idx + 1].kind != Marker::Kind::InvokeOpen)) {
+            return function_entry_failure(expected);
+        }
+        std::size_t fn_idx = idx + 1;
+        const FallbackReason failure =
+            parse_function(fn_idx, call, FunctionContainer::ToolCall);
+        idx = fn_idx;
         if (failure != FallbackReason::None) { return failure; }
-        skip_format_whitespace(text_, pos);
-        if (consume(pos, "</tool_call>")) { return FallbackReason::None; }
-        // Tolerant: a complete call may be followed by explanatory text, or the model may have
-        // stopped at the end of its budget before the closing tag. parse() resolves the terminal
-        // flag; the strict parser keeps the hard structural failure.
+        // idx now points past the function close.
+        if (idx < markers_.size() && markers_[idx].kind == Marker::Kind::ToolCallClose &&
+            !has_content_between(markers_[idx - 1].end, markers_[idx].begin)) {
+            ++idx;
+            return FallbackReason::None;
+        }
+        // Tolerant: a complete call may be followed by explanatory text, or the model may
+        // have stopped at the end of its budget before the closing tag. parse() applies the
+        // call-level recovery policy; the strict parser keeps the hard structural failure.
         return tolerant_ ? FallbackReason::TruncatedTail : FallbackReason::MalformedStructure;
     }
 
-    FallbackReason parse_function(std::size_t& pos, RawToolCall& call) {
-        std::size_t header_begin = 0;
-        std::string_view fn_close = "</function>";
-        if (starts_with_at(text_, pos, "<function")) {
-            header_begin = pos + 9;
-            fn_close = "</function>";
-        } else if (starts_with_at(text_, pos, "<invoke")) {
-            header_begin = pos + 7;
-            fn_close = "</invoke>";
-        } else if (tolerant_) {
-            // Recover a malformed function opener: a dropped or doubled leading '<', a leaked
-            // ChatML turn marker, or a dropped 'function'/'invoke' keyword, followed by '=' or a
-            // name. A form that yields no valid name is rejected by valid_function_name below, so
-            // prose after a marker cannot pass.
-            std::size_t scan = pos;
-            while (scan < text_.size() && text_[scan] == '<') { ++scan; }
-            if (starts_with_at(text_, scan, "|im_start|>")) { scan += 11; }
-            std::size_t kw_len = 0;
-            if (starts_with_at(text_, scan, "function")) { kw_len = 8; }
-            else if (starts_with_at(text_, scan, "invoke")) { kw_len = 6; }
-            else { return FallbackReason::MalformedStructure; }
-            scan += kw_len;
-            if (scan >= text_.size() || (text_[scan] != '=' && !is_format_whitespace(text_[scan]))) {
-                return FallbackReason::MalformedStructure;
+    FallbackReason parse_function_calls(std::size_t& idx, std::vector<RawToolCall>& calls) {
+        // markers_[idx] is the container open.
+        bool had_calls = false;
+        std::size_t i = idx + 1;
+        while (i < markers_.size()) {
+            if (has_content_between(markers_[i - 1].end, markers_[i].begin) ||
+                (markers_[i].kind != Marker::Kind::FunctionCallsClose &&
+                 markers_[i].kind != Marker::Kind::FunctionOpen &&
+                 markers_[i].kind != Marker::Kind::InvokeOpen)) {
+                return expected_function_failure(calls, markers_[i - 1].end,
+                                                 markers_[i].begin);
             }
-            if (text_[scan] == '=') { ++scan; }
-            header_begin = scan;
-            fn_close = kw_len == 8 ? "</function>" : "</invoke>";
-        } else {
-            return FallbackReason::MalformedStructure;
+            if (markers_[i].kind == Marker::Kind::FunctionCallsClose) {
+                idx = i + 1;
+                // An empty container is not a tool-call region.
+                return had_calls ? FallbackReason::None : FallbackReason::MalformedStructure;
+            }
+            RawToolCall call;
+            const FallbackReason terminal =
+                finish_call(calls, call, parse_function(i, call, FunctionContainer::FunctionCalls));
+            if (terminal != FallbackReason::None) { return terminal; }
+            had_calls = true;
         }
+        // The region is exhausted inside the container: an unclosed wrapper after one or
+        // more complete calls is a truncation in tolerant mode; the strict parser keeps
+        // the hard structural failure.
+        if (tolerant_ && had_calls) { return FallbackReason::TruncatedTail; }
+        return FallbackReason::MalformedStructure;
+    }
 
-        std::size_t tag_end = text_.find('>', header_begin);
-        bool ws_boundary = false;
-        // Tolerant: the model sometimes drops the '>' after the function name (for example a name
-        // followed directly by a newline and a parameter tag). Recover by scanning the identifier
-        // run and accepting it when format whitespace separates it from the next '<' or end of
-        // region.
-        if (tolerant_) {
-            std::size_t scan = header_begin;
-            while (scan < text_.size() && text_[scan] == '=') { ++scan; }
-            const std::size_t ident_begin = scan;
-            while (scan < text_.size() && scan - header_begin < max_name_length_) {
-                const char byte = text_[scan];
-                if (!is_ascii_alphanumeric(byte) && byte != '_' && byte != '-') { break; }
-                ++scan;
-            }
-            if (scan > ident_begin && scan < text_.size() && is_format_whitespace(text_[scan]) &&
-                (tag_end == std::string_view::npos || scan < tag_end)) {
-                std::size_t after = scan;
-                while (after < text_.size() && is_format_whitespace(text_[after])) { ++after; }
-                if (after >= text_.size() || text_[after] == '<') {
-                    tag_end     = scan;
-                    ws_boundary = true;
-                }
-            }
-        }
-        if (tag_end == std::string_view::npos || tag_end == header_begin) {
-            return FallbackReason::InvalidToolName;
-        }
-        const std::string_view header = text_.substr(header_begin, tag_end - header_begin);
-        call.name = extract_name_from_tag_header(header);
+    FallbackReason parse_function(std::size_t& idx, RawToolCall& call,
+                                  FunctionContainer container) {
+        const Marker& open = markers_[idx];
+        call.name = open.name;
         if (!valid_function_name(call.name, max_name_length_)) {
             return FallbackReason::InvalidToolName;
         }
         // Strict mode rejects a name outside the declared tool set. Tolerant mode keeps an
-        // otherwise well-formed call structured and leaves the identity judgment to the consumer:
-        // leaking the raw region to content would turn a valid call into prose.
+        // otherwise well-formed call structured and leaves the identity judgment to the
+        // consumer: leaking the raw region to content would turn a valid call into prose.
         if (!tolerant_ && contract_.enforce_declared_names &&
             find_tool_contract(contract_, call.name) == nullptr) {
             return FallbackReason::UndeclaredTool;
         }
-        pos = ws_boundary ? tag_end : tag_end + 1;
-
-        for (;;) {
-            skip_format_whitespace(text_, pos);
-            if (consume(pos, fn_close)) {
+        const Marker::Kind fn_close_kind =
+            open.kind == Marker::Kind::FunctionOpen ? Marker::Kind::FunctionClose
+                                                    : Marker::Kind::InvokeClose;
+        for (std::size_t i = idx + 1; ; ) {
+            if (i >= markers_.size()) {
+                // Tolerant: a missing function close is a truncation only when the region truly
+                // ends after the last complete parameter; trailing prose after it is a
+                // structural failure in both modes.
+                if (tolerant_ && !has_content_between(markers_[i - 1].end, text_.size())) {
+                    return FallbackReason::TruncatedTail;
+                }
+                return FallbackReason::MalformedStructure;
+            }
+            if (has_content_between(markers_[i - 1].end, markers_[i].begin)) {
+                return FallbackReason::MalformedStructure;
+            }
+            if (markers_[i].kind == fn_close_kind) {
+                idx = i + 1;
                 return FallbackReason::None;
             }
-            // Tolerant: the region is exhausted after the last complete parameter, so a missing
-            // function close is a truncation, not a malformed structure. parse() retains the
-            // recovered parameters; the strict parser still requires the closing tag.
-            if (tolerant_ && at_region_end(pos)) {
-                return FallbackReason::TruncatedTail;
+            if (markers_[i].kind != Marker::Kind::ParameterOpen) {
+                return FallbackReason::MalformedStructure;
             }
-            const FallbackReason failure = parse_parameter(pos, call);
+            const FallbackReason failure = parse_parameter(i, call, fn_close_kind, container);
             if (failure != FallbackReason::None) { return failure; }
         }
     }
 
-    FallbackReason parse_parameter(std::size_t& pos, RawToolCall& call) {
-        std::size_t header_begin = 0;
-        std::string_view param_close = "</parameter>";
-        if (starts_with_at(text_, pos, "<parameter")) {
-            header_begin = pos + 10;
-            param_close  = "</parameter>";
-        } else if (starts_with_at(text_, pos, "<param")) {
-            header_begin = pos + 6;
-            param_close  = "</param>";
-        } else {
-            return FallbackReason::MalformedStructure;
-        }
-
-        const std::size_t tag_end = text_.find('>', header_begin);
-        if (tag_end == std::string_view::npos || tag_end == header_begin) {
-            return FallbackReason::MalformedStructure;
-        }
-        const std::string_view header = text_.substr(header_begin, tag_end - header_begin);
-        const std::string_view name   = extract_name_from_tag_header(header);
-        if (name.empty()) {
-            return FallbackReason::MalformedStructure;
-        }
-
-        const std::size_t value_begin = tag_end + 1;
-        std::size_t value_end         = 0;
-        std::size_t close_len         = 0;
-        if (!find_parameter_close(value_begin, value_end, close_len, param_close)) {
+    FallbackReason parse_parameter(std::size_t& idx, RawToolCall& call, Marker::Kind fn_close_kind,
+                                   FunctionContainer container) {
+        const Marker& open = markers_[idx];
+        const std::string_view name = open.name;
+        const bool opaque_string    = is_declared_string_parameter(contract_, call.name, name);
+        const std::size_t value_begin = open.end;
+        std::size_t value_end = 0;
+        std::size_t close_idx = 0;
+        if (!find_parameter_close(idx, value_end, close_idx, open.close_kind, fn_close_kind,
+                                  container, opaque_string, call.name)) {
             if (tolerant_) {
-                // Tolerant: the region ends before the closing tag, so the output budget cut the
-                // parameter value. Keep the value up to the cut (last occurrence wins, as with a
-                // complete parameter) and flag the tail; the strict parser keeps the hard
-                // structural failure.
-                const std::string_view partial = text_.substr(value_begin, text_.size() - value_begin);
-                const auto existing = std::find_if(call.parameters.begin(), call.parameters.end(),
-                                                   [&](const RawParameter& candidate) { return candidate.name == name; });
+                // Tolerant: the region ends before the closing tag, so the output budget cut
+                // the parameter value. Keep the value up to the cut (last occurrence wins, as
+                // with a complete parameter) and flag the tail.
+                const std::string_view partial =
+                    text_.substr(value_begin, text_.size() - value_begin);
+                const auto existing =
+                    std::find_if(call.parameters.begin(), call.parameters.end(),
+                                 [&](const RawParameter& candidate) { return candidate.name == name; });
                 if (existing != call.parameters.end()) {
                     existing->value = partial;
                     ++duplicate_parameters_repaired_;
                 } else {
                     call.parameters.push_back(RawParameter{.name = name, .value = partial});
                 }
-                pos = text_.size();
+                idx = markers_.size();
                 return FallbackReason::TruncatedTail;
             }
             return FallbackReason::MalformedStructure;
@@ -786,32 +1218,170 @@ private:
         } else {
             call.parameters.push_back(RawParameter{.name = name, .value = value});
         }
-        pos = value_end + close_len;
+        idx = close_idx + 1;
         return FallbackReason::None;
     }
 
-    bool find_parameter_close(std::size_t value_begin, std::size_t& value_end,
-                              std::size_t& close_len, std::string_view required_close) const {
-        std::size_t depth = 1;
-        std::size_t scan  = value_begin;
-        while (scan < text_.size()) {
-            if (starts_with_at(text_, scan, required_close)) {
-                --depth;
-                if (depth == 0) {
-                    value_end = scan;
-                    close_len = required_close.size();
+    // A valid continuation after a completed function in this container. Every check is
+    // positional: the successor is examined at the first non-whitespace byte after the
+    // function close, so only a token that begins exactly there is seen; bytes between the
+    // close and a later token are prose at that position (a doubled '<' before a valid
+    // opener is one such run). The ToolCall container additionally requires that what
+    // follows the wrapper close is EOF, a valid top-level construct, or prose carrying no
+    // further "</tool_call>": a later wrapper close that the prose does not belong to is
+    // the boundary of a fake call embedded in value data, and accepting it would shadow a
+    // later, more complete close.
+    bool function_successor(std::size_t k, FunctionContainer container) const {
+        if (k + 1 >= markers_.size()) {
+            // TopLevel: a region that ends after the function close is a successor; the
+            // wrapper containers still require their own closing tag.
+            return container == FunctionContainer::TopLevel &&
+                   !has_content_between(markers_[k].end, text_.size());
+        }
+        const std::size_t expected = first_non_whitespace(markers_[k].end, markers_[k + 1].begin);
+        const bool aligned = expected == markers_[k + 1].begin;
+        switch (container) {
+        case FunctionContainer::ToolCall: {
+            if (!aligned || markers_[k + 1].kind != Marker::Kind::ToolCallClose) {
+                return false;
+            }
+            if (k + 2 >= markers_.size()) { return true; }
+            const std::size_t expected2 =
+                first_non_whitespace(markers_[k + 1].end, markers_[k + 2].begin);
+            if (expected2 == markers_[k + 2].begin) {
+                const Marker::Kind nxt = markers_[k + 2].kind;
+                if (nxt == Marker::Kind::ToolCallOpen || nxt == Marker::Kind::FunctionCallsOpen) {
                     return true;
                 }
-                scan += required_close.size();
-                continue;
+                if ((nxt == Marker::Kind::FunctionOpen || nxt == Marker::Kind::InvokeOpen) &&
+                    function_name_policy(markers_[k + 2].name)) {
+                    return true;
+                }
             }
-            std::size_t open_tag_end = 0;
-            if (is_param_open_at(text_, scan, open_tag_end)) {
+            for (std::size_t i = k + 2; i < markers_.size(); ++i) {
+                if (markers_[i].kind == Marker::Kind::ToolCallClose) { return false; }
+            }
+            return true;
+        }
+        case FunctionContainer::FunctionCalls: {
+            if (!aligned) { return false; }
+            if (markers_[k + 1].kind == Marker::Kind::FunctionCallsClose) { return true; }
+            return (markers_[k + 1].kind == Marker::Kind::FunctionOpen ||
+                    markers_[k + 1].kind == Marker::Kind::InvokeOpen) &&
+                   function_name_policy(markers_[k + 1].name);
+        }
+        case FunctionContainer::TopLevel: {
+            if (!aligned) { return false; }
+            const Marker::Kind nxt = markers_[k + 1].kind;
+            if (nxt == Marker::Kind::ToolCallOpen || nxt == Marker::Kind::FunctionCallsOpen) {
+                return true;
+            }
+            return (nxt == Marker::Kind::FunctionOpen || nxt == Marker::Kind::InvokeOpen) &&
+                   function_name_policy(markers_[k + 1].name);
+        }
+        }
+        return false;
+    }
+
+    // Marker k is a literal parameter close of the required spelling. It ends the value
+    // only when what follows continues the enclosing call: a genuine sibling, or the
+    // function close with a structural successor - in both cases a token aligned at the
+    // first non-whitespace byte after this close. In the tolerant relaxation pass a
+    // function close still counts when the region ends after it or only tokens remain
+    // that the container discards (a stray parameter open, plain prose); a marker the
+    // container does not expect there (a wrapper-foreign open) is the closing boundary of
+    // an embedded fake call in opaque data and never a sibling boundary.
+    bool parameter_close_structural(std::size_t k, FunctionContainer container, bool relaxed,
+                                    Marker::Kind fn_close_kind,
+                                    std::string_view fn_name) const {
+        if (k + 1 >= markers_.size()) {
+            // A complete last parameter at EOF is useful only to tolerant recovery, where
+            // parse_function() classifies the missing function close as a truncated tail.
+            return relaxed;
+        }
+        const std::size_t expected = first_non_whitespace(markers_[k].end, markers_[k + 1].begin);
+        if (expected != markers_[k + 1].begin) {
+            // Prose between this close and the next marker: the positional check at the
+            // expected position sees neither a close tag nor a parameter header.
+            return false;
+        }
+        const Marker& next = markers_[k + 1];
+        if (next.kind == fn_close_kind) {
+            if (function_successor(k + 1, container)) { return true; }
+            if (!relaxed) { return false; }
+            if (k + 2 >= markers_.size()) { return true; }
+            const std::size_t expected2 =
+                first_non_whitespace(markers_[k + 1].end, markers_[k + 2].begin);
+            if (expected2 != markers_[k + 2].begin) { return true; }
+            const Marker::Kind nxt2 = markers_[k + 2].kind;
+            if (nxt2 == Marker::Kind::ParameterOpen) { return true; }
+            return !is_region_open_kind(nxt2);
+        }
+        if (next.kind == Marker::Kind::ParameterOpen) {
+            return parameter_sibling_policy(fn_name, next.name);
+        }
+        return false;
+    }
+
+    bool find_opaque_parameter_close(std::size_t idx, std::size_t& value_end,
+                                     std::size_t& close_idx, Marker::Kind required_close,
+                                     Marker::Kind fn_close_kind, FunctionContainer container,
+                                     bool relaxed, std::string_view fn_name) const {
+        for (std::size_t k = idx + 1; k < markers_.size(); ++k) {
+            if (markers_[k].kind != required_close) { continue; }
+            if (parameter_close_structural(k, container, relaxed, fn_close_kind, fn_name)) {
+                value_end = markers_[k].begin;
+                close_idx = k;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool find_parameter_close(std::size_t idx, std::size_t& value_end, std::size_t& close_idx,
+                              Marker::Kind required_close, Marker::Kind fn_close_kind,
+                              FunctionContainer container, bool opaque_string,
+                              std::string_view fn_name) const {
+        if (opaque_string) {
+            // Declared string parameters are opaque data. Parameter elements are siblings in
+            // the Qwen grammar, not recursively nested elements, so a literal "<parameter...>"
+            // inside source code must not increase structural depth. Conversely, a literal
+            // "</parameter>" is data unless what follows can continue the enclosing function.
+            //
+            // The wire format is still intrinsically ambiguous if user data itself contains an
+            // exact complete closing boundary: no delimiter parser can distinguish that byte
+            // sequence without escaping or length-prefixing, so the value ends at the first
+            // such boundary and the following bytes may then be parsed as further parameters
+            // or calls without any fallback reason. Restricting this recovery to
+            // schema-declared strings avoids changing legacy/non-string parsing.
+            //
+            // Prefer a fully structural boundary. Only when that is impossible does tolerant
+            // mode relax the suffix check.
+            if (find_opaque_parameter_close(idx, value_end, close_idx, required_close,
+                                            fn_close_kind, container, /*relaxed*/ false,
+                                            fn_name)) {
+                return true;
+            }
+            return tolerant_ && find_opaque_parameter_close(idx, value_end, close_idx,
+                                                            required_close, fn_close_kind,
+                                                            container, /*relaxed*/ true, fn_name);
+        }
+
+        // Legacy and non-string values keep the historical balanced-marker behavior.
+        std::size_t depth = 1;
+        for (std::size_t k = idx + 1; k < markers_.size(); ++k) {
+            if (markers_[k].kind == Marker::Kind::ParameterOpen) {
                 ++depth;
-                scan = open_tag_end + 1;
                 continue;
             }
-            ++scan;
+            if (markers_[k].kind == required_close) {
+                --depth;
+                if (depth == 0) {
+                    value_end = markers_[k].begin;
+                    close_idx = k;
+                    return true;
+                }
+            }
         }
         return false;
     }
@@ -819,6 +1389,7 @@ private:
     std::string_view text_;
     std::size_t max_name_length_;
     const Contract& contract_;
+    std::vector<Marker> markers_;
     std::uint32_t duplicate_parameters_repaired_ = 0;
     bool tolerant_ = false;
 };
@@ -883,8 +1454,8 @@ ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text,
                                                  const ToolCallOutputContract& contract,
                                                  bool tolerant) {
     const std::string_view source(text);
-    std::size_t candidate = find_first_tool_marker(source);
-    if (candidate == std::string::npos) { return fallback(text); }
+    std::size_t candidate = find_first_region_open(source);
+    if (candidate == std::string_view::npos) { return fallback(text); }
 
     ParsedToolCallOutput out;
     out.diagnostics.marker_seen = true;
@@ -960,7 +1531,7 @@ std::string ToolCallOutputDecoder::feed(std::string_view text) {
         const char byte = text[index];
         if (!pending_tag_.empty()) {
             pending_tag_.push_back(byte);
-            if (matches_any_marker(pending_tag_)) {
+            if (marker_confirmed(pending_tag_)) {
                 tool_region_ = std::move(trailing_whitespace_);
                 trailing_whitespace_.clear();
                 tool_region_.append(pending_tag_);
@@ -969,7 +1540,7 @@ std::string ToolCallOutputDecoder::feed(std::string_view text) {
                 saw_tool_marker_ = true;
                 break;
             }
-            if (!is_prefix_of_any_marker(pending_tag_)) {
+            if (!marker_possible(pending_tag_)) {
                 visible.append(trailing_whitespace_);
                 trailing_whitespace_.clear();
                 visible.append(pending_tag_);
