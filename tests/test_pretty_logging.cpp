@@ -255,6 +255,44 @@ int main() {
             partial_output.find("prefix cache restored") == std::string::npos,
         "a partial prefix cache restore is not reported as a warning");
 
+    // A Host tier that keeps no snapshot restores nothing resumable: the warning says so rather
+    // than claiming the most valuable snapshots were kept.
+    std::string none_kept_output;
+    {
+        StderrCapture capture;
+        {
+            ninfer::product::LoggingRuntime logging(
+                {.logger_name  = "ninfer-serve",
+                 .color        = ninfer::product::LogColorMode::Never,
+                 .presentation = ninfer::product::LogPresentation::Service});
+            ninfer::product::StartupLogRenderer startup(logging);
+            ninfer::LoadSummary load;
+            load.model_name     = "qwen3.6-27b";
+            load.cuda_sync_mode = "blocking";
+            load.prefix_cache   = {.attempted           = true,
+                                   .restored            = true,
+                                   .blocks              = 0,
+                                   .snapshots           = 0,
+                                   .bytes               = 0,
+                                   .seconds             = 0.1,
+                                   .saved_blocks        = 15807,
+                                   .saved_snapshots     = 98,
+                                   .required_host_bytes = 50ULL << 30,
+                                   .host_bytes          = 1ULL << 30};
+            startup.engine_ready(load);
+            logging.flush();
+        }
+        none_kept_output = capture.finish();
+    }
+    failures += check(
+        none_kept_output.find("  WARN  prefix cache not restored | none of the file's 98 snapshots "
+                              "fits: it needs 50.0 GiB of Host tier and --host-cache-mib gives "
+                              "1.00 GiB | the save at shutdown replaces the file") !=
+                std::string::npos &&
+            none_kept_output.find("partly restored") == std::string::npos &&
+            none_kept_output.find("most valuable") == std::string::npos,
+        "a restore that kept no snapshot claims its most valuable snapshots were kept");
+
     std::string tool_output;
     {
         StderrCapture capture;

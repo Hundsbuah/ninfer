@@ -322,7 +322,15 @@ void StartupLogRenderer::engine_ready(const LoadSummary& load) {
                          context_cost_preset_source_name(load.context_cost.prefill_source),
                          load.prefill_signature);
     const LoadSummary::PrefixCacheRestore& cache = load.prefix_cache;
-    if (cache.restored && cache.required_host_bytes > cache.host_bytes) {
+    if (cache.restored && cache.required_host_bytes > cache.host_bytes && cache.snapshots == 0) {
+        // Nothing resumes without a snapshot, and a restore keeps only the blocks its snapshots
+        // resume through: say so, since the save at shutdown then replaces the whole file.
+        impl_->logger->warn(
+            "prefix cache not restored | none of the file's {} snapshots fits: it needs {} of Host "
+            "tier and --host-cache-mib gives {} | the save at shutdown replaces the file",
+            format_pretty_count(cache.saved_snapshots),
+            format_pretty_bytes(cache.required_host_bytes), format_pretty_bytes(cache.host_bytes));
+    } else if (cache.restored && cache.required_host_bytes > cache.host_bytes) {
         impl_->logger->warn(
             "prefix cache partly restored | {} of {} snapshots | {} of {} blocks | {} | {} | the "
             "file needs {} of Host tier; --host-cache-mib gives {}, so the most valuable "
