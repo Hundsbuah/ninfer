@@ -22,6 +22,7 @@
 
 #include <cstdint>
 #include <type_traits>
+#include <utility>
 
 namespace ninfer::ops::detail {
 
@@ -108,9 +109,10 @@ __device__ __forceinline__ void q8_a16_sliced_k_mma(Q8LinearOperands operands, O
     constexpr bool kFragmentEpilogue = requires {
         epilogue.store_fragment(output, 0, 0, float4{}, operands.rows, 0);
     };
+    // std::declval names the row lvalue portably: Linux nvcc 13.4 rejects a dereferenced cast of
+    // nullptr here and crashes on a requires parameter list.
     constexpr bool kRowEpilogue = requires {
-        epilogue.apply_row(output, 0, 0, *reinterpret_cast<const float(*)[ActiveCols]>(nullptr),
-                           0);
+        epilogue.apply_row(output, 0, 0, std::declval<const float (&)[ActiveCols]>(), 0);
     };
     static_assert(kRowTiles == 1 || (std::is_same_v<RowPolicy, Q8SlicedKIdentityRows> &&
                                      !kFragmentEpilogue && !kRowEpilogue),
