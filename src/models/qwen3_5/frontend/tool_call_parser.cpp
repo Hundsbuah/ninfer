@@ -100,63 +100,140 @@ std::string_view unquote(std::string_view str) {
     return str;
 }
 
-std::string_view extract_name_from_tag_header(std::string_view header) {
-    header = trim_format_whitespace(header);
-    if (header.starts_with('=')) {
-        return unquote(header.substr(1));
-    }
-    for (std::size_t i = 0; i < header.size();) {
-        if (is_format_whitespace(header[i])) {
-            ++i;
+// Quote-aware scan for the byte that terminates an opening tag: the first '>' outside a
+// single- or double-quoted attribute or direct-name value. A quote is closed only by the
+// same quote; there is no escape syntax (the wire format has none). Returns false when no
+// unquoted '>' exists or EOF is reached with a quote still open - both are invalid headers.
+bool find_tag_end(std::string_view text, std::size_t begin, std::size_t& tag_end) {
+    char quote = '\0';
+    for (std::size_t i = begin; i < text.size(); ++i) {
+        const char byte = text[i];
+        if (quote != '\0') {
+            if (byte == quote) { quote = '\0'; }
             continue;
         }
-        const std::size_t attr_begin = i;
-        while (i < header.size() && header[i] != '=' && !is_format_whitespace(header[i]) && header[i] != '>') {
-            ++i;
+        if (byte == '\'' || byte == '"') {
+            quote = byte;
+            continue;
         }
-        const std::string_view attr_name = header.substr(attr_begin, i - attr_begin);
-        skip_format_whitespace(header, i);
-        if (i < header.size() && header[i] == '=') {
-            ++i;
-            skip_format_whitespace(header, i);
-            if (i >= header.size()) break;
-            std::string_view val;
-            if (header[i] == '"' || header[i] == '\'') {
-                const char q = header[i];
-                const std::size_t q_start = i + 1;
-                const std::size_t q_end = header.find(q, q_start);
-                if (q_end != std::string_view::npos) {
-                    val = header.substr(q_start, q_end - q_start);
-                    i = q_end + 1;
-                } else {
-                    val = header.substr(q_start);
-                    i = header.size();
-                }
-            } else {
-                const std::size_t val_begin = i;
-                while (i < header.size() && !is_format_whitespace(header[i]) && header[i] != '/' && header[i] != '>') {
-                    ++i;
-                }
-                val = header.substr(val_begin, i - val_begin);
-            }
-            if (attr_name == "name") {
-                return val;
-            }
+        if (byte == '>') {
+            tag_end = i;
+            return true;
         }
     }
-    return unquote(header);
+    return false;
+}
+
+constexpr bool is_attr_name_start(char byte) {
+    return (byte >= 'a' && byte <= 'z') || (byte >= 'A' && byte <= 'Z') || byte == '_';
+}
+
+constexpr bool is_attr_name_rest(char byte) {
+    return is_attr_name_start(byte) || is_ascii_digit(byte) || byte == '.' || byte == ':' ||
+           byte == '-';
+}
+
+enum class HeaderSyntax : std::uint8_t {
+    DirectName,
+    Attributes,
+};
+
+struct NameHeaderPayload {
+    std::string_view name;
+    HeaderSyntax syntax;
+};
+
+// Validates the complete payload between an opener prefix and its quote-aware terminating
+// '>'. Every payload byte must belong to the syntax: a name that is found is not a header
+// that is valid. The two accepted forms:
+//
+//   direct:   "=name" - the name may be quoted ("='name'", '="name"'), where the quote must
+//             enclose the whole remainder; an unquoted name is the whole remainder, so a
+//             declared unusual name ("=a<b") keeps working, and a fake opener that scans
+//             through value data to a later ">" (="X\nif (a") yields a name that is not a
+//             plausible identifier.
+//   attrs:    whitespace-separated attributes "name="value""; values may be single- or
+//             double-quoted (a quoted value may contain '>') or unquoted (up to whitespace);
+//             an attribute without '=' or trailing junk makes the whole header invalid; the
+//             first name= attribute supplies the name and must be non-empty.
+bool parse_name_header_payload(std::string_view payload, NameHeaderPayload& parsed) {
+    payload = trim_format_whitespace(payload);
+    if (payload.starts_with('=')) {
+        const std::string_view rest = payload.substr(1);
+        if (rest.empty()) { return false; }
+        if (rest.front() == '"' || rest.front() == '\'') {
+            const char quote = rest.front();
+            if (rest.size() < 3 || rest.back() != quote) { return false; }
+            const std::string_view name =
+                trim_format_whitespace(rest.substr(1, rest.size() - 2));
+            if (name.empty()) { return false; }
+            parsed.name   = name;
+            parsed.syntax = HeaderSyntax::DirectName;
+            return true;
+        }
+        parsed.name   = rest;
+        parsed.syntax = HeaderSyntax::DirectName;
+        return true;
+    }
+
+    std::string_view name;
+    bool has_name = false;
+    std::size_t i  = 0;
+    while (i < payload.size()) {
+        while (i < payload.size() && is_format_whitespace(payload[i])) { ++i; }
+        if (i >= payload.size()) { break; }
+        const std::size_t attr_begin = i;
+        while (i < payload.size() && payload[i] != '=' && !is_format_whitespace(payload[i])) {
+            ++i;
+        }
+        const std::string_view attr_name = payload.substr(attr_begin, i - attr_begin);
+        if (attr_begin >= i || !is_attr_name_start(payload[attr_begin]) ||
+            std::any_of(attr_name.begin() + 1, attr_name.end(),
+                        [](char byte) { return !is_attr_name_rest(byte); })) {
+            return false;
+        }
+        if (i >= payload.size() || payload[i] != '=') { return false; }
+        ++i;
+        skip_format_whitespace(payload, i);
+        std::string_view value;
+        if (i < payload.size() && (payload[i] == '"' || payload[i] == '\'')) {
+            const char quote   = payload[i];
+            const std::size_t q_start = i + 1;
+            i = q_start;
+            while (i < payload.size() && payload[i] != quote) { ++i; }
+            if (i >= payload.size()) { return false; }
+            value = payload.substr(q_start, i - q_start);
+            ++i;
+        } else {
+            const std::size_t v_begin = i;
+            while (i < payload.size() && !is_format_whitespace(payload[i])) { ++i; }
+            value = payload.substr(v_begin, i - v_begin);
+        }
+        if (attr_name == "name" && !has_name) {
+            if (value.empty()) { return false; }
+            name     = value;
+            has_name = true;
+        }
+    }
+    if (!has_name) { return false; }
+    parsed.name   = name;
+    parsed.syntax = HeaderSyntax::Attributes;
+    return true;
 }
 
 // The canonical parameter opener grammar shared by parameter parsing and structural
 // boundary detection: "<parameter" or "<param", then a byte that delimits the prefix
-// ('=', format whitespace, or '>'), then header bytes terminated by the first '>'. The
-// byte after the prefix must delimit it: a longer identifier such as "<parameterX>" is
-// not a parameter opener, so the two parser stages can never classify the same bytes
-// differently.
+// ('=', format whitespace, or '>'), then a header payload terminated by the quote-aware
+// tag end and fully validated by parse_name_header_payload(). The byte after the prefix
+// must delimit it: a longer identifier such as "<parameterX>" is not a parameter opener.
+// Because the payload is validated as a whole, a fake opener that finds its ">" in value
+// data (an attribute header carrying trailing source code, a direct name carrying markup)
+// is rejected by this one grammar - so the two parser stages can never classify the same
+// bytes differently.
 struct ParameterHeader {
     std::size_t header_begin; // first byte after the opener prefix
-    std::size_t tag_end;      // index of the header's terminating '>'
-    std::string_view name;    // extracted parameter name; empty when the header yields none
+    std::size_t tag_end;      // index of the header's quote-aware terminating '>'
+    std::string_view name;    // the validated parameter name; empty when the header yields none
     std::string_view close_tag;
 };
 
@@ -177,14 +254,17 @@ bool parse_parameter_header(std::string_view text, std::size_t pos, ParameterHea
     if (separator != '=' && separator != '>' && !is_format_whitespace(separator)) {
         return false;
     }
-    const std::size_t tag_end = text.find('>', header_begin);
-    if (tag_end == std::string_view::npos || tag_end == header_begin) {
+    std::size_t tag_end = 0;
+    if (!find_tag_end(text, header_begin, tag_end) || tag_end == header_begin) {
+        return false;
+    }
+    NameHeaderPayload payload;
+    if (!parse_name_header_payload(text.substr(header_begin, tag_end - header_begin), payload)) {
         return false;
     }
     header.header_begin = header_begin;
     header.tag_end      = tag_end;
-    header.name         =
-        extract_name_from_tag_header(text.substr(header_begin, tag_end - header_begin));
+    header.name         = payload.name;
     header.close_tag    = close_tag;
     return true;
 }
@@ -206,6 +286,105 @@ bool is_param_close_at(std::string_view text, std::size_t pos, std::size_t& tag_
         return true;
     }
     return false;
+}
+
+enum class FunctionTagKind : std::uint8_t {
+    Function,
+    Invoke,
+};
+
+struct FunctionHeader {
+    std::size_t header_begin; // first byte after the opener prefix
+    std::size_t tag_end;      // index of the header's quote-aware terminating '>'
+    std::string_view name;    // the function name; empty when the header yields none
+    std::string_view close_tag;
+    FunctionTagKind kind;
+    bool recovered_missing_gt; // true when the missing-'> recovery supplied the tag end
+};
+
+// The payload stage shared by function parsing and structural boundary detection, mirroring
+// parse_parameter_header(): the quote-aware tag end, then full payload validation by
+// parse_name_header_payload(). A name that is found is not a header that is valid. The
+// missing-'> recovery (tolerant mode) fires before the payload parse and supplies both the
+// tag end and the name: the model sometimes drops the '>' after the function name (for
+// example a name followed directly by a newline and a parameter tag), so it recovers by
+// scanning the identifier run and accepting it when format whitespace separates it from the
+// next '<' or end of region. A header that fails here fails in every stage alike.
+bool parse_function_payload(std::string_view text, std::size_t header_begin,
+                            std::size_t max_name_length, bool tolerant,
+                            std::string_view close_tag, FunctionTagKind kind,
+                            FunctionHeader& header) {
+    std::size_t tag_end = 0;
+    const bool found_gt = find_tag_end(text, header_begin, tag_end);
+    header.header_begin = header_begin;
+    header.close_tag    = close_tag;
+    header.kind         = kind;
+    header.recovered_missing_gt = false;
+    header.name           = std::string_view{};
+    header.tag_end        = tag_end;
+    if (tolerant) {
+        std::size_t scan = header_begin;
+        while (scan < text.size() && text[scan] == '=') { ++scan; }
+        const std::size_t ident_begin = scan;
+        while (scan < text.size() && scan - header_begin < max_name_length) {
+            const char byte = text[scan];
+            if (!is_ascii_alphanumeric(byte) && byte != '_' && byte != '-') { break; }
+            ++scan;
+        }
+        if (scan > ident_begin && scan < text.size() && is_format_whitespace(text[scan]) &&
+            (!found_gt || scan < tag_end)) {
+            std::size_t after = scan;
+            while (after < text.size() && is_format_whitespace(text[after])) { ++after; }
+            if (after >= text.size() || text[after] == '<') {
+                header.tag_end               = scan;
+                header.recovered_missing_gt  = true;
+                header.name                  = text.substr(ident_begin, scan - ident_begin);
+                return true;
+            }
+        }
+    }
+    if (!found_gt || tag_end == header_begin) { return false; }
+    NameHeaderPayload payload;
+    if (!parse_name_header_payload(text.substr(header_begin, tag_end - header_begin), payload)) {
+        return false;
+    }
+    header.name = payload.name;
+    return true;
+}
+
+// The strict opener boundary: the byte after "<function" or "<invoke>" must delimit the
+// prefix ('=', format whitespace, or '>'). True when the text opens a function tag at pos;
+// reports the prefix end, the matching close tag, and the tag kind.
+bool function_opener_prefix_at(std::string_view text, std::size_t pos, std::size_t& prefix_end,
+                               std::string_view& close_tag, FunctionTagKind& kind) {
+    if (starts_with_at(text, pos, "<function")) {
+        prefix_end = pos + 9;
+        close_tag  = "</function>";
+        kind       = FunctionTagKind::Function;
+    } else if (starts_with_at(text, pos, "<invoke")) {
+        prefix_end = pos + 7;
+        close_tag  = "</invoke>";
+        kind       = FunctionTagKind::Invoke;
+    } else {
+        return false;
+    }
+    if (prefix_end >= text.size()) { return false; }
+    const char separator = text[prefix_end];
+    return separator == '=' || separator == '>' || is_format_whitespace(separator);
+}
+
+// The canonical function opener grammar shared by function parsing and structural boundary
+// detection: "<function" or "<invoke", then the strict opener boundary, then the validated
+// payload of parse_function_payload(). A longer identifier such as "<functionbash>" is not
+// a function opener, so the two parser stages can never classify the same bytes differently.
+bool parse_function_header(std::string_view text, std::size_t pos, std::size_t max_name_length,
+                           bool tolerant, FunctionHeader& header) {
+    std::size_t prefix_end = 0;
+    std::string_view close_tag;
+    FunctionTagKind kind;
+    if (!function_opener_prefix_at(text, pos, prefix_end, close_tag, kind)) { return false; }
+    return parse_function_payload(text, prefix_end, max_name_length, tolerant, close_tag, kind,
+                                  header);
 }
 
 static constexpr std::string_view kToolMarkers[] = {
@@ -413,12 +592,13 @@ bool is_declared_string_parameter(const Contract& contract, std::string_view too
            admits_type(parameter->types, SchemaType::String);
 }
 
-// Conservative ordinary parameter identifier, used only to decide whether an undeclared
-// candidate sibling may terminate an opaque string. Official chat templates emit
-// parameter headers as "<parameter=<name>" with identifier-like names; a name carrying
-// markup, format whitespace, control bytes, or other non-identifier bytes can only be
-// the product of a fake opener that found its first ">" in value data. Declared names
-// are governed by the tool contract, not by this grammar.
+// Fallback trust policy for undeclared candidate siblings. After a literal close, a
+// following parameter opener is structural only when the current tool contract declares
+// its name (trusted by definition). An undeclared name is trusted only as a fallback,
+// and only while it is still a plausible ordinary parameter identifier - the form the
+// official chat templates emit as "<parameter=<name>". A name carrying markup, format
+// whitespace, control bytes, or other non-identifier bytes can only be the product of a
+// fake opener that found its first ">" in value data, so it terminates nothing.
 bool is_ordinary_parameter_name(std::string_view name) {
     if (name.empty()) { return false; }
     for (const char byte : name) {
@@ -710,18 +890,21 @@ private:
 
     FallbackReason parse_function(std::size_t& pos, RawToolCall& call,
                                   FunctionContainer container) {
-        std::size_t header_begin = 0;
-        std::string_view fn_close = "</function>";
-        if (starts_with_at(text_, pos, "<function")) {
-            header_begin = pos + 9;
-            fn_close = "</function>";
-        } else if (starts_with_at(text_, pos, "<invoke")) {
-            header_begin = pos + 7;
-            fn_close = "</invoke>";
+        FunctionHeader header;
+        std::string_view fn_close;
+        FunctionTagKind kind;
+        std::size_t prefix_end = 0;
+        if (function_opener_prefix_at(text_, pos, prefix_end, fn_close, kind)) {
+            // The same canonical opener grammar the structural boundary detection uses: a byte
+            // sequence that is not a function opener here is not one there either.
+            if (!parse_function_payload(text_, prefix_end, max_name_length_, tolerant_, fn_close,
+                                        kind, header)) {
+                return FallbackReason::InvalidToolName;
+            }
         } else if (tolerant_) {
             // Recover a malformed function opener: a dropped or doubled leading '<', a leaked
             // ChatML turn marker, or a dropped 'function'/'invoke' keyword, followed by '=' or a
-            // name. A form that yields no valid name is rejected by valid_function_name below, so
+            // name. A form that yields no valid name is rejected by the payload stage below, so
             // prose after a marker cannot pass.
             std::size_t scan = pos;
             while (scan < text_.size() && text_[scan] == '<') { ++scan; }
@@ -735,42 +918,17 @@ private:
                 return FallbackReason::MalformedStructure;
             }
             if (text_[scan] == '=') { ++scan; }
-            header_begin = scan;
-            fn_close = kw_len == 8 ? "</function>" : "</invoke>";
+            prefix_end = scan;
+            fn_close   = kw_len == 8 ? "</function>" : "</invoke>";
+            kind       = kw_len == 8 ? FunctionTagKind::Function : FunctionTagKind::Invoke;
+            if (!parse_function_payload(text_, prefix_end, max_name_length_, tolerant_, fn_close,
+                                        kind, header)) {
+                return FallbackReason::InvalidToolName;
+            }
         } else {
             return FallbackReason::MalformedStructure;
         }
-
-        std::size_t tag_end = text_.find('>', header_begin);
-        bool ws_boundary = false;
-        // Tolerant: the model sometimes drops the '>' after the function name (for example a name
-        // followed directly by a newline and a parameter tag). Recover by scanning the identifier
-        // run and accepting it when format whitespace separates it from the next '<' or end of
-        // region.
-        if (tolerant_) {
-            std::size_t scan = header_begin;
-            while (scan < text_.size() && text_[scan] == '=') { ++scan; }
-            const std::size_t ident_begin = scan;
-            while (scan < text_.size() && scan - header_begin < max_name_length_) {
-                const char byte = text_[scan];
-                if (!is_ascii_alphanumeric(byte) && byte != '_' && byte != '-') { break; }
-                ++scan;
-            }
-            if (scan > ident_begin && scan < text_.size() && is_format_whitespace(text_[scan]) &&
-                (tag_end == std::string_view::npos || scan < tag_end)) {
-                std::size_t after = scan;
-                while (after < text_.size() && is_format_whitespace(text_[after])) { ++after; }
-                if (after >= text_.size() || text_[after] == '<') {
-                    tag_end     = scan;
-                    ws_boundary = true;
-                }
-            }
-        }
-        if (tag_end == std::string_view::npos || tag_end == header_begin) {
-            return FallbackReason::InvalidToolName;
-        }
-        const std::string_view header = text_.substr(header_begin, tag_end - header_begin);
-        call.name = extract_name_from_tag_header(header);
+        call.name = header.name;
         if (!valid_function_name(call.name, max_name_length_)) {
             return FallbackReason::InvalidToolName;
         }
@@ -781,7 +939,7 @@ private:
             find_tool_contract(contract_, call.name) == nullptr) {
             return FallbackReason::UndeclaredTool;
         }
-        pos = ws_boundary ? tag_end : tag_end + 1;
+        pos = header.recovered_missing_gt ? header.tag_end : header.tag_end + 1;
 
         for (;;) {
             skip_format_whitespace(text_, pos);
@@ -856,18 +1014,61 @@ private:
         return FallbackReason::None;
     }
 
+    // The same header grammar parse_function() consumes, applied to a boundary candidate:
+    // a function opener that does not parse as a header here does not parse in the consumer
+    // either. Tolerant mode accepts what the tolerant consumer accepts (undeclared names,
+    // the missing-'> recovery); strict mode adds name validity and the declared-tool policy.
+    bool has_valid_function_header(std::size_t pos, FunctionHeader& header) const {
+        if (!parse_function_header(text_, pos, max_name_length_, tolerant_, header)) {
+            return false;
+        }
+        if (!tolerant_) {
+            if (!valid_function_name(header.name, max_name_length_)) { return false; }
+            if (contract_.enforce_declared_names && find_tool_contract(contract_, header.name) ==
+                                                     nullptr) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // A valid continuation after a completed function in this container. The ToolCall
+    // container additionally requires that what follows the wrapper close is EOF, a valid
+    // top-level construct, or prose carrying no further "</tool_call>": a later wrapper
+    // close that the prose does not belong to is the boundary of a fake call embedded in
+    // value data, and accepting it would shadow a later, more complete close.
     bool has_structural_function_successor(std::size_t pos,
                                            FunctionContainer container) const {
         skip_format_whitespace(text_, pos);
         switch (container) {
-        case FunctionContainer::ToolCall:
-            return starts_with_at(text_, pos, kToolClose);
-        case FunctionContainer::FunctionCalls:
-            return starts_with_at(text_, pos, "</function_calls>") ||
-                   starts_with_at(text_, pos, "<function") ||
-                   starts_with_at(text_, pos, "<invoke");
-        case FunctionContainer::TopLevel:
-            return pos == text_.size() || matches_any_marker(text_.substr(pos));
+        case FunctionContainer::ToolCall: {
+            if (!starts_with_at(text_, pos, kToolClose)) { return false; }
+            const std::size_t after = pos + kToolClose.size();
+            std::size_t at = after;
+            skip_format_whitespace(text_, at);
+            if (at == text_.size()) { return true; }
+            if (starts_with_at(text_, at, "<tool_call>") ||
+                starts_with_at(text_, at, "<function_calls>")) {
+                return true;
+            }
+            FunctionHeader header;
+            if (has_valid_function_header(at, header)) { return true; }
+            return text_.find(kToolClose, after) == std::string_view::npos;
+        }
+        case FunctionContainer::FunctionCalls: {
+            if (starts_with_at(text_, pos, "</function_calls>")) { return true; }
+            FunctionHeader header;
+            return has_valid_function_header(pos, header);
+        }
+        case FunctionContainer::TopLevel: {
+            if (pos == text_.size()) { return true; }
+            if (starts_with_at(text_, pos, "<tool_call>") ||
+                starts_with_at(text_, pos, "<function_calls>")) {
+                return true;
+            }
+            FunctionHeader header;
+            return has_valid_function_header(pos, header);
+        }
         }
         return false;
     }

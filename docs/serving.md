@@ -239,17 +239,28 @@ String parameters preserve function/tool-call markers and balanced nested
 `<parameter=...>...</parameter>` text as value bytes. For a parameter whose declared schema
 admits a string, parameter delimiters are opaque: a literal opener in the value does not nest,
 and a literal close ends the value only when what follows continues the call (a sibling
-parameter whose header extracts to a parameter name, or the function close, and in tolerant mode
+parameter whose header validates as a parameter opener, or the function close, and in tolerant mode
 also a function close followed by discarded trailing tokens or the end of the cut region);
-unmatched literal delimiters and a sibling whose extracted name is neither declared for
-the current function nor an ordinary parameter identifier remain representable value
-bytes. A non-ordinary name - embedded markup, format whitespace, control bytes - means
+unmatched literal delimiters, a sibling whose header is not a valid opener, and a sibling
+whose name is neither declared for the current function nor an ordinary parameter identifier
+remain representable value bytes.
+A non-ordinary name - embedded markup, format whitespace, control bytes - means
 the candidate opener had no terminator of its own and found its first `>` in value data
 (structural markup swallowed from a literal close, a function close, or a wrapper close,
 or an ordinary byte such as a comparison operator or a shell redirection); chat templates
 emit declared names verbatim between the opener prefix and the first `>`, and NInfer does
 not restrict declared names to a grammar excluding markup, so the current function's
 declared parameter set alone decides names that are not ordinary.
+The opener grammar is strict in both modes: the byte after a `<function`, `<invoke`,
+`<parameter`, or `<param` prefix must delimit the prefix (`=`, format whitespace, or `>`),
+so a longer identifier such as `<functionbash>` opens nothing, and the header payload must
+validate as a whole - a byte that belongs to neither the name nor a `name=` attribute
+invalidates the opener. Two formerly accepted permissive forms are rejected deliberately:
+a bare space-separated name without `=` or a quoted attribute (for example
+`<function NAME>`) and a direct name containing a double-quote character (for example
+`<parameter=a"b>`); the Qwen chat templates emit names verbatim between `=` and the first
+`>`, so neither form belongs to the wire format and both would re-open the fake-opener
+ambiguity this grammar removes.
 Non-string and untyped parameters keep the balanced rule,
 where an
 unmatched nested opener or a standalone close makes that tool-call region ordinary content. The
