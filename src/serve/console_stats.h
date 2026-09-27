@@ -32,7 +32,10 @@ struct ConsoleRequestSample {
     std::uint64_t computed_prefill_tokens  = 0;
     double prefill_seconds                 = 0.0;
     std::uint64_t decode_tokens            = 0;
+    // The request's share of each batched decode round, and the full elapsed time of those rounds;
+    // their sums give aggregate decode throughput and the time-weighted mean decode batch size.
     double decode_seconds                  = 0.0;
+    double decode_round_seconds            = 0.0;
     std::uint64_t model_rounds             = 0;
     std::uint64_t model_drafted_tokens     = 0;
     std::uint64_t model_accepted_tokens    = 0;

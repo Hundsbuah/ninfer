@@ -42,6 +42,7 @@ int main() {
 
     // Engine speculative totals include n-gram rounds; the model drafter gets only the remainder.
     GenerationOutcome mixed                     = outcome(1000, 600, 101, 0.25, 0.2, 2.0);
+    mixed.metrics.decode_share_seconds          = 0.8;
     mixed.metrics.speculative_backend           = ninfer::SpeculativeBackend::DFlash2;
     mixed.metrics.speculative_rounds            = 30;
     mixed.metrics.speculative_draft_tokens      = 300;
@@ -99,6 +100,23 @@ int main() {
     }
     failures += check(batched.sum.decode_tokens == 100 && batched.sum.decode_seconds == 1.0,
                       "decode rate must count each shared batched round once");
+    failures += check(batched.sum.decode_round_seconds / batched.sum.decode_seconds == 2.0,
+                      "two requests sharing every decode round must average a batch of two");
+
+    // A round's batch weighs by its duration: 1 s solo followed by 3 s at batch 3 averages 2.5,
+    // not the 2.0 of counting the two rounds equally.
+    ConsoleStatsTotals weighted;
+    GenerationOutcome long_lane            = outcome(10, 0, 3, 0.1, 0.01, 4.0);
+    long_lane.metrics.decode_share_seconds = 1.0 + 3.0 / 3.0;
+    weighted.add(make_console_request_sample(long_lane));
+    for (int index = 0; index < 2; ++index) {
+        GenerationOutcome short_lane            = outcome(10, 0, 2, 0.1, 0.01, 3.0);
+        short_lane.metrics.decode_share_seconds = 3.0 / 3.0;
+        weighted.add(make_console_request_sample(short_lane));
+    }
+    failures += check(std::abs(weighted.sum.decode_round_seconds / weighted.sum.decode_seconds -
+                               2.5) < 1e-12,
+                      "mean decode batch must weigh each round by its duration");
 
     ConsoleStatsSnapshot snapshot;
     snapshot.completed           = 1;
@@ -124,7 +142,9 @@ int main() {
         failures += check(contains(row, "60.0%"), "row must show the cache-hit ratio");
         failures += check(contains(row, " 2.00k ") && !contains(row, "tok/s"),
                           "row must show the prefill rate without repeating its unit");
-        failures += check(contains(row, " 50.0 "), "row must show the decode rate");
+        failures += check(contains(row, " 125.0 "), "row must show the decode rate");
+        failures += check(contains(lines[1], "decode  batch") && contains(row, " 125.0   2.50 "),
+                          "the mean decode batch must follow the decode rate");
         failures += check(contains(row, "40.0%") && contains(row, "4.00"),
                           "row must show model-drafter acceptance and accepted per round");
         failures += check(contains(row, "70.0%") && contains(row, "25.0%"),
@@ -132,7 +152,7 @@ int main() {
         // Every column shown, the table still fits a console snapped to half of a 1920-pixel
         // screen.
         for (std::size_t index = 1; index < lines.size(); ++index) {
-            failures += check(ninfer::product::terminal_display_width(lines[index]) <= 86,
+            failures += check(ninfer::product::terminal_display_width(lines[index]) <= 93,
                               "panel table must fit a half-width console");
         }
     }

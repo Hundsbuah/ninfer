@@ -1001,11 +1001,12 @@ more than ten have completed, one over the last ten:
 | cached | prefix-cache hit tokens / prompt tokens |
 | prefill | computed (non-cached) prompt tokens / prefill seconds, in tok/s |
 | decode | aggregate decode throughput in tok/s: output tokens after the first / decode seconds, where each batched decode round's time is split across the requests in it, so concurrent requests add up rather than each showing its per-stream rate |
+| batch | mean decode batch size, each decode round weighted by its duration; decode / batch is the per-stream rate. The throughput record's `batch` counts rounds equally over its interval instead |
 | `<DRAFTER>`, acc/rnd | model-drafter (MTP or DFlash) accepted / drafted tokens, and accepted tokens per model-drafted round; n-gram rounds are excluded |
 | ngram, ng rnds | n-gram accepted / drafted tokens and verification rounds |
 | archive | n-gram archive accepted / drafted tokens, shown once the archive has drafted |
 
-The table is 77 columns wide, 86 with the archive column, so it fits a console window snapped to
+The table is 84 columns wide, 93 with the archive column, so it fits a console window snapped to
 half of a 1920-pixel screen; a narrower window cuts the rows at its edge.
 
 Ratios and rates divide summed tokens by summed seconds, so each request weighs by its size. The

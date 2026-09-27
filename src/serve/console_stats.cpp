@@ -36,11 +36,10 @@ std::string rate_cell(std::uint64_t tokens, double seconds) {
     return text;
 }
 
-std::string per_round_cell(std::uint64_t accepted, std::uint64_t rounds) {
-    if (rounds == 0) { return std::string(kNone); }
+std::string mean_cell(double total, double count) {
+    if (count <= 0.0) { return std::string(kNone); }
     char buffer[32];
-    std::snprintf(buffer, sizeof(buffer), "%.2f",
-                  static_cast<double>(accepted) / static_cast<double>(rounds));
+    std::snprintf(buffer, sizeof(buffer), "%.2f", total / count);
     return buffer;
 }
 
@@ -50,16 +49,16 @@ struct Column {
 };
 
 // The row label is left-aligned; every value column is right-aligned under its heading. The
-// table is 77 columns wide (86 with the archive column), so it fits a console window snapped to
+// table is 84 columns wide (93 with the archive column), so it fits a console window snapped to
 // half of a 1920-pixel screen.
 constexpr std::size_t kLabelWidth   = 7;
 constexpr std::size_t kArchiveWidth = 9;
 constexpr Column kColumns[]         = {
-    {"TTFT", 8},  {"cached", 8},  {"prefill", 9}, {"decode", 8},
+    {"TTFT", 8},  {"cached", 8},  {"prefill", 9}, {"decode", 8},   {"batch", 7},
     {"draft", 9}, {"acc/rnd", 9}, {"ngram", 8},   {"ng rnds", 10},
 };
 constexpr std::size_t kColumnCount   = std::size(kColumns);
-constexpr std::size_t kDrafterColumn = 4; // heading names the configured model drafter
+constexpr std::size_t kDrafterColumn = 5; // heading names the configured model drafter
 
 void append_right(std::string& out, std::string_view text, std::size_t width) {
     if (text.size() < width) { out.append(width - text.size(), ' '); }
@@ -90,8 +89,10 @@ std::string render_row(std::string_view label, const ConsoleStatsTotals& totals,
         ratio_cell(sum.cache_hit_tokens, sum.prompt_tokens),
         rate_cell(sum.computed_prefill_tokens, sum.prefill_seconds),
         rate_cell(sum.decode_tokens, sum.decode_seconds),
+        mean_cell(sum.decode_round_seconds, sum.decode_seconds),
         ratio_cell(sum.model_accepted_tokens, sum.model_drafted_tokens),
-        per_round_cell(sum.model_accepted_tokens, sum.model_rounds),
+        mean_cell(static_cast<double>(sum.model_accepted_tokens),
+                  static_cast<double>(sum.model_rounds)),
         ratio_cell(sum.ngram_accepted_tokens, sum.ngram_drafted_tokens),
         sum.ngram_rounds == 0 ? std::string(kNone) : product::format_pretty_count(sum.ngram_rounds),
     };
@@ -130,8 +131,11 @@ ConsoleRequestSample make_console_request_sample(const GenerationOutcome& outcom
         .decode_tokens  = outcome.completion_tokens > 0
                               ? static_cast<std::uint64_t>(outcome.completion_tokens - 1)
                               : 0,
-        .decode_seconds = metrics.decode_share_seconds,
-        .model_rounds   = saturating_sub(metrics.speculative_rounds, metrics.ngram_rounds),
+        // Each round's elapsed time over this request's share of it is that round's batch size, so
+        // the summed ratio weighs each round's batch by its duration.
+        .decode_seconds       = metrics.decode_share_seconds,
+        .decode_round_seconds = metrics.decode_seconds,
+        .model_rounds = saturating_sub(metrics.speculative_rounds, metrics.ngram_rounds),
         .model_drafted_tokens =
             saturating_sub(metrics.speculative_draft_tokens, metrics.ngram_drafted_tokens),
         .model_accepted_tokens =
@@ -158,6 +162,7 @@ void ConsoleStatsTotals::add(const ConsoleRequestSample& sample) noexcept {
     if (sample.decode_seconds > 0.0) {
         sum.decode_tokens += sample.decode_tokens;
         sum.decode_seconds += sample.decode_seconds;
+        sum.decode_round_seconds += sample.decode_round_seconds;
     }
     sum.model_rounds += sample.model_rounds;
     sum.model_drafted_tokens += sample.model_drafted_tokens;
