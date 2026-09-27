@@ -938,6 +938,58 @@ void test_tap_planner() {
     require(plan_taps(1, 0, hints, {}, {}, config).empty(), "no taps for a 1-token prompt");
 }
 
+// A Host tier smaller than a saved one restores whole snapshots with their paths, most valuable
+// first, and never a block no chosen snapshot resumes through.
+void test_restore_plan() {
+    const PrefixIndexConfig config = small_config();
+    // Two lineages sharing blocks 0-1: 0-1-2-3-4 and 0-1-5-6-7-8-9.
+    const std::vector<std::int32_t> parents = {-1, 0, 1, 2, 3, 1, 5, 6, 7, 8};
+    const std::vector<SavedSnapshotShape> snapshots = {
+        {.anchor = 4, .frontier = 5 * 64, .slabs = 4, .hits = 0},
+        {.anchor = 9, .frontier = 7 * 64 + 10, .slabs = 5, .hits = 5},
+        {.anchor = 1, .frontier = 2 * 64, .slabs = 4, .hits = 0},
+    };
+    const auto chosen_blocks = [](const HostRestorePlan& plan) {
+        std::vector<std::uint32_t> out;
+        for (std::uint32_t index = 0; index < plan.blocks.size(); ++index) {
+            if (plan.blocks[index]) { out.push_back(index); }
+        }
+        return out;
+    };
+
+    const HostRestorePlan all = plan_host_restore(parents, snapshots, 23, config);
+    require(all.slabs == 23 && chosen_blocks(all).size() == parents.size() &&
+                std::all_of(all.snapshots.begin(), all.snapshots.end(), [](bool b) { return b; }),
+            "a tier that holds the whole file must restore all of it");
+
+    // The blocks alone would fill 10 of these 12 slabs and leave no room for any image: the plan
+    // instead takes the most used snapshot and exactly its path.
+    const HostRestorePlan one = plan_host_restore(parents, snapshots, 12, config);
+    require(!one.snapshots[0] && one.snapshots[1] && !one.snapshots[2] && one.slabs == 12,
+            "a small tier must keep the most valuable snapshot");
+    require(chosen_blocks(one) == std::vector<std::uint32_t>{0, 1, 5, 6, 7, 8, 9},
+            "a small tier must restore exactly the kept snapshot's path");
+
+    // Shared path blocks are paid for once, and a snapshot that does not fit is passed over for a
+    // later one that does.
+    const HostRestorePlan two = plan_host_restore(parents, snapshots, 16, config);
+    require(!two.snapshots[0] && two.snapshots[1] && two.snapshots[2] && two.slabs == 16,
+            "a snapshot sharing a kept path must cost only its own slabs");
+
+    // Between otherwise equal snapshots, use decides.
+    const std::vector<std::int32_t> roots        = {-1, -1};
+    const std::vector<SavedSnapshotShape> equals = {
+        {.anchor = 0, .frontier = 64, .slabs = 4, .hits = 0},
+        {.anchor = 1, .frontier = 64, .slabs = 4, .hits = 3},
+    };
+    const HostRestorePlan used = plan_host_restore(roots, equals, 5, config);
+    require(!used.snapshots[0] && used.snapshots[1] && !used.blocks[0] && used.blocks[1],
+            "the more used of two equal snapshots must be kept");
+
+    require_throws([&] { (void)plan_host_restore(std::vector<std::int32_t>{0}, {}, 8, config); },
+                   "a block that is its own parent must be rejected");
+}
+
 } // namespace
 
 int main() {
@@ -954,6 +1006,7 @@ int main() {
         test_host_only_reattach();
         test_tail_device_fill();
         test_persistence_roundtrip();
+        test_restore_plan();
         test_image_only_host_tier();
         test_random_stress();
         test_tap_planner();

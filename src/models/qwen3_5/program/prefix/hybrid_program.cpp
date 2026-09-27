@@ -138,12 +138,16 @@ namespace {
 
 HybridCachePersistence public_result(const HybridPersistResult& result) {
     return HybridCachePersistence{
-        .ok        = result.ok,
-        .message   = result.message,
-        .blocks    = result.blocks,
-        .snapshots = result.snapshots,
-        .bytes     = result.bytes,
-        .seconds   = result.seconds,
+        .ok                  = result.ok,
+        .message             = result.message,
+        .blocks              = result.blocks,
+        .snapshots           = result.snapshots,
+        .bytes               = result.bytes,
+        .seconds             = result.seconds,
+        .saved_blocks        = result.saved_blocks,
+        .saved_snapshots     = result.saved_snapshots,
+        .required_host_bytes = result.required_host_bytes,
+        .host_bytes          = result.host_bytes,
     };
 }
 

@@ -298,8 +298,8 @@ public:
                              std::vector<SnapshotRef>& snapshots) const;
     [[nodiscard]] BlockIdentity block_identity(NodeRef node) const;
     // Rebuild a saved Host tier into a fresh index, parents before children and anchors before
-    // their snapshots. Nothing is evicted to make room, so a smaller Host tier restores a prefix
-    // of what was saved; absent means no slab, node or snapshot entry was free.
+    // their snapshots, in the selection plan_host_restore made. Nothing is evicted to make room;
+    // absent means no slab, node or snapshot entry was free, or the entry already exists.
     [[nodiscard]] std::optional<RestoredBlock> restore_host_block(NodeRef parent,
                                                                   std::uint64_t lookup_hash,
                                                                   std::span<const TokenId> tokens,
@@ -474,5 +474,35 @@ private:
     double inflation_              = 0.0;
     PrefixIndexStats counters_;
 };
+
+// ---- restore planning (§5.5) -------------------------------------------------------------------
+// A saved snapshot as the restore plan sees it.
+struct SavedSnapshotShape {
+    // Index of its anchor among the saved blocks; -1 for the root.
+    std::int32_t anchor    = -1;
+    std::uint32_t frontier = 0;
+    // Host slabs it takes: the image's, plus one for a tail.
+    std::uint32_t slabs = 0;
+    std::uint32_t hits  = 0;
+};
+
+struct HostRestorePlan {
+    std::vector<bool> blocks;
+    std::vector<bool> snapshots;
+    // Host slabs the chosen entries take.
+    std::uint64_t slabs = 0;
+};
+
+// Chooses what an empty Host tier of `host_slabs` restores from a saved one: everything when it
+// fits. Otherwise snapshots are taken greedily by the GDSF density of §9.3 without its
+// time-dependent base — (1 + hits) times the prefill a restore saves from the root, per byte of
+// image, tail and anchor path. Each takes its own slabs and the path blocks not yet chosen; one
+// that does not fit is passed over for later ones that may. Blocks are chosen only on a chosen
+// snapshot's path, so no restored block is dead. `block_parents` lists every saved block's parent
+// index (-1 for the root), parents first.
+[[nodiscard]] HostRestorePlan plan_host_restore(std::span<const std::int32_t> block_parents,
+                                                std::span<const SavedSnapshotShape> snapshots,
+                                                std::uint64_t host_slabs,
+                                                const PrefixIndexConfig& config);
 
 } // namespace ninfer::runtime::prefix_cache

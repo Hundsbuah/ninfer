@@ -136,6 +136,7 @@ prompt tokens from cache but prefilled 5.02M tokens (994 s). It showed three pro
 | Persistent backfill proof with a 16K-token growth reserve | not merged (branch `feat/hybrid-cache-policy-rebased`, `c974e5ec`) | §6.3 | targeted scenario: four 12K-token requests queued behind a blocked 90K-token head finish in 1.6 s instead of 35–36 s; the long request already decoding takes 4.7 s (12 %) longer, about the borrowers' prefill time, and the head starts that much later (its answer ends at the same time); no answer is cut short. Agentic workload: 0–9 backfills per run, effect within sampling noise | reverted: a trade-off, not a win (below) |
 | Prefetch of the blocked head's Host-only blocks | `d9b8d437` | §6.6 | admission Host restores −22 % (seed 42, 62.4 → 48.6 GB) and −25 % (seed 43, 68.4 → 51.3 GB), 10–11 GB prefetched per run; TTFT without queue wait −3 % and −6 %; decode rounds/s unchanged (57.8 vs 57.8, one request decoding) | kept |
 | Stop cancels running and queued requests before the save (`Engine::stop()`; `ninfer-serve` stops on Ctrl+C pressed twice within 5 s) | "fix(serve): stop on a confirmed Ctrl+C …" (2026-09-27) | §5.5 | a correctness fix, not A/B tested. The production log's stops at 07:48 and 07:54 left 10 and 3 requests unfinished and wrote no file: Ctrl+C waited silently for them and a second Ctrl+C killed the process. Console test, one streaming and one queued request: before, generation ran on 68.6 s after Ctrl+C; after, one press only prompts, and a confirmed pair fails both with 503 within 0.2 s, saves 99 blocks (503 MiB) in 0.1–0.2 s and exits about 0.7 s later | kept |
+| A Host tier smaller than the saved file restores its most valuable snapshots and only their paths (file format 3, tables before slab bytes), with a startup warning | "fix(prefix-cache): restore the most valuable snapshots …" (2026-09-27) | §5.5 | a correctness fix, not A/B tested. Format 2 restored every block before any snapshot, in file order, and still reported the file restored. For the production file (15,807 blocks and 98 snapshots of 91–92 slabs of 2.06 MiB, 49.97 GiB, saved at `--host-cache-mib 52000`), any tier below about 32,800 MiB filled with blocks and kept no snapshot, so nothing was resumable; between that and about 51,200 MiB the snapshots kept depended on file order | kept |
 
 Fix 3 was measured on top of the backfill proof. The build that combined all three against the
 base: at the 16 GB Host tier, prompt tokens prefilled −13.9 % (seed 42) and −2.7 % (seed 43), TTFT
@@ -528,10 +529,17 @@ directory, or `--host-cache-mib 0`, so an unusable location fails before any cac
 - **Load**, at Engine construction before any request: the file is used only when its fingerprint
   (absolute artifact path, size and modification time, prefill signature, KV storage, speculative
   backend, RoPE scaling, and the product binary's identity — build id plus executable size and
-  time, so any rebuild invalidates it) and its Host geometry equal the running Engine's. Entries
-  are rebuilt Host-only, parents before children, without evicting anything: a smaller Host tier
-  restores a prefix of the file, and its first requests restore blocks and images through the
-  ordinary Host restore path. A damaged file loads nothing.
+  time, so any rebuild invalidates it) and its Host geometry equal the running Engine's, and its
+  size matches its tables. The file (format 3) holds the header, the block table, the snapshot
+  table and only then the slab bytes, so the loader chooses before it reads any slab. A Host tier
+  that holds the whole file restores all of it. A smaller one restores whole snapshots, greedily
+  by the GDSF density of §9.3 without its time-dependent base — (1 + hits) × the prefill a
+  restore saves from the root, per byte of image, tail and anchor path — each with the path
+  blocks it needs and no others, and reads only those slabs (`plan_host_restore`); the startup
+  log then warns `prefix cache partly restored` with the kept and saved counts and the Host tier
+  the file needs. Entries are rebuilt Host-only, parents before children, without evicting
+  anything, and their first requests restore blocks and images through the ordinary Host restore
+  path. A damaged file loads nothing.
 - The startup log shows the read of an accepted file as a progress phase (`loading prefix cache`,
   then `prefix cache read | bytes | time | rate`), then reports what was restored or why nothing
   was; the shutdown log reports the save.

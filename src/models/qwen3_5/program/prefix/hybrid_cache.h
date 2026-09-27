@@ -78,6 +78,12 @@ struct HybridPersistResult {
     std::uint64_t snapshots = 0;
     std::uint64_t bytes     = 0;
     double seconds          = 0.0;
+    // Load only: the file's entries and the Host tier bytes they all take, against this tier.
+    // A tier smaller than the file restores the snapshots it values most (plan_host_restore).
+    std::uint64_t saved_blocks        = 0;
+    std::uint64_t saved_snapshots     = 0;
+    std::uint64_t required_host_bytes = 0;
+    std::uint64_t host_bytes          = 0;
 };
 
 class HybridPrefixCache final : public runtime::prefix_cache::PrefixIndexBackend {
@@ -208,8 +214,9 @@ public:
     [[nodiscard]] HybridPersistResult save(const std::filesystem::path& path,
                                            std::string_view fingerprint) const;
     // Rebuilds a saved Host tier into this empty cache when the file's fingerprint and geometry
-    // match. A mismatch or damaged file loads nothing; a smaller Host tier loads what fits.
-    // Reading a file whose header matches publishes StartupPhase::PrefixCacheLoad to `observer`.
+    // match. A mismatch or damaged file loads nothing; a smaller Host tier restores the snapshots
+    // it values most and only their paths, reading nothing else. Reading a file whose header
+    // matches publishes StartupPhase::PrefixCacheLoad to `observer`.
     [[nodiscard]] HybridPersistResult load(const std::filesystem::path& path,
                                            std::string_view fingerprint,
                                            const StartupObserver& observer);

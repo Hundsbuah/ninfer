@@ -1246,6 +1246,12 @@ struct LoadSummary {
         std::uint64_t snapshots = 0;
         std::uint64_t bytes     = 0;
         double seconds          = 0.0;
+        // What the file holds and the Host tier bytes all of it takes, against this Engine's
+        // tier. When the tier is smaller, only the snapshots it values most were restored.
+        std::uint64_t saved_blocks        = 0;
+        std::uint64_t saved_snapshots     = 0;
+        std::uint64_t required_host_bytes = 0;
+        std::uint64_t host_bytes          = 0;
     } prefix_cache;
 };
 

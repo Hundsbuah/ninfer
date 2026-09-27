@@ -321,12 +321,21 @@ void StartupLogRenderer::engine_ready(const LoadSummary& load) {
                          context_cost_preset_source_name(load.context_cost.transfer_source),
                          context_cost_preset_source_name(load.context_cost.prefill_source),
                          load.prefill_signature);
-    if (load.prefix_cache.restored) {
+    const LoadSummary::PrefixCacheRestore& cache = load.prefix_cache;
+    if (cache.restored && cache.required_host_bytes > cache.host_bytes) {
+        impl_->logger->warn(
+            "prefix cache partly restored | {} of {} snapshots | {} of {} blocks | {} | {} | the "
+            "file needs {} of Host tier; --host-cache-mib gives {}, so the most valuable "
+            "snapshots were kept",
+            format_pretty_count(cache.snapshots), format_pretty_count(cache.saved_snapshots),
+            format_pretty_count(cache.blocks), format_pretty_count(cache.saved_blocks),
+            format_pretty_bytes(cache.bytes), format_pretty_duration(cache.seconds),
+            format_pretty_bytes(cache.required_host_bytes), format_pretty_bytes(cache.host_bytes));
+    } else if (cache.restored) {
         impl_->logger->info("prefix cache restored | {} blocks | {} snapshots | {} | {}",
-                            format_pretty_count(load.prefix_cache.blocks),
-                            format_pretty_count(load.prefix_cache.snapshots),
-                            format_pretty_bytes(load.prefix_cache.bytes),
-                            format_pretty_duration(load.prefix_cache.seconds));
+                            format_pretty_count(cache.blocks), format_pretty_count(cache.snapshots),
+                            format_pretty_bytes(cache.bytes),
+                            format_pretty_duration(cache.seconds));
     } else if (load.prefix_cache.attempted) {
         impl_->logger->info("prefix cache not restored | {}", load.prefix_cache.message);
     }

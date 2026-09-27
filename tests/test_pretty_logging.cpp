@@ -220,6 +220,41 @@ int main() {
             startup_output.find("CUDA initialized") == std::string::npos,
         "normal startup pretty output is noisy or incomplete");
 
+    // A Host tier smaller than the saved file warns with what was kept and what the file needs.
+    std::string partial_output;
+    {
+        StderrCapture capture;
+        {
+            ninfer::product::LoggingRuntime logging(
+                {.logger_name  = "ninfer-serve",
+                 .color        = ninfer::product::LogColorMode::Never,
+                 .presentation = ninfer::product::LogPresentation::Service});
+            ninfer::product::StartupLogRenderer startup(logging);
+            ninfer::LoadSummary load;
+            load.model_name     = "qwen3.6-27b";
+            load.cuda_sync_mode = "blocking";
+            load.prefix_cache   = {.attempted           = true,
+                                   .restored            = true,
+                                   .blocks              = 9000,
+                                   .snapshots           = 60,
+                                   .bytes               = 30ULL << 30,
+                                   .seconds             = 7.0,
+                                   .saved_blocks        = 15807,
+                                   .saved_snapshots     = 98,
+                                   .required_host_bytes = 50ULL << 30,
+                                   .host_bytes          = 31ULL << 30};
+            startup.engine_ready(load);
+            logging.flush();
+        }
+        partial_output = capture.finish();
+    }
+    failures += check(
+        partial_output.find("  WARN  prefix cache partly restored | 60 of 98 snapshots | 9,000 of "
+                            "15,807 blocks | 30.0 GiB | 7.0s | the file needs 50.0 GiB of Host "
+                            "tier; --host-cache-mib gives 31.0 GiB") != std::string::npos &&
+            partial_output.find("prefix cache restored") == std::string::npos,
+        "a partial prefix cache restore is not reported as a warning");
+
     std::string tool_output;
     {
         StderrCapture capture;

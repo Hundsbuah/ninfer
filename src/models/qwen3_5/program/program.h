@@ -229,6 +229,11 @@ struct HybridCachePersistence {
     std::uint64_t snapshots = 0;
     std::uint64_t bytes     = 0;
     double seconds          = 0.0;
+    // Load only: what the file holds and needs, against this Host tier.
+    std::uint64_t saved_blocks        = 0;
+    std::uint64_t saved_snapshots     = 0;
+    std::uint64_t required_host_bytes = 0;
+    std::uint64_t host_bytes          = 0;
 };
 
 struct HybridPrefixCacheStats {

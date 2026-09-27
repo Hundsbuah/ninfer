@@ -1380,6 +1380,79 @@ std::optional<SnapshotRef> PrefixCacheIndex::restore_host_snapshot(NodeRef ancho
     return ref_of_snapshot(index);
 }
 
+HostRestorePlan plan_host_restore(std::span<const std::int32_t> block_parents,
+                                  std::span<const SavedSnapshotShape> snapshots,
+                                  std::uint64_t host_slabs, const PrefixIndexConfig& config) {
+    const std::size_t block_count = block_parents.size();
+    HostRestorePlan plan{.blocks    = std::vector<bool>(block_count, false),
+                         .snapshots = std::vector<bool>(snapshots.size(), false)};
+    // Blocks on each block's path, itself included.
+    std::vector<std::uint32_t> path_blocks(block_count);
+    for (std::size_t index = 0; index < block_count; ++index) {
+        const std::int32_t parent = block_parents[index];
+        if (parent >= static_cast<std::int32_t>(index) || parent < -1) {
+            throw std::invalid_argument("saved prefix cache blocks are not parents first");
+        }
+        path_blocks[index] = parent < 0 ? 1U : path_blocks[static_cast<std::size_t>(parent)] + 1U;
+    }
+    std::uint64_t total = block_count;
+    for (const SavedSnapshotShape& snapshot : snapshots) {
+        if (snapshot.anchor >= static_cast<std::int32_t>(block_count) || snapshot.anchor < -1 ||
+            snapshot.slabs < config.image_slabs) {
+            throw std::invalid_argument("saved prefix cache snapshot is inconsistent");
+        }
+        total += snapshot.slabs;
+    }
+    if (total <= host_slabs) {
+        plan.blocks.assign(block_count, true);
+        plan.snapshots.assign(snapshots.size(), true);
+        plan.slabs = total;
+        return plan;
+    }
+
+    std::vector<double> density(snapshots.size());
+    for (std::size_t index = 0; index < snapshots.size(); ++index) {
+        const SavedSnapshotShape& snapshot = snapshots[index];
+        const std::uint64_t path =
+            snapshot.anchor < 0 ? 0U : path_blocks[static_cast<std::size_t>(snapshot.anchor)];
+        const double saved = config.cost.prefill_seconds(0, snapshot.frontier) -
+                             config.cost.restore_seconds(config.image_bytes);
+        const double size =
+            static_cast<double>(config.image_bytes) +
+            static_cast<double>(snapshot.slabs > config.image_slabs ? config.block_bytes : 0U) +
+            static_cast<double>(path) * static_cast<double>(config.block_bytes);
+        density[index] = (1.0 + static_cast<double>(snapshot.hits)) * std::max(0.0, saved) /
+                         std::max(size, 1.0);
+    }
+    std::vector<std::uint32_t> order(snapshots.size());
+    for (std::uint32_t index = 0; index < order.size(); ++index) { order[index] = index; }
+    std::stable_sort(order.begin(), order.end(), [&](std::uint32_t left, std::uint32_t right) {
+        if (density[left] != density[right]) { return density[left] > density[right]; }
+        return snapshots[left].frontier > snapshots[right].frontier;
+    });
+
+    std::uint64_t left = host_slabs;
+    for (const std::uint32_t index : order) {
+        const SavedSnapshotShape& snapshot = snapshots[index];
+        std::uint64_t need                 = snapshot.slabs;
+        for (std::int32_t block = snapshot.anchor;
+             block >= 0 && !plan.blocks[static_cast<std::size_t>(block)];
+             block = block_parents[static_cast<std::size_t>(block)]) {
+            ++need;
+        }
+        if (need > left) { continue; }
+        for (std::int32_t block = snapshot.anchor;
+             block >= 0 && !plan.blocks[static_cast<std::size_t>(block)];
+             block = block_parents[static_cast<std::size_t>(block)]) {
+            plan.blocks[static_cast<std::size_t>(block)] = true;
+        }
+        plan.snapshots[index] = true;
+        left -= need;
+    }
+    plan.slabs = host_slabs - left;
+    return plan;
+}
+
 std::optional<SnapshotRef> PrefixCacheIndex::slot_owner(std::uint32_t slot) const {
     if (slot >= slot_state_.size() || slot_state_[slot] != SlotState::Owned) {
         return std::nullopt;
