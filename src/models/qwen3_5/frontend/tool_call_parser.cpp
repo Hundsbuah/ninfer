@@ -3,8 +3,12 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <array>
+#include <compare>
+#include <optional>
 #include <stdexcept>
 #include <string_view>
+#include <unordered_map>
 #include <utility>
 
 namespace ninfer::models::qwen3_5::frontend {
@@ -17,8 +21,17 @@ using NormalizationPolicy = Contract::NormalizationPolicy;
 using SchemaType          = Contract::SchemaType;
 using TypeSet             = Contract::TypeSet;
 
-constexpr std::string_view kToolOpen      = "<tool_call>";
-constexpr std::string_view kToolClose     = "</tool_call>";
+constexpr std::size_t kNpos                = std::string_view::npos;
+constexpr std::string_view kToolOpen       = "<tool_call>";
+constexpr std::string_view kToolClose      = "</tool_call>";
+constexpr std::string_view kContainerOpen  = "<function_calls>";
+constexpr std::string_view kContainerClose = "</function_calls>";
+constexpr std::string_view kFunctionClose  = "</function>";
+constexpr std::string_view kInvokeClose    = "</invoke>";
+constexpr std::string_view kParameterClose = "</parameter>";
+constexpr std::string_view kParamClose     = "</param>";
+// A tag header is one short line; a longer run is text. This also bounds every header scan.
+constexpr std::size_t kMaxTagHeaderBytes = 256;
 
 struct RawParameter {
     std::string_view name;
@@ -141,38 +154,35 @@ std::string_view extract_name_from_tag_header(std::string_view header) {
     return unquote(header);
 }
 
-bool is_param_open_at(std::string_view text, std::size_t pos, std::size_t& tag_end) {
-    std::size_t header_begin = 0;
-    if (starts_with_at(text, pos, "<parameter")) {
-        header_begin = pos + 10;
-    } else if (starts_with_at(text, pos, "<param")) {
-        header_begin = pos + 6;
-    } else {
-        return false;
+// Position of the '>' that ends a tag header, or npos. The header must open with '=' or a space,
+// so `<parameterX>` or `<functionbash>` is text, and it stays on one line without a nested '<'.
+std::size_t tag_header_end(std::string_view text, std::size_t header_begin) {
+    if (header_begin >= text.size()) { return kNpos; }
+    const char delimiter = text[header_begin];
+    if (delimiter != '=' && delimiter != ' ' && delimiter != '\t') { return kNpos; }
+    const std::size_t limit = std::min(text.size(), header_begin + kMaxTagHeaderBytes);
+    for (std::size_t pos = header_begin + 1; pos < limit; ++pos) {
+        const char byte = text[pos];
+        if (byte == '>') { return pos; }
+        if (byte == '<' || byte == '\n' || byte == '\r') { return kNpos; }
     }
-    if (header_begin >= text.size()) { return false; }
-    if (text[header_begin] != '=' && text[header_begin] != ' ' && text[header_begin] != '\t' &&
-        text[header_begin] != '\r' && text[header_begin] != '\n' && text[header_begin] != '>') {
-        return false;
-    }
-    const std::size_t end = text.find('>', header_begin);
-    if (end != std::string_view::npos && end != header_begin) {
-        tag_end = end;
-        return true;
-    }
-    return false;
+    return kNpos;
 }
 
-bool is_param_close_at(std::string_view text, std::size_t pos, std::size_t& tag_len) {
-    if (starts_with_at(text, pos, "</parameter>")) {
-        tag_len = 12;
-        return true;
+// Undeclared parameter names are accepted in identifier form only; declared names are accepted
+// verbatim. Anything else inside a tag header (a regex class, `...`, a quoted phrase) is text.
+bool plain_parameter_name(std::string_view name) {
+    if (name.empty()) { return false; }
+    const char lead = name.front();
+    if (is_ascii_digit(lead) || (!is_ascii_alphanumeric(lead) && lead != '_' && lead != '$' &&
+                                 lead != '@' && static_cast<unsigned char>(lead) < 0x80U)) {
+        return false;
     }
-    if (starts_with_at(text, pos, "</param>")) {
-        tag_len = 8;
-        return true;
-    }
-    return false;
+    return std::all_of(name.begin(), name.end(), [](char byte) {
+        return static_cast<unsigned char>(byte) >= 0x80U || is_ascii_alphanumeric(byte) ||
+               byte == '_' || byte == '-' || byte == '.' || byte == '$' || byte == '@' ||
+               byte == ':';
+    });
 }
 
 static constexpr std::string_view kToolMarkers[] = {
@@ -535,141 +545,435 @@ NormalizedParameter normalize_parameter(std::string_view encoded_value,
     return {.json_value = encode_json_string(value)};
 }
 
-class QwenToolRegionParser {
+// Region grammar:
+//
+//   region    := item (ws item)* ws EOF
+//   item      := "<tool_call>" ws function ws "</tool_call>"
+//              | "<function_calls>" ws function (ws function)* ws "</function_calls>"
+//              | function
+//   function  := function-open ws (parameter ws)* function-close
+//   parameter := parameter-open VALUE parameter-close
+//
+// Qwen writes argument text without a delimiter escape, so VALUE may hold any bytes, including
+// complete or partial tool-call markup. A parameter close is therefore a boundary candidate only
+// where a sibling parameter, the function close or the region end follows it, and a reading must
+// consume the whole region. Among the readings that do, the parser keeps the one whose values hold
+// the least unmatched markup: line-framed tags, the serialization the chat template writes for
+// real structure, count before inline ones, and a remaining tie keeps the earliest close.
+
+enum class Wrapper : std::uint8_t { ToolCall, Container, Bare };
+
+constexpr std::size_t kWrapperCount = 3;
+// Where a value's call ends depends only on its function close form and its wrapper.
+constexpr std::size_t kContextCount = 2 * kWrapperCount;
+
+constexpr std::uint8_t context_of(bool invoke, Wrapper wrapper) {
+    return static_cast<std::uint8_t>((invoke ? kWrapperCount : 0U) +
+                                     static_cast<std::size_t>(wrapper));
+}
+
+constexpr bool context_invoke(std::uint8_t context) { return context >= kWrapperCount; }
+
+constexpr Wrapper context_wrapper(std::uint8_t context) {
+    return static_cast<Wrapper>(context % kWrapperCount);
+}
+
+enum class TagFamily : std::uint8_t { ToolCall, Container, Function, Parameter };
+
+constexpr std::size_t kTagFamilyCount = 4;
+
+struct ParameterOpen {
+    std::size_t value_begin = 0;
+    std::string_view name;
+    bool short_form = false;
+};
+
+struct FunctionOpen {
+    std::size_t body_begin = 0;
+    std::string_view name;
+    bool invoke = false;
+};
+
+struct FunctionOpenResult {
+    std::optional<FunctionOpen> open;
+    FallbackReason failure = FallbackReason::MalformedStructure;
+};
+
+struct MarkupTag {
+    std::size_t begin = 0;
+    // Index of the boundary candidate a parameter close forms, or npos when nothing that can
+    // continue a call follows it.
+    std::size_t candidate = kNpos;
+    TagFamily family      = TagFamily::Parameter;
+    bool closing          = false;
+    bool short_form       = false;
+    bool framed           = false;
+};
+
+struct BoundaryCandidate {
+    enum class Kind : std::uint8_t { Sibling, FunctionEnd, RegionEnd };
+    Kind kind         = Kind::RegionEnd;
+    std::size_t begin = 0;
+    ParameterOpen sibling;
+    std::size_t function_end = 0;
+    bool invoke              = false;
+};
+
+// Lexicographic plausibility of a reading. Recovery terms exist only in tolerant salvage.
+struct ReadingCost {
+    std::uint32_t discarded_suffix = 0;
+    std::uint32_t missing_close    = 0;
+    std::uint32_t framed_markup    = 0;
+    std::uint32_t inline_markup    = 0;
+
+    friend constexpr auto operator<=>(const ReadingCost&, const ReadingCost&) = default;
+};
+
+constexpr ReadingCost operator+(ReadingCost lhs, const ReadingCost& rhs) {
+    lhs.discarded_suffix += rhs.discarded_suffix;
+    lhs.missing_close += rhs.missing_close;
+    lhs.framed_markup += rhs.framed_markup;
+    lhs.inline_markup += rhs.inline_markup;
+    return lhs;
+}
+
+struct Reading {
+    bool valid = false;
+    ReadingCost cost;
+    FallbackReason failure = FallbackReason::MalformedStructure;
+};
+
+constexpr Reading accepted(ReadingCost cost = {}) { return Reading{.valid = true, .cost = cost}; }
+
+constexpr Reading rejected(FallbackReason failure) { return Reading{.failure = failure}; }
+
+struct ValueChoice {
+    Reading reading;
+    std::size_t candidate = kNpos;
+};
+
+using ValueChoices = std::array<ValueChoice, kContextCount>;
+
+// Tags inside one value that no other tag of the same family and framing closes or opens.
+class MarkupBalance {
 public:
-    QwenToolRegionParser(std::string_view text, std::size_t max_name_length,
-                         const Contract& contract, bool tolerant)
-        : text_(text), max_name_length_(max_name_length), contract_(contract),
-          tolerant_(tolerant) {}
-
-    [[nodiscard]] std::uint32_t duplicate_parameters_repaired() const noexcept {
-        return duplicate_parameters_repaired_;
-    }
-
-    FallbackReason parse(std::vector<RawToolCall>& calls) {
-        std::size_t pos = 0;
-        for (;;) {
-            skip_format_whitespace(text_, pos);
-            if (pos == text_.size()) {
-                return calls.empty() ? FallbackReason::MalformedStructure : FallbackReason::None;
-            }
-            if (starts_with_at(text_, pos, "<tool_call>")) {
-                RawToolCall call;
-                const FallbackReason terminal = finish_call(calls, call, parse_tool_call(pos, call));
-                if (terminal != FallbackReason::None) { return terminal; }
-            } else if (starts_with_at(text_, pos, "<function_calls>")) {
-                pos += 16;
-                bool had_calls = false;
-                for (;;) {
-                    skip_format_whitespace(text_, pos);
-                    if (consume(pos, "</function_calls>")) { break; }
-                    if (pos == text_.size()) {
-                        // Tolerant: an unclosed wrapper after one or more complete calls is a
-                        // truncation; the strict parser keeps the hard structural failure.
-                        if (tolerant_ && had_calls) { return FallbackReason::TruncatedTail; }
-                        return FallbackReason::MalformedStructure;
-                    }
-                    RawToolCall call;
-                    const FallbackReason terminal = finish_call(calls, call, parse_function(pos, call));
-                    if (terminal != FallbackReason::None) { return terminal; }
-                    had_calls = true;
-                }
-                if (!had_calls) { return FallbackReason::MalformedStructure; }
-            } else if (starts_with_at(text_, pos, "<function") || starts_with_at(text_, pos, "<invoke")) {
-                RawToolCall call;
-                const FallbackReason terminal = finish_call(calls, call, parse_function(pos, call));
-                if (terminal != FallbackReason::None) { return terminal; }
-            } else {
-                // Tolerant: a trailing suffix after one or more complete calls is discarded
-                // rather than failing the whole output.
-                if (tolerant_ && !calls.empty()) { return FallbackReason::TruncatedTail; }
-                return calls.empty() ? FallbackReason::MalformedStructure
-                                     : FallbackReason::TrailingContent;
-            }
+    void add(const MarkupTag& tag) noexcept {
+        const std::size_t slot = slot_of(tag.family, tag.framed);
+        if (!tag.closing) {
+            ++open_[slot];
+        } else if (open_[slot] != 0) {
+            --open_[slot];
+        } else {
+            ++stray_[slot];
         }
     }
 
+    [[nodiscard]] std::uint32_t unmatched(bool framed) const noexcept {
+        std::uint32_t total = 0;
+        for (std::size_t family = 0; family < kTagFamilyCount; ++family) {
+            const std::size_t slot = slot_of(static_cast<TagFamily>(family), framed);
+            total += open_[slot] + stray_[slot];
+        }
+        return total;
+    }
+
+    // Closes without an opener only accumulate as a value grows, so this bounds every longer value.
+    [[nodiscard]] std::uint32_t stray(bool framed) const noexcept {
+        std::uint32_t total = 0;
+        for (std::size_t family = 0; family < kTagFamilyCount; ++family) {
+            total += stray_[slot_of(static_cast<TagFamily>(family), framed)];
+        }
+        return total;
+    }
+
 private:
+    static constexpr std::size_t slot_of(TagFamily family, bool framed) noexcept {
+        return static_cast<std::size_t>(family) * 2U + (framed ? 1U : 0U);
+    }
+
+    std::array<std::uint32_t, 2 * kTagFamilyCount> open_{};
+    std::array<std::uint32_t, 2 * kTagFamilyCount> stray_{};
+};
+
+struct IgnoreCalls {
+    void open(std::string_view) noexcept {}
+
+    void close() noexcept {}
+
+    void drop() noexcept {}
+};
+
+// Positions of the `<tool_call>` wrappers a reading holds inside its parameter values.
+class NestedWrapperRecorder {
+public:
+    explicit NestedWrapperRecorder(std::string_view text) noexcept : text_(text) {}
+
+    void open(std::string_view) noexcept { call_begin_ = positions_.size(); }
+
+    void parameter(std::string_view, std::string_view value) {
+        const auto base = static_cast<std::size_t>(value.data() - text_.data());
+        for (std::size_t pos = value.find(kToolOpen); pos != kNpos;
+             pos             = value.find(kToolOpen, pos + 1)) {
+            positions_.push_back(base + pos);
+        }
+    }
+
+    void close() noexcept {}
+
+    void drop() noexcept { positions_.resize(call_begin_); }
+
+    [[nodiscard]] std::vector<std::size_t> take_positions() noexcept {
+        return std::move(positions_);
+    }
+
+private:
+    std::string_view text_;
+    std::vector<std::size_t> positions_;
+    std::size_t call_begin_ = 0;
+};
+
+class CallRecorder {
+public:
+    void open(std::string_view name) {
+        call_         = RawToolCall{.name = name};
+        call_repairs_ = 0;
+    }
+
+    void parameter(std::string_view name, std::string_view value) {
+        // Last occurrence wins, as it would in JSON object syntax, rather than discarding an
+        // otherwise well-formed call.
+        const auto existing =
+            std::find_if(call_->parameters.begin(), call_->parameters.end(),
+                         [&](const RawParameter& candidate) { return candidate.name == name; });
+        if (existing != call_->parameters.end()) {
+            existing->value = value;
+            ++call_repairs_;
+        } else {
+            call_->parameters.push_back(RawParameter{.name = name, .value = value});
+        }
+    }
+
+    void close() {
+        calls_.push_back(std::move(*call_));
+        call_.reset();
+        duplicate_repairs_ += call_repairs_;
+        call_repairs_ = 0;
+    }
+
+    void drop() noexcept {
+        call_.reset();
+        call_repairs_ = 0;
+    }
+
+    [[nodiscard]] std::vector<RawToolCall> take_calls() noexcept { return std::move(calls_); }
+
+    [[nodiscard]] std::uint32_t duplicate_repairs() const noexcept { return duplicate_repairs_; }
+
+private:
+    std::optional<RawToolCall> call_;
+    std::vector<RawToolCall> calls_;
+    std::uint32_t call_repairs_      = 0;
+    std::uint32_t duplicate_repairs_ = 0;
+};
+
+class QwenToolRegionParser {
+public:
+    struct Calls {
+        std::vector<RawToolCall> calls;
+        std::uint32_t duplicate_parameters_repaired = 0;
+    };
+
+    struct NestedWrapper {
+        std::size_t begin = 0;
+        // Unmatched markup between the reading's start and this wrapper, read as prose.
+        ReadingCost prose;
+    };
+
+    QwenToolRegionParser(std::string_view text, std::size_t max_name_length,
+                         const Contract& contract, bool tolerant)
+        : text_(text), max_name_length_(max_name_length), contract_(contract), tolerant_(tolerant) {
+        scan_markup();
+    }
+
+    // Best reading of the region that starts at `start`. A salvage reading (tolerant mode only)
+    // drops a malformed suffix after a complete call or accepts closing tags cut at the region
+    // end, and only for calls whose values carry no stray line-framed markup.
+    Reading region(std::size_t start, bool salvage) {
+        Tables& tables = prepared(salvage);
+        IgnoreCalls ignore;
+        return resolve(tables, walk(start, Phase::Item, Wrapper::Bare, salvage, ignore), salvage);
+    }
+
+    // Start of the first parameter value the region opens, or npos when it fails before one.
+    [[nodiscard]] std::size_t first_value(std::size_t start) const {
+        IgnoreCalls ignore;
+        const Step step = walk(start, Phase::Item, Wrapper::Bare, false, ignore);
+        return step.kind == Step::Kind::Value ? step.parameter.value_begin : kNpos;
+    }
+
+    // Materializes the reading region() selected for the same start and mode.
+    Calls build(std::size_t start, bool salvage) {
+        CallRecorder recorder;
+        replay(start, salvage, recorder);
+        return Calls{.calls                         = recorder.take_calls(),
+                     .duplicate_parameters_repaired = recorder.duplicate_repairs()};
+    }
+
+    // `<tool_call>` wrappers inside the parameter values of the exact reading from `start`, each
+    // with the unmatched markup of the text from `prose_begin` up to it.
+    std::vector<NestedWrapper> nested_wrappers(std::size_t start, std::size_t prose_begin) {
+        NestedWrapperRecorder recorder(text_);
+        replay(start, false, recorder);
+        std::vector<NestedWrapper> wrappers;
+        MarkupBalance prose;
+        auto tag = std::lower_bound(
+            tags_.begin(), tags_.end(), prose_begin,
+            [](const MarkupTag& markup, std::size_t pos) { return markup.begin < pos; });
+        for (const std::size_t begin : recorder.take_positions()) {
+            for (; tag != tags_.end() && tag->begin < begin; ++tag) { prose.add(*tag); }
+            wrappers.push_back(NestedWrapper{.begin = begin,
+                                             .prose = {.framed_markup = prose.unmatched(true),
+                                                       .inline_markup = prose.unmatched(false)}});
+        }
+        return wrappers;
+    }
+
+private:
+    enum class Phase : std::uint8_t { Item, Function, AfterFunction, AfterItem };
+
+    struct Step {
+        enum class Kind : std::uint8_t { End, Value };
+        Kind kind = Kind::End;
+        Reading reading;
+        ParameterOpen parameter;
+        std::uint8_t context    = 0;
+        bool discard_on_failure = false;
+    };
+
+    struct Tables {
+        bool prepared = false;
+        std::vector<std::array<Reading, kContextCount>> tails;
+        // Highest candidate index whose tail is valid in each context, or npos.
+        std::array<std::size_t, kContextCount> last_valid_tail{};
+        std::unordered_map<std::size_t, ValueChoices> values;
+    };
+
+    // Replays the reading region() selected for the same start and mode into `recorder`.
+    template <typename Recorder>
+    void replay(std::size_t start, bool salvage, Recorder& recorder) {
+        Tables& tables = prepared(salvage);
+        Step step      = walk(start, Phase::Item, Wrapper::Bare, salvage, recorder);
+        while (step.kind == Step::Kind::Value) {
+            ParameterOpen parameter  = step.parameter;
+            const ValueChoice* value = &value_choices(tables, parameter, salvage)[step.context];
+            if (!value->reading.valid) {
+                recorder.drop();
+                return;
+            }
+            for (;;) {
+                const BoundaryCandidate& boundary = candidates_[value->candidate];
+                recorder.parameter(
+                    parameter.name,
+                    text_.substr(parameter.value_begin, boundary.begin - parameter.value_begin));
+                if (boundary.kind != BoundaryCandidate::Kind::Sibling) { break; }
+                parameter = boundary.sibling;
+                value     = &value_choices(tables, parameter, salvage)[step.context];
+            }
+            recorder.close();
+            const BoundaryCandidate& last = candidates_[value->candidate];
+            if (last.kind == BoundaryCandidate::Kind::RegionEnd) { return; }
+            step = walk(last.function_end, Phase::AfterFunction, context_wrapper(step.context),
+                        salvage, recorder);
+        }
+    }
+
     bool consume(std::size_t& pos, std::string_view token) const {
         if (!starts_with_at(text_, pos, token)) { return false; }
         pos += token.size();
         return true;
     }
 
-    // True when nothing but trailing whitespace remains after `pos` in the tool region.
-    bool at_region_end(std::size_t pos) const {
-        std::size_t at = pos;
-        skip_format_whitespace(text_, at);
-        return at == text_.size();
-    }
-
-    // Applies tolerant recovery to a sub-parse result and reports whether parse() should
-    // terminate. In tolerant mode, a malformed suffix after one or more complete calls is
-    // discarded, and a single truncated final call whose name and at least one parameter are
-    // complete is retained; the recovered calls are never demoted to text. The strict parser
-    // returns the raw failure unchanged.
-    FallbackReason finish_call(std::vector<RawToolCall>& calls, RawToolCall& call,
-                               FallbackReason failure) {
-        if (failure == FallbackReason::None) {
-            calls.push_back(std::move(call));
-            return FallbackReason::None;
-        }
-        if (tolerant_ && !calls.empty()) { return FallbackReason::TruncatedTail; }
-        if (tolerant_ && failure == FallbackReason::TruncatedTail && calls.empty() &&
-            !call.parameters.empty()) {
-            calls.push_back(std::move(call));
-            return FallbackReason::TruncatedTail;
-        }
-        return failure;
-    }
-
-    FallbackReason parse_tool_call(std::size_t& pos, RawToolCall& call) {
-        if (!consume(pos, "<tool_call>")) { return FallbackReason::MalformedStructure; }
-        skip_format_whitespace(text_, pos);
-        const FallbackReason failure = parse_function(pos, call);
-        if (failure != FallbackReason::None) { return failure; }
-        skip_format_whitespace(text_, pos);
-        if (consume(pos, "</tool_call>")) { return FallbackReason::None; }
-        // Tolerant: a complete call may be followed by explanatory text, or the model may have
-        // stopped at the end of its budget before the closing tag. parse() resolves the terminal
-        // flag; the strict parser keeps the hard structural failure.
+    [[nodiscard]] FallbackReason cut_reason() const noexcept {
         return tolerant_ ? FallbackReason::TruncatedTail : FallbackReason::MalformedStructure;
     }
 
-    FallbackReason parse_function(std::size_t& pos, RawToolCall& call) {
+    [[nodiscard]] bool valid_parameter_name(std::string_view name) const {
+        if (plain_parameter_name(name)) { return true; }
+        if (name.empty()) { return false; }
+        return std::any_of(contract_.tools.begin(), contract_.tools.end(), [&](const auto& tool) {
+            return find_parameter_contract(tool, name) != nullptr;
+        });
+    }
+
+    [[nodiscard]] std::optional<ParameterOpen> parameter_open_at(std::size_t pos) const {
         std::size_t header_begin = 0;
-        std::string_view fn_close = "</function>";
+        bool short_form          = false;
+        if (starts_with_at(text_, pos, "<parameter")) {
+            header_begin = pos + 10;
+        } else if (starts_with_at(text_, pos, "<param")) {
+            header_begin = pos + 6;
+            short_form   = true;
+        } else {
+            return std::nullopt;
+        }
+        const std::size_t header_end = tag_header_end(text_, header_begin);
+        if (header_end == kNpos) { return std::nullopt; }
+        const std::string_view name =
+            extract_name_from_tag_header(text_.substr(header_begin, header_end - header_begin));
+        if (!valid_parameter_name(name)) { return std::nullopt; }
+        return ParameterOpen{.value_begin = header_end + 1, .name = name, .short_form = short_form};
+    }
+
+    // Function opener in strict syntax, recognized only to weigh literal markup inside values.
+    [[nodiscard]] std::size_t function_tag_end(std::size_t pos) const {
+        std::size_t header_begin = 0;
         if (starts_with_at(text_, pos, "<function")) {
             header_begin = pos + 9;
-            fn_close = "</function>";
         } else if (starts_with_at(text_, pos, "<invoke")) {
             header_begin = pos + 7;
-            fn_close = "</invoke>";
+        } else {
+            return kNpos;
+        }
+        const std::size_t header_end = tag_header_end(text_, header_begin);
+        if (header_end == kNpos ||
+            !valid_function_name(
+                extract_name_from_tag_header(text_.substr(header_begin, header_end - header_begin)),
+                max_name_length_)) {
+            return kNpos;
+        }
+        return header_end + 1;
+    }
+
+    [[nodiscard]] FunctionOpenResult function_open_at(std::size_t pos) const {
+        std::size_t header_begin = 0;
+        bool invoke              = false;
+        if (starts_with_at(text_, pos, "<function")) {
+            header_begin = pos + 9;
+        } else if (starts_with_at(text_, pos, "<invoke")) {
+            header_begin = pos + 7;
+            invoke       = true;
         } else if (tolerant_) {
-            // Recover a malformed function opener: a dropped or doubled leading '<', a leaked
-            // ChatML turn marker, or a dropped 'function'/'invoke' keyword, followed by '=' or a
-            // name. A form that yields no valid name is rejected by valid_function_name below, so
-            // prose after a marker cannot pass.
+            // Recover a malformed function opener: a dropped or doubled leading '<' or a leaked
+            // ChatML turn marker before the keyword. A form that yields no valid name is rejected
+            // below, so prose after a marker cannot pass.
             std::size_t scan = pos;
             while (scan < text_.size() && text_[scan] == '<') { ++scan; }
             if (starts_with_at(text_, scan, "|im_start|>")) { scan += 11; }
-            std::size_t kw_len = 0;
-            if (starts_with_at(text_, scan, "function")) { kw_len = 8; }
-            else if (starts_with_at(text_, scan, "invoke")) { kw_len = 6; }
-            else { return FallbackReason::MalformedStructure; }
-            scan += kw_len;
-            if (scan >= text_.size() || (text_[scan] != '=' && !is_format_whitespace(text_[scan]))) {
-                return FallbackReason::MalformedStructure;
+            if (starts_with_at(text_, scan, "function")) {
+                scan += 8;
+            } else if (starts_with_at(text_, scan, "invoke")) {
+                scan += 6;
+                invoke = true;
+            } else {
+                return {};
             }
-            if (text_[scan] == '=') { ++scan; }
             header_begin = scan;
-            fn_close = kw_len == 8 ? "</function>" : "</invoke>";
         } else {
-            return FallbackReason::MalformedStructure;
+            return {};
         }
 
-        std::size_t tag_end = text_.find('>', header_begin);
-        bool ws_boundary = false;
+        std::size_t tag_end = tag_header_end(text_, header_begin);
+        bool ws_boundary    = false;
         // Tolerant: the model sometimes drops the '>' after the function name (for example a name
         // followed directly by a newline and a parameter tag). Recover by scanning the identifier
         // run and accepting it when format whitespace separates it from the next '<' or end of
@@ -684,143 +988,308 @@ private:
                 ++scan;
             }
             if (scan > ident_begin && scan < text_.size() && is_format_whitespace(text_[scan]) &&
-                (tag_end == std::string_view::npos || scan < tag_end)) {
+                (tag_end == kNpos || scan < tag_end)) {
                 std::size_t after = scan;
-                while (after < text_.size() && is_format_whitespace(text_[after])) { ++after; }
+                skip_format_whitespace(text_, after);
                 if (after >= text_.size() || text_[after] == '<') {
                     tag_end     = scan;
                     ws_boundary = true;
                 }
             }
         }
-        if (tag_end == std::string_view::npos || tag_end == header_begin) {
-            return FallbackReason::InvalidToolName;
+        if (tag_end == kNpos || tag_end == header_begin) {
+            return {.failure = FallbackReason::InvalidToolName};
         }
-        const std::string_view header = text_.substr(header_begin, tag_end - header_begin);
-        call.name = extract_name_from_tag_header(header);
-        if (!valid_function_name(call.name, max_name_length_)) {
-            return FallbackReason::InvalidToolName;
+        const std::string_view name =
+            extract_name_from_tag_header(text_.substr(header_begin, tag_end - header_begin));
+        if (!valid_function_name(name, max_name_length_)) {
+            return {.failure = FallbackReason::InvalidToolName};
         }
         // Strict mode rejects a name outside the declared tool set. Tolerant mode keeps an
         // otherwise well-formed call structured and leaves the identity judgment to the consumer:
         // leaking the raw region to content would turn a valid call into prose.
         if (!tolerant_ && contract_.enforce_declared_names &&
-            find_tool_contract(contract_, call.name) == nullptr) {
-            return FallbackReason::UndeclaredTool;
+            find_tool_contract(contract_, name) == nullptr) {
+            return {.failure = FallbackReason::UndeclaredTool};
         }
-        pos = ws_boundary ? tag_end : tag_end + 1;
+        return {.open = FunctionOpen{.body_begin = ws_boundary ? tag_end : tag_end + 1,
+                                     .name       = name,
+                                     .invoke     = invoke}};
+    }
 
+    // The template writes every structural tag on a line of its own.
+    [[nodiscard]] bool line_framed(std::size_t begin, std::size_t end) const noexcept {
+        const bool line_start = begin == 0 || text_[begin - 1] == '\n';
+        const bool line_end =
+            end == text_.size() || text_[end] == '\n' ||
+            (text_[end] == '\r' && (end + 1 == text_.size() || text_[end + 1] == '\n'));
+        return line_start && line_end;
+    }
+
+    std::size_t add_candidate(std::size_t begin, std::size_t end) {
+        std::size_t next = end;
+        skip_format_whitespace(text_, next);
+        BoundaryCandidate candidate{.begin = begin};
+        if (next == text_.size()) {
+            candidate.kind = BoundaryCandidate::Kind::RegionEnd;
+        } else if (const std::optional<ParameterOpen> sibling = parameter_open_at(next)) {
+            candidate.kind    = BoundaryCandidate::Kind::Sibling;
+            candidate.sibling = *sibling;
+        } else if (starts_with_at(text_, next, kFunctionClose)) {
+            candidate.kind         = BoundaryCandidate::Kind::FunctionEnd;
+            candidate.function_end = next + kFunctionClose.size();
+        } else if (starts_with_at(text_, next, kInvokeClose)) {
+            candidate.kind         = BoundaryCandidate::Kind::FunctionEnd;
+            candidate.function_end = next + kInvokeClose.size();
+            candidate.invoke       = true;
+        } else {
+            return kNpos;
+        }
+        candidates_.push_back(candidate);
+        return candidates_.size() - 1;
+    }
+
+    void scan_markup() {
+        std::size_t pos = text_.find('<');
+        while (pos != kNpos) {
+            MarkupTag tag{.begin = pos};
+            std::size_t end  = kNpos;
+            const auto fixed = [&](std::string_view marker, TagFamily family, bool closing,
+                                   bool short_form = false) {
+                if (!starts_with_at(text_, pos, marker)) { return false; }
+                tag.family     = family;
+                tag.closing    = closing;
+                tag.short_form = short_form;
+                end            = pos + marker.size();
+                return true;
+            };
+            if (fixed(kToolClose, TagFamily::ToolCall, true) ||
+                fixed(kToolOpen, TagFamily::ToolCall, false) ||
+                fixed(kContainerClose, TagFamily::Container, true) ||
+                fixed(kContainerOpen, TagFamily::Container, false) ||
+                fixed(kFunctionClose, TagFamily::Function, true) ||
+                fixed(kInvokeClose, TagFamily::Function, true) ||
+                fixed(kParameterClose, TagFamily::Parameter, true) ||
+                fixed(kParamClose, TagFamily::Parameter, true, true)) {
+            } else if (const std::optional<ParameterOpen> parameter = parameter_open_at(pos)) {
+                tag.family     = TagFamily::Parameter;
+                tag.short_form = parameter->short_form;
+                end            = parameter->value_begin;
+            } else if (const std::size_t body = function_tag_end(pos); body != kNpos) {
+                tag.family = TagFamily::Function;
+                end        = body;
+            } else {
+                pos = text_.find('<', pos + 1);
+                continue;
+            }
+            tag.framed = line_framed(pos, end);
+            if (tag.family == TagFamily::Parameter && tag.closing) {
+                tag.candidate = add_candidate(pos, end);
+            }
+            tags_.push_back(tag);
+            pos = text_.find('<', end);
+        }
+    }
+
+    // Walks the deterministic structure between two parameter values: wrapper tags, parameterless
+    // calls and the next function opener. It stops at the next value, whose close is a choice, or
+    // at the end of the reading.
+    template <typename Recorder>
+    Step walk(std::size_t pos, Phase phase, Wrapper wrapper, bool salvage,
+              Recorder& recorder) const {
+        bool after_call = phase == Phase::AfterFunction || phase == Phase::AfterItem;
+        const auto stop = [&](FallbackReason failure) {
+            if (salvage && after_call) {
+                recorder.drop();
+                return Step{.reading = accepted({.discarded_suffix = 1})};
+            }
+            return Step{.reading = rejected(failure)};
+        };
         for (;;) {
-            skip_format_whitespace(text_, pos);
-            if (consume(pos, fn_close)) {
-                return FallbackReason::None;
-            }
-            // Tolerant: the region is exhausted after the last complete parameter, so a missing
-            // function close is a truncation, not a malformed structure. parse() retains the
-            // recovered parameters; the strict parser still requires the closing tag.
-            if (tolerant_ && at_region_end(pos)) {
-                return FallbackReason::TruncatedTail;
-            }
-            const FallbackReason failure = parse_parameter(pos, call);
-            if (failure != FallbackReason::None) { return failure; }
-        }
-    }
-
-    FallbackReason parse_parameter(std::size_t& pos, RawToolCall& call) {
-        std::size_t header_begin = 0;
-        std::string_view param_close = "</parameter>";
-        if (starts_with_at(text_, pos, "<parameter")) {
-            header_begin = pos + 10;
-            param_close  = "</parameter>";
-        } else if (starts_with_at(text_, pos, "<param")) {
-            header_begin = pos + 6;
-            param_close  = "</param>";
-        } else {
-            return FallbackReason::MalformedStructure;
-        }
-
-        const std::size_t tag_end = text_.find('>', header_begin);
-        if (tag_end == std::string_view::npos || tag_end == header_begin) {
-            return FallbackReason::MalformedStructure;
-        }
-        const std::string_view header = text_.substr(header_begin, tag_end - header_begin);
-        const std::string_view name   = extract_name_from_tag_header(header);
-        if (name.empty()) {
-            return FallbackReason::MalformedStructure;
-        }
-
-        const std::size_t value_begin = tag_end + 1;
-        std::size_t value_end         = 0;
-        std::size_t close_len         = 0;
-        if (!find_parameter_close(value_begin, value_end, close_len, param_close)) {
-            if (tolerant_) {
-                // Tolerant: the region ends before the closing tag, so the output budget cut the
-                // parameter value. Keep the value up to the cut (last occurrence wins, as with a
-                // complete parameter) and flag the tail; the strict parser keeps the hard
-                // structural failure.
-                const std::string_view partial = text_.substr(value_begin, text_.size() - value_begin);
-                const auto existing = std::find_if(call.parameters.begin(), call.parameters.end(),
-                                                   [&](const RawParameter& candidate) { return candidate.name == name; });
-                if (existing != call.parameters.end()) {
-                    existing->value = partial;
-                    ++duplicate_parameters_repaired_;
+            switch (phase) {
+            case Phase::AfterItem:
+                skip_format_whitespace(text_, pos);
+                if (pos == text_.size()) { return Step{.reading = accepted()}; }
+                phase = Phase::Item;
+                break;
+            case Phase::Item:
+                if (consume(pos, kToolOpen)) {
+                    wrapper = Wrapper::ToolCall;
+                } else if (consume(pos, kContainerOpen)) {
+                    wrapper = Wrapper::Container;
+                } else if (starts_with_at(text_, pos, "<function") ||
+                           starts_with_at(text_, pos, "<invoke")) {
+                    wrapper = Wrapper::Bare;
                 } else {
-                    call.parameters.push_back(RawParameter{.name = name, .value = partial});
+                    return stop(after_call ? FallbackReason::TrailingContent
+                                           : FallbackReason::MalformedStructure);
                 }
-                pos = text_.size();
-                return FallbackReason::TruncatedTail;
+                skip_format_whitespace(text_, pos);
+                phase = Phase::Function;
+                break;
+            case Phase::Function: {
+                const FunctionOpenResult opened = function_open_at(pos);
+                if (!opened.open) { return stop(opened.failure); }
+                recorder.open(opened.open->name);
+                pos = opened.open->body_begin;
+                skip_format_whitespace(text_, pos);
+                if (consume(pos, opened.open->invoke ? kInvokeClose : kFunctionClose)) {
+                    recorder.close();
+                    after_call = true;
+                    phase      = Phase::AfterFunction;
+                    break;
+                }
+                if (const std::optional<ParameterOpen> parameter = parameter_open_at(pos)) {
+                    return Step{.kind               = Step::Kind::Value,
+                                .parameter          = *parameter,
+                                .context            = context_of(opened.open->invoke, wrapper),
+                                .discard_on_failure = salvage && after_call};
+                }
+                return stop(pos == text_.size() ? cut_reason()
+                                                : FallbackReason::MalformedStructure);
             }
-            return FallbackReason::MalformedStructure;
+            case Phase::AfterFunction:
+                after_call = true;
+                if (wrapper == Wrapper::Bare) {
+                    phase = Phase::AfterItem;
+                    break;
+                }
+                skip_format_whitespace(text_, pos);
+                if (consume(pos, wrapper == Wrapper::ToolCall ? kToolClose : kContainerClose)) {
+                    phase = Phase::AfterItem;
+                    break;
+                }
+                if (pos == text_.size()) {
+                    return Step{.reading = salvage ? accepted({.missing_close = 1})
+                                                   : rejected(cut_reason())};
+                }
+                if (wrapper == Wrapper::Container) {
+                    phase = Phase::Function;
+                    break;
+                }
+                return stop(cut_reason());
+            }
         }
-        const std::string_view value = text_.substr(value_begin, value_end - value_begin);
-
-        const auto existing =
-            std::find_if(call.parameters.begin(), call.parameters.end(),
-                         [&](const RawParameter& candidate) { return candidate.name == name; });
-
-        // Last occurrence wins, as it would in JSON object syntax, rather than discarding an
-        // otherwise well-formed call.
-        if (existing != call.parameters.end()) {
-            existing->value = value;
-            ++duplicate_parameters_repaired_;
-        } else {
-            call.parameters.push_back(RawParameter{.name = name, .value = value});
-        }
-        pos = value_end + close_len;
-        return FallbackReason::None;
     }
 
-    bool find_parameter_close(std::size_t value_begin, std::size_t& value_end,
-                              std::size_t& close_len, std::string_view required_close) const {
-        std::size_t depth = 1;
-        std::size_t scan  = value_begin;
-        while (scan < text_.size()) {
-            if (starts_with_at(text_, scan, required_close)) {
-                --depth;
-                if (depth == 0) {
-                    value_end = scan;
-                    close_len = required_close.size();
-                    return true;
-                }
-                scan += required_close.size();
-                continue;
-            }
-            std::size_t open_tag_end = 0;
-            if (is_param_open_at(text_, scan, open_tag_end)) {
-                ++depth;
-                scan = open_tag_end + 1;
-                continue;
-            }
-            ++scan;
+    Reading resolve(Tables& tables, const Step& step, bool salvage) {
+        if (step.kind == Step::Kind::End) { return step.reading; }
+        const Reading& value = value_choices(tables, step.parameter, salvage)[step.context].reading;
+        if (!value.valid && step.discard_on_failure) { return accepted({.discarded_suffix = 1}); }
+        return value;
+    }
+
+    // Best close for a value in every context. It reads only the tails of later candidates, which
+    // prepared() fills from the end of the text backward, so no evaluation recurses.
+    const ValueChoices& value_choices(Tables& tables, const ParameterOpen& parameter,
+                                      bool salvage) {
+        if (const auto found = tables.values.find(parameter.value_begin);
+            found != tables.values.end()) {
+            return found->second;
         }
-        return false;
+        ValueChoices choices{};
+        std::array<bool, kContextCount> explained{};
+        // A context is settled once no later close can improve it: every longer value keeps at
+        // least the stray closes seen so far (ties keep the earlier close), or no later candidate
+        // has a valid tail.
+        std::array<bool, kContextCount> settled{};
+        bool candidate_seen = false;
+        MarkupBalance balance;
+        const auto first =
+            std::lower_bound(tags_.begin(), tags_.end(), parameter.value_begin,
+                             [](const MarkupTag& tag, std::size_t pos) { return tag.begin < pos; });
+        for (auto tag = first; tag != tags_.end(); ++tag) {
+            if (tag->candidate != kNpos && tag->short_form == parameter.short_form) {
+                candidate_seen = true;
+                const ReadingCost value_cost{.framed_markup = balance.unmatched(true),
+                                             .inline_markup = balance.unmatched(false)};
+                const ReadingCost later_bound{.framed_markup = balance.stray(true),
+                                              .inline_markup = balance.stray(false)};
+                const bool admissible = !salvage || value_cost.framed_markup == 0;
+                bool open_context     = false;
+                for (std::size_t context = 0; context < kContextCount; ++context) {
+                    if (settled[context]) { continue; }
+                    ValueChoice& choice = choices[context];
+                    const Reading& tail = tables.tails[tag->candidate][context];
+                    if (admissible && tail.valid) {
+                        const ReadingCost total = value_cost + tail.cost;
+                        if (!choice.reading.valid || total < choice.reading.cost) {
+                            choice = ValueChoice{.reading   = accepted(total),
+                                                 .candidate = tag->candidate};
+                        }
+                    } else if (!choice.reading.valid && !explained[context]) {
+                        choice.reading.failure =
+                            tail.valid ? FallbackReason::MalformedStructure : tail.failure;
+                        explained[context] = true;
+                    }
+                    const std::size_t last = tables.last_valid_tail[context];
+                    settled[context] =
+                        (choice.reading.valid && choice.reading.cost <= later_bound) ||
+                        last == kNpos || last <= tag->candidate;
+                    open_context = open_context || !settled[context];
+                }
+                if (!open_context) { break; }
+            }
+            balance.add(*tag);
+            // Salvage admits only values free of line-framed markup, and a stray close stays
+            // unmatched in every longer value.
+            if (salvage && balance.stray(true) != 0) { break; }
+        }
+        if (!candidate_seen) {
+            for (ValueChoice& choice : choices) { choice.reading.failure = cut_reason(); }
+        }
+        return tables.values.emplace(parameter.value_begin, choices).first->second;
+    }
+
+    Reading tail(Tables& tables, const BoundaryCandidate& candidate, std::uint8_t context,
+                 bool salvage) {
+        switch (candidate.kind) {
+        case BoundaryCandidate::Kind::Sibling:
+            return value_choices(tables, candidate.sibling, salvage)[context].reading;
+        case BoundaryCandidate::Kind::FunctionEnd: {
+            if (candidate.invoke != context_invoke(context)) {
+                return rejected(FallbackReason::MalformedStructure);
+            }
+            IgnoreCalls ignore;
+            return resolve(tables,
+                           walk(candidate.function_end, Phase::AfterFunction,
+                                context_wrapper(context), salvage, ignore),
+                           salvage);
+        }
+        case BoundaryCandidate::Kind::RegionEnd:
+            return salvage ? accepted({.missing_close = 1}) : rejected(cut_reason());
+        }
+        return rejected(FallbackReason::MalformedStructure);
+    }
+
+    Tables& prepared(bool salvage) {
+        Tables& tables = salvage ? salvage_ : exact_;
+        if (tables.prepared) { return tables; }
+        tables.tails.assign(candidates_.size(), {});
+        tables.last_valid_tail.fill(kNpos);
+        for (std::size_t index = candidates_.size(); index-- != 0;) {
+            for (std::uint8_t context = 0; context < kContextCount; ++context) {
+                tables.tails[index][context] = tail(tables, candidates_[index], context, salvage);
+            }
+            for (std::size_t context = 0; context < kContextCount; ++context) {
+                if (tables.tails[index][context].valid &&
+                    tables.last_valid_tail[context] == kNpos) {
+                    tables.last_valid_tail[context] = index;
+                }
+            }
+        }
+        tables.prepared = true;
+        return tables;
     }
 
     std::string_view text_;
     std::size_t max_name_length_;
     const Contract& contract_;
-    std::uint32_t duplicate_parameters_repaired_ = 0;
     bool tolerant_ = false;
+    std::vector<MarkupTag> tags_;
+    std::vector<BoundaryCandidate> candidates_;
+    Tables exact_;
+    Tables salvage_;
 };
 
 GeneratedToolCall normalize_raw_tool_call(const RawToolCall& raw, const Contract& contract,
@@ -883,59 +1352,83 @@ ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text,
                                                  const ToolCallOutputContract& contract,
                                                  bool tolerant) {
     const std::string_view source(text);
-    std::size_t candidate = find_first_tool_marker(source);
-    if (candidate == std::string::npos) { return fallback(text); }
+    const std::size_t first_marker = find_first_tool_marker(source);
+    if (first_marker == kNpos) { return fallback(text); }
 
     ParsedToolCallOutput out;
     out.diagnostics.marker_seen = true;
 
     // Generated prose can quote a tool-call marker before the real turn. Try the first marker, then
     // each later `<tool_call>` wrapper, and accept the first region that parses; earlier markers
-    // stay ordinary content. A truncated tail that still kept a complete call (tolerant mode) is a
-    // recovered region, not a failure.
-    std::vector<RawToolCall> raw_calls;
-    std::size_t accepted                   = std::string::npos;
-    FallbackReason accepted_reason         = FallbackReason::None;
-    std::uint32_t duplicate_repairs        = 0;
-    FallbackReason first_failure           = FallbackReason::MalformedStructure;
-    bool first_failure_recorded            = false;
-    while (candidate != std::string::npos) {
-        std::vector<RawToolCall> calls;
-        QwenToolRegionParser parser(source.substr(candidate), max_tool_name_length, contract,
-                                    tolerant);
-        const FallbackReason failure = parser.parse(calls);
-        if (failure == FallbackReason::None ||
-            (failure == FallbackReason::TruncatedTail && !calls.empty())) {
-            accepted          = candidate;
-            accepted_reason   = failure;
-            duplicate_repairs = parser.duplicate_parameters_repaired();
-            raw_calls         = std::move(calls);
+    // stay ordinary content. Retries move only to a later wrapper, and only past a region that
+    // failed before its first value or whose leading calls still close cleanly: after a value that
+    // never closes, the following markup may be that value's content, and a nested example must
+    // not be re-read as the call. Every exact reading is preferred over any tolerant salvage.
+    QwenToolRegionParser parser(source, max_tool_name_length, contract, tolerant);
+    const auto next_region = [&](std::size_t region) {
+        const bool self_contained =
+            parser.first_value(region) == kNpos || parser.region(region, true).valid;
+        return self_contained ? source.find(kToolOpen, region + 1) : kNpos;
+    };
+    std::optional<FallbackReason> first_failure;
+    std::size_t accepted = kNpos;
+    bool salvaged        = false;
+    for (std::size_t region = first_marker; region != kNpos; region = next_region(region)) {
+        const Reading reading = parser.region(region, false);
+        if (reading.valid) {
+            accepted = region;
             break;
         }
-        if (!first_failure_recorded) {
-            first_failure          = failure;
-            first_failure_recorded = true;
-        }
-        // Retries move only to a later `<tool_call>` wrapper: the markup nested inside a failed
-        // region (its `<function=...>` or `<invoke>`) must not re-read a truncated call.
-        candidate = text.find(kToolOpen, candidate + 1);
+        if (!first_failure) { first_failure = reading.failure; }
     }
-    if (accepted == std::string::npos) {
-        // No region parsed. A truncated tail that kept no call carries no arguments either, so
-        // the response is returned as text with the first region's reason recorded.
-        out.diagnostics.fallback_reason = first_failure;
+    // A value of the accepted reading can hold a later wrapper whose own reading also parses: the
+    // value then swallowed the real call after a call or opener that prose quoted. Each such
+    // wrapper is weighed with the text before it read as prose. The first one with strictly less
+    // unmatched markup in total replaces the reading, whose own values are examined in turn, so a
+    // tie never lets a nested example displace the call holding it.
+    if (accepted != kNpos) {
+        const std::size_t prose_begin = accepted;
+        ReadingCost best              = parser.region(accepted, false).cost;
+        for (bool moved = best != ReadingCost{}; moved;) {
+            moved = false;
+            for (const auto& nested : parser.nested_wrappers(accepted, prose_begin)) {
+                const Reading reading = parser.region(nested.begin, false);
+                if (reading.valid && nested.prose + reading.cost < best) {
+                    best     = nested.prose + reading.cost;
+                    accepted = nested.begin;
+                    moved    = true;
+                    break;
+                }
+            }
+        }
+    }
+    if (accepted == kNpos && tolerant) {
+        for (std::size_t region = first_marker; region != kNpos; region = next_region(region)) {
+            if (parser.region(region, true).valid) {
+                accepted = region;
+                salvaged = true;
+                break;
+            }
+        }
+    }
+    if (accepted == kNpos) {
+        // No region parsed, so the response is returned as text with the first region's reason.
+        out.diagnostics.fallback_reason =
+            first_failure.value_or(FallbackReason::MalformedStructure);
         return fallback(text, out.diagnostics);
     }
-    // A recovered truncated tail keeps its reason for transparency without demoting the output.
-    out.diagnostics.fallback_reason = accepted_reason;
+    // A salvaged region keeps its reason for transparency without demoting the output.
+    out.diagnostics.fallback_reason =
+        salvaged ? FallbackReason::TruncatedTail : FallbackReason::None;
 
+    const QwenToolRegionParser::Calls raw = parser.build(accepted, salvaged);
     out.content = rtrim_format_whitespace(source.substr(0, accepted));
-    out.tool_calls.reserve(raw_calls.size());
-    for (const RawToolCall& raw : raw_calls) {
-        out.tool_calls.push_back(normalize_raw_tool_call(raw, contract, out.diagnostics));
+    out.tool_calls.reserve(raw.calls.size());
+    for (const RawToolCall& call : raw.calls) {
+        out.tool_calls.push_back(normalize_raw_tool_call(call, contract, out.diagnostics));
     }
 
-    out.diagnostics.duplicate_parameters_repaired = duplicate_repairs;
+    out.diagnostics.duplicate_parameters_repaired = raw.duplicate_parameters_repaired;
     out.diagnostics.structured_call_count = static_cast<std::uint32_t>(out.tool_calls.size());
     out.is_tool_call_response             = true;
     return out;

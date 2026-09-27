@@ -455,13 +455,12 @@ struct GeneratedToolCall {
 enum class ToolCallParseFallbackReason : std::uint8_t {
     None,
     MalformedStructure,
-    DuplicateParameter,
     InvalidToolName,
     UndeclaredTool,
     TrailingContent,
-    // Tolerant recovery discarded a trailing suffix after an otherwise complete call, or kept a
-    // call whose closing tags were cut off at the region end. A structured response was still
-    // produced, so this is surfaced for transparency, not as a fallback-to-text failure.
+    // Tolerant mode only. With structured calls, recovery discarded a trailing suffix or a cut
+    // final call, or kept a call whose closing tags were cut off at the region end. Without any,
+    // the region ended inside a call and was returned as text.
     TruncatedTail,
 };
 
@@ -472,8 +471,6 @@ tool_call_parse_fallback_reason_name(ToolCallParseFallbackReason reason) noexcep
         return "none";
     case ToolCallParseFallbackReason::MalformedStructure:
         return "malformed_structure";
-    case ToolCallParseFallbackReason::DuplicateParameter:
-        return "duplicate_parameter";
     case ToolCallParseFallbackReason::InvalidToolName:
         return "invalid_tool_name";
     case ToolCallParseFallbackReason::UndeclaredTool:

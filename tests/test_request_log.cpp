@@ -562,19 +562,19 @@ int main() {
           .structured_call_count     = 0,
           .empty_arguments_omitted   = 0,
           .schema_mismatch_arguments = 0,
-          .fallback_reason           = ninfer::ToolCallParseFallbackReason::DuplicateParameter,
+          .fallback_reason           = ninfer::ToolCallParseFallbackReason::InvalidToolName,
     };
     const Json fallback_done =
         Json::parse(format_request_done_json("serve-test", 3003, context, fallback_outcome));
     failures += check(fallback_done.at("result").at("tool_call_parse").at("marker_seen") &&
                           fallback_done.at("result").at("tool_call_parse").at("fallback_reason") ==
-                              "duplicate_parameter",
+                              "invalid_tool_name",
                       "tool-call text fallback diagnostics missing from JSONL");
     const std::optional<OperationalRecord> fallback_warning =
         render_tool_call_fallback(context, fallback_outcome);
     failures += check(
         fallback_warning && fallback_warning->severity == OperationalSeverity::Warning &&
-            fallback_warning->message == "req#7 tool markup returned as text | duplicate parameter",
+            fallback_warning->message == "req#7 tool markup returned as text | invalid tool name",
         "tool-call text fallback warning is absent or exposes raw content");
     // With returned markup, the warning shows at most 240 bytes of it from the first marker on,
     // on one line, and none of the answer text before it.
@@ -586,7 +586,7 @@ int main() {
         "<tool_call> <function=edit> " + std::string(240 - 28, 'x') + "...";
     failures += check(snippet_warning &&
                           snippet_warning->message ==
-                              "req#7 tool markup returned as text | duplicate parameter | " +
+                              "req#7 tool markup returned as text | invalid tool name | " +
                                   expected_snippet &&
                           snippet_warning->message.find("sentinel-answer-text") ==
                               std::string::npos,

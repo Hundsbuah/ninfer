@@ -478,10 +478,10 @@ BF16 KV.
 - **Quoting `</think>` no longer ends the reasoning early**: it only ends the reasoning when a line
   break or the end of the turn follows. Adapted from upstream PR #309 by Fedor Suchkov.
   Commit: [`112f17c`][c-think-quote].
-- **`--tolerant-tool-calls`** keeps a good call followed by junk, a final call cut off by the output
-  limit (if a parameter is complete), repairs a missing `>` after the function name, and returns
-  calls to undeclared tools. By David Oelfke in the [gzenz/ninfer](https://github.com/gzenz/ninfer)
-  fork, ported onto this fork's parser.
+- **`--tolerant-tool-calls`** keeps a good call followed by junk, a final call whose closing tags
+  were cut off by the output limit (never one cut inside a value), repairs a missing `>` after the
+  function name, and returns calls to undeclared tools. By David Oelfke in the
+  [gzenz/ninfer](https://github.com/gzenz/ninfer) fork, ported onto this fork's parser.
   Commit: [`90e8ecf`][c-tolerant-tools].
 
 ### API and client compatibility

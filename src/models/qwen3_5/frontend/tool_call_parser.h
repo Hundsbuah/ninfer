@@ -62,10 +62,14 @@ struct ParsedToolCallOutput {
 [[nodiscard]] std::shared_ptr<const ToolCallOutputContract>
 build_tool_call_output_contract(std::span<const std::string> tool_jsons, bool enabled);
 
-// Parse Qwen's XML-like tool-call format. In tolerant mode, a complete function call is
-// recovered even when the model adds malformed wrapper markup, a trailing suffix, or stops at
-// its output budget before the closing tags; the strict parser keeps its all-or-nothing
-// behavior.
+// Parse Qwen's XML-like tool-call format. Argument text has no delimiter escape, so a parameter
+// close counts as structure only where the rest of the region still parses; among such readings
+// the one whose values hold the least unmatched markup wins. Markup that prose quoted before the
+// real call stays content when reading it as prose leaves strictly less markup unmatched than
+// reading it as a call whose value swallows the real one. In tolerant mode, complete calls are
+// also recovered from malformed wrapper markup, a trailing suffix, or closing tags cut by the
+// output budget, but never with a value the budget cut; the strict parser keeps its
+// all-or-nothing behavior.
 [[nodiscard]] ParsedToolCallOutput
 parse_qwen_tool_call_output(const std::string& text, std::size_t max_tool_name_length,
                             const ToolCallOutputContract& contract, bool tolerant = false);

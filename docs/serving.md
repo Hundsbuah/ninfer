@@ -253,22 +253,42 @@ the tool consumer can report the validation error and continue the agent loop. S
 supported explicit type retain untyped inference. NInfer does not apply defaults, enforce required
 properties, perform recursive JSON Schema validation, or use constrained decoding.
 
-String parameters preserve function/tool-call markers and balanced nested
-`<parameter=...>...</parameter>` text as value bytes. The Qwen wire format has no delimiter escape,
-so an unmatched nested parameter opener or a standalone `</parameter>` cannot be represented
-unambiguously; either makes that tool-call region ordinary content. Later content is still examined:
-the first tool-call region (any accepted marker form) that parses becomes the structured turn, and any
-quoted markup before it stays ordinary content. Generated reasoning closes only at a `</think>`
-followed by a line break or the end of the turn, so a marker the model quotes while reasoning (followed
-by a space, punctuation or an escaped `
+String parameters preserve tool-call markup as value bytes, including the `<tool_call>`,
+`<function=...>`, `<parameter=...>` and `</parameter>` tags that source code, patches, shell commands
+and documentation carry. The Qwen wire format has no delimiter escape, so a parameter close is
+structure only where a sibling parameter opener, the function close or the end of the turn follows it
+and the rest of the region still parses as calls; every other close stays in the value. When several
+readings consume the region, the one whose values hold the least unmatched markup wins: tags on a
+line of their own, as the chat template writes real structure, count before inline tags, and a tie
+keeps the earliest close. A value therefore keeps complete example calls, even ones that use the
+enclosing tool's parameter names. The residual ambiguity is a value that itself contains the
+template's parameter boundary with unbalanced markup around it, such as a line `</parameter>`
+followed by a line `<parameter=NAME>`; that pair reads as structure. Undeclared parameter names are
+accepted in identifier form (letters, digits, `_`, `-`, `.`, `$`, `@` and `:`, not starting with a
+digit); declared names are accepted verbatim. Later content is still examined, so markup that prose
+quotes before the real call stays ordinary content: the first tool-call region (any accepted marker
+form) that parses is the candidate turn, and a later `<tool_call>` inside one of its values replaces
+it when that region parses too and reading the text before it as prose leaves strictly less
+unmatched markup in total. A quoted complete call or a quoted opener therefore does not swallow the
+real call, while a tie keeps an example call inside the value that holds it. The search stops at a
+region that fails after opening a parameter value unless its leading calls close cleanly, since the
+markup after an unclosed value may be that value's content. The residual ambiguity here is prose
+that quotes the opener lines themselves (`<tool_call>`, `<function=NAME>` and `<parameter=NAME>`,
+each on a line of its own) before the real call: that balances exactly like a value cut right after
+a complete example call, and the tie keeps the earlier reading. Generated reasoning closes only at a
+`</think>` followed by a line break or the end of the turn, so a marker the model quotes while
+reasoning (followed by a space, punctuation or an escaped `
 `) stays in the reasoning channel.
 
 By default the parser keeps that all-or-nothing behaviour. With `--tolerant-tool-calls` the server
-recovers a call instead when the model adds a suffix after a complete call, a second call is
-malformed, a single final call is cut by the output budget before its closing tags, or the closing
-bracket after the function name is missing: the recovered call is reported structurally with a
-`truncated_tail` diagnostic (logged at Info severity) rather than demoted to text, and an
-undeclared tool name stays structured for the consumer to judge.
+salvages calls when no exact reading exists: complete calls followed by a suffix or by a malformed or
+cut call, or a final call whose closing tags the output budget cut after its last complete
+parameter. Salvage keeps only calls whose values hold no stray line-framed markup, and never a value
+the budget cut, since a truncated path, command or file body could act on the wrong target. Salvaged
+calls are reported structurally with a `truncated_tail` diagnostic (logged at Info severity) rather
+than demoted to text; a region that ends inside a value is returned as text with the same reason.
+Tolerant mode also repairs a missing closing bracket after the function name without a fallback
+reason, and keeps an undeclared tool name structured for the consumer to judge.
 
 Messages enter the selected template in their input order. The maintained Qwen templates keep
 system/developer messages at their original positions. A final assistant message is an assistant
@@ -943,7 +963,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--long-anchor-spacing N` | original: minimum token gap between automatic long anchors, doubling per anchor walking back from the prompt end (anchor k sits at least `N * 2^k` tokens below the previous grid point), so short tool-loop turns do not each cost an anchor and deep history stays covered; `0` anchors every one of the last N message boundaries | `1024` |
 | `--no-thinking` | disable thinking by default | thinking on |
 | `--preserve-thinking` | preserve closed-turn assistant reasoning by default | off |
-| `--tolerant-tool-calls` | recover complete tool calls cut by a malformed wrapper, a trailing suffix or the output budget instead of demoting them to text | off |
+| `--tolerant-tool-calls` | salvage complete tool calls from a malformed wrapper, a trailing suffix or closing tags cut by the output budget instead of demoting them to text; a call cut inside a value stays text | off |
 | `--cors` | permissive browser CORS headers | off |
 | `--usage-chunk-choice` | give the streamed usage chunk a zero-delta choice, for strict client parsers that reject the OpenAI-conformant empty `choices` array | off |
 | `--temperature F` | process-level temperature override | unset |
@@ -1051,9 +1071,10 @@ A parameter named more than once in one call keeps its last value, as in JSON ob
 counts once in `duplicate_parameters_repaired` for each repeat instead of demoting the call to text.
 Fallback reasons are `none`, `malformed_structure`, `invalid_tool_name`, `undeclared_tool`,
 `trailing_content`, and `truncated_tail`. `truncated_tail` occurs only with `--tolerant-tool-calls`:
-with a nonzero `structured_call_count` the recovered calls were returned structurally (a discarded
-suffix or a call cut at the region end), and with none the region was returned as text. These
-counters contain no tool arguments or generated text.
+with a nonzero `structured_call_count` the salvaged calls were returned structurally (a discarded
+suffix or cut final call, or closing tags cut at the region end), and with none the region ended
+inside a call and was returned as text. These counters contain no tool arguments or generated
+text.
 
 `request_done.timings_seconds` contains `prepare`, `ttft`, `vision`, `prefill`, `decode`, and `total`
 as full-precision JSON numbers. Its `speculative` object contains `backend`, `draft_window`, `rounds`,

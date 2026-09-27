@@ -2,6 +2,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <initializer_list>
 #include <iostream>
 #include <memory>
@@ -214,19 +215,167 @@ int test_string_values_preserve_embedded_tool_markup() {
     return failures;
 }
 
-int test_unrepresentable_parameter_delimiters_fall_back() {
-    const auto contract = contract_for("bash", Json{{"command", Json{{"type", "string"}}}});
-    const std::string unmatched_open =
-        tool_call("bash", {{"command", "echo '<parameter=unterminated>'"}});
-    const std::string standalone_close = tool_call("bash", {{"command", "echo '</parameter>'"}});
+int check_single_call(const fi::ParsedToolCallOutput& parsed, std::string_view name,
+                      const Json& arguments, std::string_view message) {
+    const bool structured =
+        parsed.is_tool_call_response && parsed.tool_calls.size() == 1 &&
+        parsed.tool_calls.front().name == name &&
+        parsed.diagnostics.fallback_reason == ninfer::ToolCallParseFallbackReason::None;
+    return check(structured && Json::parse(parsed.tool_calls.front().arguments_json) == arguments,
+                 std::string(message));
+}
+
+int test_literal_parameter_delimiters_stay_string_content() {
+    const auto contract = contract_for("bash", Json{{"command", Json{{"type", "string"}}},
+                                                    {"timeout", Json{{"type", "integer"}}}});
+    // A close is a boundary only where the call grammar continues after it, so unmatched literal
+    // openers and closes need no escape.
+    const std::vector<std::string> commands = {
+        "echo '<parameter=unterminated>'",
+        "echo '</parameter>'",
+        "printf '%s' '</parameter>' '<parameter=timeout>' '</function>' '</tool_call>'",
+        "grep -n '<parameter=\\|</parameter>\\|<tool_call>' tool_call_parser.cpp",
+        "cat > fixture.txt <<'EOF'\nls\n</parameter>\n</function>\n</tool_call>\nEOF",
+        "cat > fixture.txt <<'EOF'\n<tool_call>\n<function=bash>\n<parameter=command>\nEOF",
+    };
+    int failures = 0;
+    for (const std::string& command : commands) {
+        for (const bool tolerant : {false, true}) {
+            const auto parsed = fi::parse_qwen_tool_call_output(
+                tool_call("bash", {{"command", command}, {"timeout", "30"}}), 64, contract,
+                tolerant);
+            failures += check_single_call(
+                parsed, "bash", Json{{"command", command}, {"timeout", 30}},
+                "literal delimiters in a string value changed the call: " + command);
+        }
+    }
+    return failures;
+}
+
+// Shapes of the calls a coding agent lost while editing this parser: source code and patches
+// carry tool-call markup inside string literals, before or after a sibling parameter.
+int test_agent_payloads_keep_literal_markup() {
+    const auto write = contract_for("write", Json{{"path", Json{{"type", "string"}}},
+                                                  {"content", Json{{"type", "string"}}},
+                                                  {"i", Json{{"type", "string"}}}});
+    const auto edit  = contract_for(
+        "edit", Json{{"i", Json{{"type", "string"}}}, {"input", Json{{"type", "string"}}}});
+    const std::string source =
+        "int test_partial_view() {\n"
+        "    harness.feed(\"<tool_call>\\n<function=write>\\n<parameter=path>\\n\");\n"
+        "    harness.feed(\"A</parameter><parameter=X\\nB</function>\\nC\\n\");\n"
+        "    return check(view.empty(), \"a </parameter> close is not a boundary\");\n"
+        "}";
+    const std::string patch = "[tests/test_tool_call_parser.cpp#E1A7]\n"
+                              "PUT >1041:\n"
+                              "+    harness.feed(\"<tool_call>\\n<function=write>\\n\");\n"
+                              "+    harness.feed(\"<parameter=path>\\nx\\n</parameter>\\n\");";
 
     int failures = 0;
-    failures += check_rejected(unmatched_open, contract,
-                               ninfer::ToolCallParseFallbackReason::MalformedStructure,
-                               "unbalanced nested parameter open was silently repaired");
-    failures += check_rejected(standalone_close, contract,
-                               ninfer::ToolCallParseFallbackReason::MalformedStructure,
-                               "standalone parameter close was guessed to be string content");
+    for (const bool tolerant : {false, true}) {
+        failures += check_single_call(
+            fi::parse_qwen_tool_call_output(
+                tool_call("write", {{"content", source}, {"path", "tests/preview.cpp"}}), 64, write,
+                tolerant),
+            "write", Json{{"content", source}, {"path", "tests/preview.cpp"}},
+            "source code with literal openers swallowed the following path parameter");
+        failures += check_single_call(
+            fi::parse_qwen_tool_call_output(
+                "Helpers are in. Next:\n\n" +
+                    tool_call("edit", {{"i", "Inserting preview tests"}, {"input", patch}}),
+                64, edit, tolerant),
+            "edit", Json{{"i", "Inserting preview tests"}, {"input", patch}},
+            "a patch with literal markup lost its structured edit call");
+    }
+    return failures;
+}
+
+// Complete example calls written on their own lines are balanced markup: they stay inside the value
+// even where their parameter names are declared for the enclosing tool.
+int test_string_values_keep_complete_example_calls() {
+    const auto contract = contract_for("bash", Json{{"command", Json{{"type", "string"}}},
+                                                    {"timeout", Json{{"type", "integer"}}},
+                                                    {"i", Json{{"type", "string"}}}});
+    const std::string example =
+        tool_call("bash", {{"command", "ls -la"}, {"timeout", "30"}, {"i", "Listing"}});
+    const std::string fixture = "printf '%s' '" + example + "' > fixture.txt && cat fixture.txt";
+    const std::string trailing_example = "cat > fixture.txt <<'EOF'\n" + example;
+
+    int failures = 0;
+    for (const bool tolerant : {false, true}) {
+        failures += check_single_call(
+            fi::parse_qwen_tool_call_output(
+                tool_call("bash", {{"command", fixture}, {"i", "Creating fixtures"}}), 64, contract,
+                tolerant),
+            "bash", Json{{"command", fixture}, {"i", "Creating fixtures"}},
+            "a complete example call inside a command was read as structure");
+        failures += check_single_call(
+            fi::parse_qwen_tool_call_output(
+                tool_call("bash", {{"i", "Writing fixture"}, {"command", trailing_example}}), 64,
+                contract, tolerant),
+            "bash", Json{{"i", "Writing fixture"}, {"command", trailing_example}},
+            "an example call at the end of the last value was read as structure");
+
+        const std::string two_calls = tool_call("bash", {{"command", fixture}}) + "\n" +
+                                      tool_call("bash", {{"command", "cat fixture.txt"}});
+        const auto parsed = fi::parse_qwen_tool_call_output(two_calls, 64, contract, tolerant);
+        failures += check(
+            parsed.is_tool_call_response && parsed.tool_calls.size() == 2 &&
+                Json::parse(parsed.tool_calls[0].arguments_json) == Json{{"command", fixture}} &&
+                Json::parse(parsed.tool_calls[1].arguments_json) ==
+                    Json{{"command", "cat fixture.txt"}} &&
+                parsed.diagnostics.fallback_reason == ninfer::ToolCallParseFallbackReason::None,
+            "an example call inside the first of two calls moved the call boundary");
+    }
+    return failures;
+}
+
+// The earliest boundary is not always right: here it would cut the document after its first line
+// and turn the example's closing tags into a separate `i` value.
+int test_balanced_example_with_declared_sibling_names() {
+    const auto contract        = contract_for("write", Json{{"path", Json{{"type", "string"}}},
+                                                            {"content", Json{{"type", "string"}}},
+                                                            {"i", Json{{"type", "string"}}}});
+    const std::string document = "Call it like this:\n<parameter=path>\n/tmp/a\n</parameter>\n"
+                                 "<parameter=i>\nnote\n</parameter>";
+    const std::string text     = tool_call("write", {{"content", document}, {"path", "doc.md"}});
+    int failures               = 0;
+    for (const bool tolerant : {false, true}) {
+        failures += check_single_call(fi::parse_qwen_tool_call_output(text, 64, contract, tolerant),
+                                      "write", Json{{"content", document}, {"path", "doc.md"}},
+                                      "a balanced example with declared names was split");
+    }
+    return failures;
+}
+
+int test_incremental_literal_markup_matches_one_shot() {
+    const auto contract = output_contract_for(
+        "write", Json{{"path", Json{{"type", "string"}}}, {"content", Json{{"type", "string"}}}});
+    const std::string content = "feed(\"<tool_call>\\n<function=write>\\n<parameter=path>\\n\");\n"
+                                "cat <<'EOF'\n</parameter>\n</function>\n</tool_call>\nEOF";
+    const std::string text =
+        "Writing it.\n" + tool_call("write", {{"content", content}, {"path", "probe.cpp"}});
+    const auto parsed = fi::parse_qwen_tool_call_output(text, 64, *contract);
+
+    int failures =
+        check_single_call(parsed, "write", Json{{"content", content}, {"path", "probe.cpp"}},
+                          "literal markup case did not parse in one shot");
+    bool every_split_matches = true;
+    for (std::size_t split = 0; split <= text.size(); ++split) {
+        fi::ToolCallOutputDecoder decoder(contract, 64);
+        std::string visible = decoder.feed(std::string_view(text).substr(0, split));
+        visible += decoder.feed(std::string_view(text).substr(split));
+        const auto terminal = decoder.finish();
+        if (visible + terminal.content != parsed.content || terminal.tool_calls.size() != 1 ||
+            terminal.tool_calls.front().arguments_json !=
+                parsed.tool_calls.front().arguments_json ||
+            terminal.diagnostics != parsed.diagnostics) {
+            every_split_matches = false;
+            break;
+        }
+    }
+    failures += check(every_split_matches,
+                      "incremental literal-markup parsing depends on the transport chunk boundary");
     return failures;
 }
 
@@ -705,6 +854,50 @@ int test_incremental_quoted_marker_preserves_bytes() {
     return failures;
 }
 
+// Prose can quote a complete call or a bare opener before the real call. Reading the quote as a
+// call parses too, but only because its value swallows the real call; the quote stays content.
+int test_quoted_call_markup_before_real_call() {
+    const auto contract        = contract_for("bash", Json{{"command", Json{{"type", "string"}}}});
+    const std::string real     = tool_call("bash", {{"command", "echo ok"}});
+    const std::string quotes[] = {
+        "The call looks like this:\n" + tool_call("bash", {{"command", "ls"}}) + "\nRunning it:",
+        "Each call starts with <tool_call><function=bash><parameter=command> and the command.",
+    };
+    int failures = 0;
+    for (const std::string& quote : quotes) {
+        for (const bool tolerant : {false, true}) {
+            const auto parsed =
+                fi::parse_qwen_tool_call_output(quote + "\n" + real, 64, contract, tolerant);
+            failures += check_single_call(parsed, "bash", Json{{"command", "echo ok"}},
+                                          "quoted markup swallowed the real call: " + quote);
+            failures += check(parsed.content == quote,
+                              "quoted markup before the real call was not kept as content");
+        }
+    }
+    return failures;
+}
+
+// A value cut right after a complete example call balances its markup exactly like prose quoting
+// an opener before a call. The example inside the value must never become the call.
+int test_cut_value_never_promotes_its_example() {
+    const std::vector<std::string> definitions = {
+        tool_definition("write", Json{{"path", Json{{"type", "string"}}},
+                                      {"content", Json{{"type", "string"}}}}),
+        tool_definition("bash", Json{{"command", Json{{"type", "string"}}}})};
+    const auto contract    = contract_from_definitions(definitions);
+    const std::string text = "<tool_call>\n<function=write>\n<parameter=path>\ndoc.md\n"
+                             "</parameter>\n<parameter=content>\nExample:\n" +
+                             tool_call("bash", {{"command", "rm -rf build"}});
+    int failures           = 0;
+    for (const bool tolerant : {false, true}) {
+        const auto parsed   = fi::parse_qwen_tool_call_output(text, 64, *contract, tolerant);
+        const bool promoted = std::any_of(parsed.tool_calls.begin(), parsed.tool_calls.end(),
+                                          [](const auto& call) { return call.name == "bash"; });
+        failures += check(!promoted, "an example inside a cut value was emitted as the call");
+    }
+    return failures;
+}
+
 int test_incremental_valid_and_boolean() {
     fi::ToolCallOutputDecoder legacy(std::make_shared<fi::ToolCallOutputContract>(), 64);
     std::string visible;
@@ -1172,19 +1365,16 @@ int test_tolerant_undeclared_and_value_cut() {
                           strict.diagnostics.fallback_reason == Reason::UndeclaredTool,
                       "strict mode did not reject the undeclared-name call");
 
+    // A value cut by the end of the output is not the value the model meant: `/tmp/out` may have
+    // been `/tmp/out.js`. Even tolerant mode returns the region as text.
     const std::string value_cut = "Now\n"
                                   "<tool_call>\n"
                                   "<function=delete_file>\n"
                                   + open_tag + "/tmp/out";
     const auto cut_tolerant = fi::parse_qwen_tool_call_output(value_cut, 64, *contract, true);
-    failures += check(cut_tolerant.is_tool_call_response && cut_tolerant.tool_calls.size() == 1 &&
-                          cut_tolerant.tool_calls.front().name == "delete_file",
-                      "tolerant mode did not keep the value-cut call");
-    if (cut_tolerant.tool_calls.size() == 1) {
-        const Json args = Json::parse(cut_tolerant.tool_calls.front().arguments_json);
-        failures += check(args.at("filePath").get<std::string>() == "/tmp/out",
-                          "tolerant mode lost the partial value-cut argument");
-    }
+    failures += check(!cut_tolerant.is_tool_call_response && cut_tolerant.tool_calls.empty() &&
+                          cut_tolerant.content == value_cut,
+                      "tolerant mode structured a call whose value was cut");
     failures += check(cut_tolerant.diagnostics.fallback_reason == Reason::TruncatedTail,
                       "tolerant value-cut was not flagged as a truncated tail");
     const auto cut_strict = fi::parse_qwen_tool_call_output(value_cut, 64, *contract);
@@ -1208,6 +1398,65 @@ int test_tolerant_undeclared_and_value_cut() {
     return failures;
 }
 
+int test_tolerant_never_emits_cut_values() {
+    using Reason        = ninfer::ToolCallParseFallbackReason;
+    const auto contract = contract_for(
+        "write", Json{{"path", Json{{"type", "string"}}}, {"content", Json{{"type", "string"}}}});
+    int failures = 0;
+
+    // A complete path must not become a write of truncated content, or of no content at all.
+    const std::string cut_second = "<tool_call>\n<function=write>\n<parameter=path>\nsrc/main.cpp\n"
+                                   "</parameter>\n<parameter=content>\nint main() {\n    return";
+    const auto cut_tolerant      = fi::parse_qwen_tool_call_output(cut_second, 64, contract, true);
+    failures += check(!cut_tolerant.is_tool_call_response && cut_tolerant.content == cut_second &&
+                          cut_tolerant.diagnostics.fallback_reason == Reason::TruncatedTail,
+                      "tolerant mode structured a call whose last value was cut");
+
+    // Complete calls before the cut call stay structured; the cut call is dropped.
+    const std::string first = tool_call("write", {{"path", "a.txt"}, {"content", "done"}});
+    const std::string two   = first + "\n<tool_call>\n<function=write>\n<parameter=path>\nb.txt\n"
+                                      "</parameter>\n<parameter=content>\npartial";
+    const auto kept         = fi::parse_qwen_tool_call_output(two, 64, contract, true);
+    failures += check(kept.is_tool_call_response && kept.tool_calls.size() == 1 &&
+                          Json::parse(kept.tool_calls.front().arguments_json) ==
+                              Json{{"path", "a.txt"}, {"content", "done"}} &&
+                          kept.diagnostics.fallback_reason == Reason::TruncatedTail,
+                      "tolerant mode did not keep only the complete call before a cut call");
+    const auto strict = fi::parse_qwen_tool_call_output(two, 64, contract);
+    failures += check(!strict.is_tool_call_response &&
+                          strict.diagnostics.fallback_reason == Reason::MalformedStructure,
+                      "strict mode committed a region that ends inside a value");
+    return failures;
+}
+
+int test_tolerant_salvage_needs_clean_values() {
+    using Reason        = ninfer::ToolCallParseFallbackReason;
+    const auto contract = contract_for(
+        "write", Json{{"path", Json{{"type", "string"}}}, {"content", Json{{"type", "string"}}}});
+    const std::string example = tool_call("bash", {{"command", "ls"}});
+    int failures              = 0;
+
+    // An exact reading exists, so the example's closing tags are not a salvage point.
+    const std::string document = "Example:\n" + example + "\nThat is all.";
+    failures += check_single_call(
+        fi::parse_qwen_tool_call_output(
+            tool_call("write", {{"path", "doc.md"}, {"content", document}}), 64, contract, true),
+        "write", Json{{"path", "doc.md"}, {"content", document}},
+        "tolerant salvage replaced an exact reading");
+
+    // The output ends inside the document. Salvaging the example's close would write the document
+    // cut in the middle of the example markup.
+    const std::string cut =
+        "<tool_call>\n<function=write>\n<parameter=path>\ndoc.md\n</parameter>\n"
+        "<parameter=content>\nExample:\n" +
+        example + "\nThat is";
+    const auto salvaged = fi::parse_qwen_tool_call_output(cut, 64, contract, true);
+    failures += check(!salvaged.is_tool_call_response && salvaged.content == cut &&
+                          salvaged.diagnostics.fallback_reason != Reason::None,
+                      "tolerant salvage kept a value that ends inside literal markup");
+    return failures;
+}
+
 int main() {
     int failures = 0;
     failures += test_duplicate_parameter_keeps_last_value();
@@ -1215,7 +1464,11 @@ int main() {
     failures += test_multiple_calls();
     failures += test_declared_strings_preserve_text();
     failures += test_string_values_preserve_embedded_tool_markup();
-    failures += test_unrepresentable_parameter_delimiters_fall_back();
+    failures += test_literal_parameter_delimiters_stay_string_content();
+    failures += test_agent_payloads_keep_literal_markup();
+    failures += test_string_values_keep_complete_example_calls();
+    failures += test_balanced_example_with_declared_sibling_names();
+    failures += test_incremental_literal_markup_matches_one_shot();
     failures += test_declared_json_types();
     failures += test_boolean_boundary();
     failures += test_exact_integer_boundary();
@@ -1230,6 +1483,8 @@ int main() {
     failures += test_quoted_marker_before_real_call();
     failures += test_later_candidate_must_consume_the_end();
     failures += test_incremental_quoted_marker_preserves_bytes();
+    failures += test_quoted_call_markup_before_real_call();
+    failures += test_cut_value_never_promotes_its_example();
     failures += test_incremental_valid_and_boolean();
     failures += test_incremental_fallback_preserves_bytes();
     failures += test_incremental_embedded_parameter_markup();
@@ -1242,6 +1497,8 @@ int main() {
     failures += test_tolerant_truncated_final_call();
     failures += test_tolerant_missing_function_close_bracket();
     failures += test_tolerant_undeclared_and_value_cut();
+    failures += test_tolerant_never_emits_cut_values();
+    failures += test_tolerant_salvage_needs_clean_values();
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }
