@@ -738,7 +738,7 @@ void PrefixCacheIndex::abort_tail_device_fill(SnapshotRef ref) {
 
 // ---- snapshots ---------------------------------------------------------------------------------
 
-std::optional<std::uint32_t> PrefixCacheIndex::acquire_device_slot(bool allow_unbacked) {
+std::optional<std::uint32_t> PrefixCacheIndex::acquire_device_slot() {
     for (std::uint32_t slot = 0; slot < slot_state_.size(); ++slot) {
         if (slot_state_[slot] == SlotState::Free) {
             set_slot(slot, SlotState::Staging);
@@ -768,7 +768,6 @@ std::optional<std::uint32_t> PrefixCacheIndex::acquire_device_slot(bool allow_un
         ++counters_.device_slot_evictions;
         return slot;
     }
-    if (!allow_unbacked) { return std::nullopt; }
     slot = pick(false);
     if (slot == kNoId) { return std::nullopt; }
     remove_snapshot(slot_owner_[slot]);

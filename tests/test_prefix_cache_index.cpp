@@ -89,7 +89,7 @@ std::vector<NodeRef> insert_sequence(PrefixCacheIndex& index, RecordingBackend& 
 }
 
 SnapshotRef publish_tap(PrefixCacheIndex& index, NodeRef anchor) {
-    const auto slot = index.acquire_device_slot(false);
+    const auto slot = index.acquire_device_slot();
     require(slot.has_value(), "no device slot for a tap");
     const std::uint32_t frontier = (index.node(anchor).depth + 1U) * kBlockTokens;
     const PublishResult result =
@@ -204,7 +204,7 @@ void test_collisions_and_tails() {
     prompt.insert(prompt.end(), tail_tokens.begin(), tail_tokens.end());
     prompt.push_back(7);
     prompt.push_back(8);
-    const auto slot             = index.acquire_device_slot(false);
+    const auto slot             = index.acquire_device_slot();
     const std::uint32_t tail_id = backend.allocate();
     const PublishResult endpoint =
         index.publish_snapshot(first.node, 74, tail_tokens, tail_id, *slot, SnapshotKind::Endpoint);
@@ -224,7 +224,7 @@ void test_collisions_and_tails() {
             "a different tail token must not match");
 
     // Duplicate publication frees the new slot and tail and returns the existing snapshot.
-    const auto slot2              = index.acquire_device_slot(false);
+    const auto slot2              = index.acquire_device_slot();
     const std::uint32_t tail_copy = backend.allocate();
     const PublishResult duplicate = index.publish_snapshot(first.node, 74, tail_tokens, tail_copy,
                                                            *slot2, SnapshotKind::Endpoint);
@@ -234,7 +234,7 @@ void test_collisions_and_tails() {
     require(index.stats().free_device_slots == 1, "duplicate staging slot was not freed");
     require_throws(
         [&] {
-            const auto s = index.acquire_device_slot(false);
+            const auto s = index.acquire_device_slot();
             (void)index.publish_snapshot(first.node, 75, tail_tokens, backend.allocate(), *s,
                                          SnapshotKind::Tap);
         },
@@ -367,7 +367,7 @@ void test_host_dead_and_gdsf() {
     require(index.stats().gdsf_inflation >= before, "GDSF inflation must be monotonic");
 
     // A host-only snapshot chosen by host pressure is removed entirely.
-    const auto slot = index.acquire_device_slot(false);
+    const auto slot = index.acquire_device_slot();
     require(slot.has_value() && index.valid(snap_b) &&
                 (index.snapshot(snap_b).device_slot == kNoId ||
                  index.snapshot(snap_c).device_slot == kNoId),
@@ -422,7 +422,7 @@ void test_persistence_roundtrip() {
     const SnapshotRef backed = publish_tap(source, path[1]);
     backup_snapshot(source, backed);
     const auto tail_tokens      = make_tokens(10, 41);
-    const auto slot             = source.acquire_device_slot(false);
+    const auto slot             = source.acquire_device_slot();
     const std::uint32_t tail_id = backend.allocate();
     const PublishResult endpoint =
         source.publish_snapshot(path[2], 202, tail_tokens, tail_id, *slot, SnapshotKind::Endpoint);
@@ -430,7 +430,7 @@ void test_persistence_roundtrip() {
     // A Device-only snapshot on an unbacked path is not persistable.
     const auto other      = make_tokens(64, 42);
     const auto other_path = insert_sequence(source, backend, other);
-    const auto other_slot = source.acquire_device_slot(true);
+    const auto other_slot = source.acquire_device_slot();
     require(other_slot.has_value(), "no slot for an unbacked snapshot");
     (void)source.publish_snapshot(other_path[0], 64, {}, std::nullopt, *other_slot,
                                   SnapshotKind::Tap);
@@ -498,7 +498,7 @@ void test_tail_device_fill() {
     const auto path   = insert_sequence(index, backend, tokens);
     backup_node(index, path[0]);
     const auto tail_tokens      = make_tokens(10, 32);
-    const auto slot             = index.acquire_device_slot(false);
+    const auto slot             = index.acquire_device_slot();
     const std::uint32_t tail_id = backend.allocate();
     const PublishResult endpoint =
         index.publish_snapshot(path[0], 74, tail_tokens, tail_id, *slot, SnapshotKind::Endpoint);
@@ -546,28 +546,153 @@ void test_tail_device_fill() {
 
 void test_device_slots() {
     RecordingBackend backend;
-    PrefixCacheIndex index(small_config(64, 1), backend);
+    PrefixCacheIndex index(small_config(64, 2), backend);
     const auto a             = make_tokens(64, 13);
     const auto path_a        = insert_sequence(index, backend, a);
     const SnapshotRef snap_a = publish_tap(index, path_a[0]);
-    require(!index.acquire_device_slot(false).has_value(),
-            "an unbacked slot must not be taken without permission");
     backup_snapshot(index, snap_a);
-    const auto slot = index.acquire_device_slot(false);
-    require(slot.has_value(), "a backed slot must be reusable");
-    require(index.valid(snap_a) && index.snapshot(snap_a).device_slot == kNoId,
-            "the evicted slot's snapshot must survive host-only");
-    index.release_device_slot(*slot);
-
-    // Unbacked with permission: the owner is lost.
     const auto b             = make_tokens(64, 14);
     const auto path_b        = insert_sequence(index, backend, b);
-    const SnapshotRef snap_b = publish_tap(index, path_b[0]);
-    const auto forced        = index.acquire_device_slot(true);
-    require(forced.has_value() && !index.valid(snap_b), "unbacked slot eviction loses its owner");
+    const SnapshotRef snap_b = publish_tap(index, path_b[0]); // unbacked
+
+    // No free slot: the host-backed owner yields its device image and stays host-only; the
+    // unbacked slot is left alone while a backed slot exists.
+    const auto backed = index.acquire_device_slot();
+    require(backed.has_value() && index.valid(snap_a) &&
+                index.snapshot(snap_a).device_slot == kNoId,
+            "the backed slot must be evicted before the unbacked one");
+    require(index.valid(snap_b) && index.snapshot(snap_b).device_slot != kNoId,
+            "the unbacked slot must not be taken while a backed slot exists");
+    index.release_device_slot(*backed);
+
+    // Without a free or backed slot, the unbacked slot is the last resort and its owner is lost.
+    const auto c             = make_tokens(64, 15);
+    const auto path_c        = insert_sequence(index, backend, c);
+    const SnapshotRef snap_c = publish_tap(index, path_c[0]); // fills the freed slot, unbacked
+    const auto forced        = index.acquire_device_slot();
+    require(forced.has_value() && !index.valid(snap_b),
+            "an unbacked slot must be evictable as a last resort, losing its owner");
+    require(index.valid(snap_c) && index.snapshot(snap_c).device_slot != kNoId,
+            "the most recently used unbacked slot must be kept");
     index.release_device_slot(*forced);
     index.release_path(path_a);
     index.release_path(path_b);
+    index.release_path(path_c);
+    index.check_invariants();
+}
+
+// Regression: under Host tier pressure GDSF drops the host copy of a device-resident snapshot,
+// which keeps its device slot ("slot zombie"). Once every device slot is held by a zombie,
+// tap/endpoint publication must still obtain a slot by evicting the least recently hit unbacked
+// owner instead of giving up, which silently stopped every later tap and endpoint.
+void test_device_slot_starvation() {
+    RecordingBackend backend;
+    PrefixCacheIndex index(small_config(12, 2), backend);
+    const auto tokens = make_tokens(64 * 11, 21);
+
+    // Request 1: a session with an eight-block prefix written through to the Host tier (eight
+    // slabs) and an endpoint at the frontier whose backup fills the tier.
+    const std::vector<TokenId> prefix(tokens.begin(), tokens.begin() + 64 * 8);
+    const auto path = insert_sequence(index, backend, prefix);
+    for (const NodeRef node : path) { backup_node(index, node); }
+    const auto endpoint_slot = index.acquire_device_slot();
+    require(endpoint_slot.has_value(), "no device slot for the endpoint");
+    const PublishResult endpoint =
+        index.publish_snapshot(path[7], 512, {}, std::nullopt, *endpoint_slot,
+                               SnapshotKind::Endpoint);
+    require(endpoint.created, "endpoint not created");
+    backup_snapshot(index, endpoint.snapshot);
+    require(index.stats().host_free_slabs == 0, "the endpoint image must fill the tier");
+    index.release_path(path);
+
+    // Request 2 extends the session by one block. No free slab and no dead KV: GDSF drops the
+    // endpoint's host copy, but the endpoint keeps its device slot (a slot zombie).
+    auto session = prefix;
+    session.insert(session.end(), tokens.begin() + 64 * 8, tokens.begin() + 64 * 9);
+    const auto path2 = insert_sequence(index, backend, session);
+    backup_node(index, path2[8]);
+    require(index.valid(endpoint.snapshot) &&
+                index.snapshot(endpoint.snapshot).host == CopyState::Absent &&
+                index.snapshot(endpoint.snapshot).device_slot != kNoId,
+            "a device-complete snapshot must lose only its host copy");
+    index.release_path(path2);
+
+    // Request 3 extends once more; both extension blocks become dead KV on release.
+    auto session3 = session;
+    session3.insert(session3.end(), tokens.begin() + 64 * 9, tokens.begin() + 64 * 10);
+    const auto path3 = insert_sequence(index, backend, session3);
+    backup_node(index, path3[9]);
+    index.release_path(path3);
+
+    // A second endpoint is backed, using the slabs freed by reclaiming the dead extension KV.
+    const auto tap_slot = index.acquire_device_slot();
+    require(tap_slot.has_value(), "no device slot for the second endpoint");
+    const PublishResult tap =
+        index.publish_snapshot(path3[5], 384, {}, std::nullopt, *tap_slot, SnapshotKind::Endpoint);
+    require(tap.created, "second endpoint not created");
+    backup_snapshot(index, tap.snapshot);
+    require(index.stats().host_dead_reclaims == 2,
+            "the dead extension blocks must be reclaimed before any snapshot");
+    require(index.snapshot(tap.snapshot).host == CopyState::Resident,
+            "the second endpoint must be host-backed");
+
+    // Request 4 extends once more. No free slab and no dead KV left, so GDSF drops the second
+    // endpoint's host copy too. Both device slots are now zombies.
+    auto session4 = session3;
+    session4.insert(session4.end(), tokens.begin() + 64 * 10, tokens.begin() + 64 * 11);
+    const auto path4 = insert_sequence(index, backend, session4);
+    backup_node(index, path4[10]);
+    index.release_path(path4);
+    const auto z1 = index.snapshot(endpoint.snapshot);
+    const auto z2 = index.snapshot(tap.snapshot);
+    require(index.valid(endpoint.snapshot) && index.valid(tap.snapshot) &&
+                z1.host == CopyState::Absent && z2.host == CopyState::Absent &&
+                z1.device_slot != kNoId && z2.device_slot != kNoId &&
+                index.stats().host_snapshot_evictions == 2 &&
+                index.stats().free_device_slots == 0,
+            "both device slots must be held by unbacked snapshots");
+
+    // The starvation point: with every slot a zombie, acquisition must evict the least recently
+    // hit unbacked owner instead of giving up.
+    const auto slot = index.acquire_device_slot();
+    require(slot.has_value(), "a slot must be reclaimable from a zombie");
+    require(!index.valid(endpoint.snapshot) && index.valid(tap.snapshot),
+            "the least recently hit zombie must be removed, the newer one kept");
+    require(index.stats().device_slot_evictions == 1, "the zombie slot eviction must be counted");
+
+    // Publication proceeds and the frontier keeps advancing: each new endpoint evicts the oldest
+    // unbacked snapshot, never the newest.
+    const auto publish = [&](NodeRef anchor, std::uint32_t frontier) {
+        const auto s = index.acquire_device_slot();
+        require(s.has_value(), "no slot for the next endpoint");
+        const PublishResult result = index.publish_snapshot(anchor, frontier, {}, std::nullopt, *s,
+                                                            SnapshotKind::Endpoint);
+        require(result.created, "endpoint not created");
+        return result.snapshot;
+    };
+    const SnapshotRef end1 = publish(path4[4], 320);
+    require(!index.valid(tap.snapshot), "the second zombie must be evicted next");
+    const SnapshotRef end2 = publish(path4[6], 448);
+    require(!index.valid(end1), "the oldest endpoint must be evicted next");
+    const SnapshotRef end3 = publish(path4[7], 512);
+    index.check_invariants();
+
+    // Admission picks the surviving (newest) endpoint.
+    std::vector<TokenId> prompt = prefix;
+    const auto extra = make_tokens(10, 22);
+    prompt.insert(prompt.end(), extra.begin(), extra.end());
+    const auto prompt_hashes = block_lookup_hashes(prompt, {});
+    const MatchResult match =
+        index.match(prompt, prompt_hashes, {}, static_cast<std::uint32_t>(prompt.size()));
+    require(match.path.size() == 8 && match.candidates.size() == 1 &&
+                match.candidates[0].snapshot == end3,
+            "only the newest endpoint must survive and match");
+    require(match.candidates[0].restore_bytes == 0 && match.candidates[0].image_on_device,
+            "the device-resident endpoint must need no restore");
+    const AdmissionChoice choice =
+        index.choose(match, static_cast<std::uint32_t>(prompt.size()));
+    require(choice.candidate == 0U && match.candidates[*choice.candidate].frontier == 512,
+            "the newest endpoint must be chosen");
     index.check_invariants();
 }
 
@@ -586,7 +711,7 @@ void test_image_only_host_tier() {
 
     // Endpoint with a tail; its host copy holds the image only.
     const auto tail_tokens      = make_tokens(10, 16);
-    const auto slot             = index.acquire_device_slot(false);
+    const auto slot             = index.acquire_device_slot();
     const std::uint32_t tail_id = backend.allocate();
     const PublishResult endpoint =
         index.publish_snapshot(path_a[0], 74, tail_tokens, tail_id, *slot, SnapshotKind::Endpoint);
@@ -667,7 +792,7 @@ void test_random_stress() {
                         index.unpin_node(result.node);
                     }
                     if (rng() % 3U == 0) {
-                        if (const auto slot = index.acquire_device_slot(rng() % 2U)) {
+                        if (const auto slot = index.acquire_device_slot()) {
                             const PublishResult published = index.publish_snapshot(
                                 result.node, (index.node(result.node).depth + 1U) * kBlockTokens,
                                 {}, std::nullopt, *slot, SnapshotKind::Tap);
@@ -815,6 +940,7 @@ int main() {
         test_backed_before_unbacked();
         test_host_dead_and_gdsf();
         test_device_slots();
+        test_device_slot_starvation();
         test_host_only_reattach();
         test_tail_device_fill();
         test_persistence_roundtrip();

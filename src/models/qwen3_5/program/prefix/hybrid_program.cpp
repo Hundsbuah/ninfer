@@ -1184,9 +1184,10 @@ void ProgramImpl::hybrid_capture_tap(SequenceState& sequence, std::uint32_t fron
         ++counters.taps_skipped;
         return;
     }
-    const std::optional<std::uint32_t> slot = index.acquire_device_slot(!hybrid_->host_tier());
+    const std::optional<std::uint32_t> slot = index.acquire_device_slot();
     if (!slot) {
         ++counters.taps_skipped;
+        ++counters.taps_skipped_no_slot;
         return;
     }
     const std::optional<StateImageHandle> image = state_store->reserve_destination();
@@ -1296,8 +1297,7 @@ bool ProgramImpl::hybrid_finish_lane(SequenceState& sequence, RequestControl& re
                 !sequence.state.fork_pending && sequence.state.read == sequence.state.write &&
                 state_store->role(sequence.state.write) == StateImageRole::ActiveMutable) {
                 pc::PrefixCacheIndex& index = hybrid_->index();
-                const std::optional<std::uint32_t> slot =
-                    index.acquire_device_slot(!hybrid_->host_tier());
+                const std::optional<std::uint32_t> slot = index.acquire_device_slot();
                 if (slot) {
                     const std::uint32_t tail = frontier % kBlock;
                     std::optional<std::uint32_t> tail_id;
@@ -1339,6 +1339,8 @@ bool ProgramImpl::hybrid_finish_lane(SequenceState& sequence, RequestControl& re
                     } else {
                         state_store->thaw(image);
                     }
+                } else {
+                    ++hybrid_->counters().endpoints_skipped_no_slot;
                 }
             }
         }
@@ -1390,34 +1392,38 @@ HybridPrefixCacheStats ProgramImpl::hybrid_stats() const noexcept {
     const pc::PrefixIndexStats index    = hybrid_->index().stats();
     const HybridCacheCounters& counters = hybrid_->counters();
     const pc::PrefixIndexConfig& config = hybrid_->index().config();
-    out.nodes                           = index.nodes;
-    out.snapshots                       = index.snapshots;
-    out.device_resident_blocks          = index.device_resident_blocks;
-    out.device_evictable_blocks         = index.device_evictable_blocks;
-    out.host_slabs                      = config.host_slabs;
-    out.host_free_slabs                 = index.host_free_slabs;
-    out.host_slab_bytes                 = hybrid_->host_layout().slab_bytes;
-    out.free_device_snapshot_slots      = index.free_device_slots;
-    out.admissions                      = counters.admissions;
-    out.snapshot_hits                   = counters.snapshot_hits;
-    out.reused_tokens                   = counters.reused_tokens;
-    out.blocks_inserted                 = counters.blocks_inserted;
-    out.blocks_reattached               = counters.blocks_reattached;
-    out.blocks_duplicate                = counters.blocks_duplicate;
-    out.taps_created                    = counters.taps_created;
-    out.taps_skipped                    = counters.taps_skipped;
-    out.endpoints_created               = counters.endpoints_created;
-    out.host_image_writes               = counters.host_image_writes;
-    out.host_block_writes               = counters.host_block_writes;
-    out.host_image_restores             = counters.host_image_restores;
-    out.host_block_restores             = counters.host_block_restores;
-    out.host_tail_restores              = counters.host_tail_restores;
-    out.host_write_bytes                = counters.host_write_bytes;
-    out.host_restore_bytes              = counters.host_restore_bytes;
-    out.evicted_blocks                  = counters.evicted_blocks;
-    out.host_snapshot_evictions         = index.host_snapshot_evictions;
-    out.host_dead_reclaims              = index.host_dead_reclaims;
-    out.unbacked_node_losses            = index.unbacked_node_losses;
+    out.nodes                       = index.nodes;
+    out.snapshots                   = index.snapshots;
+    out.device_resident_blocks      = index.device_resident_blocks;
+    out.device_evictable_blocks     = index.device_evictable_blocks;
+    out.host_slabs                  = config.host_slabs;
+    out.host_free_slabs             = index.host_free_slabs;
+    out.host_slab_bytes             = hybrid_->host_layout().slab_bytes;
+    out.free_device_snapshot_slots  = index.free_device_slots;
+    out.admissions                  = counters.admissions;
+    out.snapshot_hits               = counters.snapshot_hits;
+    out.reused_tokens               = counters.reused_tokens;
+    out.blocks_inserted             = counters.blocks_inserted;
+    out.blocks_reattached           = counters.blocks_reattached;
+    out.blocks_duplicate            = counters.blocks_duplicate;
+    out.taps_created                = counters.taps_created;
+    out.taps_skipped                = counters.taps_skipped;
+    out.taps_skipped_no_slot        = counters.taps_skipped_no_slot;
+    out.endpoints_created           = counters.endpoints_created;
+    out.endpoints_skipped_no_slot   = counters.endpoints_skipped_no_slot;
+    out.snapshot_host_writes_failed = counters.snapshot_host_writes_failed;
+    out.host_image_writes           = counters.host_image_writes;
+    out.host_block_writes           = counters.host_block_writes;
+    out.host_image_restores         = counters.host_image_restores;
+    out.host_block_restores         = counters.host_block_restores;
+    out.host_tail_restores          = counters.host_tail_restores;
+    out.host_write_bytes            = counters.host_write_bytes;
+    out.host_restore_bytes          = counters.host_restore_bytes;
+    out.evicted_blocks              = counters.evicted_blocks;
+    out.host_snapshot_evictions     = index.host_snapshot_evictions;
+    out.host_dead_reclaims          = index.host_dead_reclaims;
+    out.unbacked_node_losses        = index.unbacked_node_losses;
+    out.device_slot_evictions       = index.device_slot_evictions;
     return out;
 }
 

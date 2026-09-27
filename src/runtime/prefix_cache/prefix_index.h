@@ -260,10 +260,10 @@ public:
 
     // ---- snapshots (§5.3, §7.4, §7.7, §9.2)
     // ------------------------------------------------------- Returns a free device snapshot slot
-    // for a tap/endpoint destination (staging), evicting the least recently hit host-backed slot.
-    // With `allow_unbacked`, an unpinned slot whose snapshot has no host copy may be evicted when
-    // no backed slot exists (that snapshot is lost).
-    [[nodiscard]] std::optional<std::uint32_t> acquire_device_slot(bool allow_unbacked);
+    // for a tap/endpoint destination (staging). Without a free slot, the least recently hit
+    // host-backed slot yields its device image and its owner keeps the host copy; only when no
+    // backed slot exists is the least recently hit unbacked slot evicted, losing its snapshot.
+    [[nodiscard]] std::optional<std::uint32_t> acquire_device_slot();
     void release_device_slot(std::uint32_t slot);
     // Publishes a snapshot whose image is in staging slot `device_slot`. frontier must equal
     // 64 * (anchor depth + 1) + tail.size() (tail.size() for the root anchor). A tail requires

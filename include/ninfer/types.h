@@ -1146,30 +1146,34 @@ struct RuntimeStats {
 
     // Hybrid prefix cache (ContextCacheMode::Hybrid); zero in Legacy mode. Block and snapshot
     // gauges are absolute; the rest are cumulative event counters.
-    std::uint32_t hybrid_cached_blocks           = 0; // Device-resident tree blocks
-    std::uint32_t hybrid_evictable_blocks        = 0;
-    std::uint32_t hybrid_tree_blocks             = 0; // Device or Host
-    std::uint32_t hybrid_snapshots               = 0;
-    std::uint64_t hybrid_host_capacity_bytes     = 0;
-    std::uint64_t hybrid_host_used_bytes         = 0;
-    std::uint64_t hybrid_snapshot_hits           = 0;
-    std::uint64_t hybrid_reused_tokens           = 0;
-    std::uint64_t hybrid_blocks_inserted         = 0;
-    std::uint64_t hybrid_blocks_reattached       = 0;
-    std::uint64_t hybrid_blocks_duplicate        = 0;
-    std::uint64_t hybrid_taps_created            = 0;
-    std::uint64_t hybrid_taps_skipped            = 0;
-    std::uint64_t hybrid_endpoints_created       = 0;
-    std::uint64_t hybrid_host_image_writes       = 0;
-    std::uint64_t hybrid_host_block_writes       = 0;
-    std::uint64_t hybrid_host_image_restores     = 0;
-    std::uint64_t hybrid_host_block_restores     = 0;
-    std::uint64_t hybrid_host_write_bytes        = 0;
-    std::uint64_t hybrid_host_restore_bytes      = 0;
-    std::uint64_t hybrid_evicted_blocks          = 0;
-    std::uint64_t hybrid_host_snapshot_evictions = 0;
-    std::uint64_t hybrid_host_dead_reclaims      = 0;
-    std::uint64_t hybrid_unbacked_node_losses    = 0;
+    std::uint32_t hybrid_cached_blocks               = 0; // Device-resident tree blocks
+    std::uint32_t hybrid_evictable_blocks            = 0;
+    std::uint32_t hybrid_tree_blocks                 = 0; // Device or Host
+    std::uint32_t hybrid_snapshots                   = 0;
+    std::uint64_t hybrid_host_capacity_bytes         = 0;
+    std::uint64_t hybrid_host_used_bytes             = 0;
+    std::uint64_t hybrid_snapshot_hits               = 0;
+    std::uint64_t hybrid_reused_tokens               = 0;
+    std::uint64_t hybrid_blocks_inserted             = 0;
+    std::uint64_t hybrid_blocks_reattached           = 0;
+    std::uint64_t hybrid_blocks_duplicate            = 0;
+    std::uint64_t hybrid_taps_created                = 0;
+    std::uint64_t hybrid_taps_skipped                = 0;
+    std::uint64_t hybrid_taps_skipped_no_slot        = 0;
+    std::uint64_t hybrid_endpoints_created           = 0;
+    std::uint64_t hybrid_endpoints_skipped_no_slot   = 0;
+    std::uint64_t hybrid_snapshot_host_writes_failed = 0;
+    std::uint64_t hybrid_host_image_writes           = 0;
+    std::uint64_t hybrid_host_block_writes           = 0;
+    std::uint64_t hybrid_host_image_restores         = 0;
+    std::uint64_t hybrid_host_block_restores         = 0;
+    std::uint64_t hybrid_host_write_bytes            = 0;
+    std::uint64_t hybrid_host_restore_bytes          = 0;
+    std::uint64_t hybrid_evicted_blocks              = 0;
+    std::uint64_t hybrid_host_snapshot_evictions     = 0;
+    std::uint64_t hybrid_host_dead_reclaims          = 0;
+    std::uint64_t hybrid_unbacked_node_losses        = 0;
+    std::uint64_t hybrid_device_slot_evictions       = 0;
 };
 
 enum class ContextCostPresetSource : std::uint8_t {

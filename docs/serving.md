@@ -973,7 +973,7 @@ in append mode and flushes every event, so successive model or MTP blocks may sh
 file. The parent directory must already exist. Failure to open the file aborts startup; the log path
 is also rejected if it resolves to the model artifact.
 
-Every line is one `ninfer_serve_request_log` schema-v25 JSON object. All events carry
+Every line is one `ninfer_serve_request_log` schema-v26 JSON object. All events carry
 `timestamp_unix_ms` and a process-unique `server_instance_id`; request IDs are monotonic only within
 that server instance. Successful request-start records include request-scoped acquisition,
 media-preprocessing wall/work, tokenizer, cache hit/miss/single-flight, and payload-size fields;
@@ -1093,13 +1093,17 @@ are interval deltas. `snapshot_hits` counts admissions that resumed from a snaps
 `reused_tokens` the prompt tokens they reused. `blocks_inserted` counts new tree blocks,
 `blocks_reattached` blocks whose existing tree entry took a request's Device pages, and
 `blocks_duplicate` committed blocks the tree already held on the Device, whose pages were released.
-`taps_created` and `taps_skipped` count planned prefill snapshots published and dropped, and
-`endpoints_created` end-of-answer snapshots. `host_image_writes`, `host_block_writes`,
-`host_image_restores`, `host_block_restores`, `host_write_bytes`, and `host_restore_bytes` count
-Host-tier write-through and restores. `evicted_blocks` counts Device block evictions,
-`host_snapshot_evictions` snapshots evicted from the Host tier, `host_dead_reclaims` Host slabs
-reclaimed from KV that no snapshot can reach, and `unbacked_node_losses` Device evictions of blocks
-with no Host copy, which remove them and the blocks after them from the cache.
+`taps_created` and `taps_skipped` count planned prefill snapshots published and dropped;
+`taps_skipped_no_slot` and `endpoints_skipped_no_slot` count publications dropped because no Device
+snapshot slot was free. `endpoints_created` counts end-of-answer snapshots. `host_image_writes`,
+`host_block_writes`, `host_image_restores`, `host_block_restores`, `host_write_bytes`, and
+`host_restore_bytes` count Host-tier write-through and restores. `snapshot_host_writes_failed`
+counts snapshot Host copies that could not start because no Host slabs were available.
+`evicted_blocks` counts Device block evictions, `host_snapshot_evictions` snapshots evicted from the
+Host tier, `host_dead_reclaims` Host slabs reclaimed from KV that no snapshot can reach,
+`unbacked_node_losses` Device evictions of blocks with no Host copy, which remove them and the
+blocks after them from the cache, and `device_slot_evictions` Device snapshot slots reclaimed from
+their owners under the index eviction policy.
 
 The JSONL `throughput.host_work` object is the aggregation authority: the Engine worker counts each
 wall-time segment once, independent of batch size. `elapsed_seconds` contains the same five

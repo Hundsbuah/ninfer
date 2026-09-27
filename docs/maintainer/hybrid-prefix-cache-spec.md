@@ -38,7 +38,7 @@ every other value is derived from the rest of the configuration (§14.2).
 
 | area | state |
 |---|---|
-| §5 index, §9 eviction (device LRU, host GDSF, dead KV), §7.1 tap planner | done; host-only unit tests (`ninfer_prefix_cache_index_test`) |
+| §5 index, §9 eviction (device LRU, host GDSF, dead KV), §7.1 tap planner | done; host-only unit tests (`ninfer_prefix_cache_index_test`). §9.2 slot eviction is unconditional — the least-recently-hit unbacked slot is sacrificed as a last resort, so tap/endpoint publication cannot starve under host-cache pressure (`test_device_slot_starvation` regression) |
 | §5.4 automatic Device sizing | done: in Hybrid mode the Main pool is not clamped to `C·L`, and `ninfer-serve` defaults `--kv-capacity` to `auto`, so free VRAM becomes Device block cache |
 | §5.4 unified Host slab pool | done: KV blocks, snapshot images (split over slabs) and snapshot tails share one pinned pool; GDSF and the dead-KV sweep decide the split at run time |
 | §6 admission as the Engine's materialization transaction | done: staging reserves every Device page and the state slot, Host restores run on a dedicated restore stream, and activation forks the lane at once; its Device work queues behind the copies it reads, layer by layer (§6.4, §6.5, §12.1) |
@@ -1028,6 +1028,12 @@ These feed §6.2 and §9.3. The existing prefill coefficients stay as they are.
   - hits move the whole path to MRU;
   - backed entries are consumed before unbacked;
   - pinned entries are never returned.
+- **Device snapshot slots (§9.2)**
+  - host-backed slots are reclaimed before unbacked ones;
+  - an unbacked slot is the last resort; its snapshot loses the image and is deleted;
+  - with a full host tier and every slot unbacked, a new tap or endpoint still receives a slot:
+    the least-recently-hit unbacked slot is sacrificed (regression against publication
+    starvation under host-cache pressure).
 - **Host GDSF**
   - hand-computed cases: two siblings, nested ancestor/descendant, frequency;
   - dead KV is reclaimed before any snapshot;
@@ -1196,7 +1202,7 @@ Host pools (`host_state_slots`, `host_kv_capacity_bytes`) are zero in Hybrid mod
 | risk | mitigation |
 |---|---|
 | Exact taps cost one prefill split each | Only semantic boundaries are exact (explicit, generation opener, structural); the prompt tail and ladder are flexible and cost no split. The proximity rule leaves one split per chat request. The zero-split GDN tap (§7.2–§7.3) removes the rest if measurement shows it matters. |
-| Snapshots crowd KV out of host memory | GDSF weighs bytes against recompute seconds on the same scale for both. Dead-KV sweep runs first. |
+| Snapshots crowd KV out of host memory | GDSF weighs bytes against recompute seconds on the same scale for both. Dead-KV sweep runs first. Device snapshot slots stay reclaimable under host pressure (§9.2): a host-backed slot gives up only its host copy, and an unbacked slot is sacrificed as a last resort, so tap/endpoint publication cannot starve. |
 | Write-through competes with decode | Low-priority stream on copy engines (path B) or ≤ 4 CTAs (path A). Measured in §13.4. Write-through can be throttled when decode is active without changing correctness. |
 | Unbacked device eviction deletes subtrees | Only happens with no or full host cache. Backed entries are always preferred. |
 | Large pinned allocations on Windows | Chunked allocation; the startup ledger reports the resolved size. |

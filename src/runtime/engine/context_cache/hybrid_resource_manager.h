@@ -328,25 +328,29 @@ public:
         out.hybrid_host_capacity_bytes       = hybrid.host_slab_bytes * hybrid.host_slabs;
         out.hybrid_host_used_bytes =
             hybrid.host_slab_bytes * (hybrid.host_slabs - hybrid.host_free_slabs);
-        out.host_kv_occupied_bytes         = out.hybrid_host_used_bytes;
-        out.hybrid_snapshot_hits           = hybrid.snapshot_hits;
-        out.hybrid_reused_tokens           = hybrid.reused_tokens;
-        out.hybrid_blocks_inserted         = hybrid.blocks_inserted;
-        out.hybrid_blocks_reattached       = hybrid.blocks_reattached;
-        out.hybrid_blocks_duplicate        = hybrid.blocks_duplicate;
-        out.hybrid_taps_created            = hybrid.taps_created;
-        out.hybrid_taps_skipped            = hybrid.taps_skipped;
-        out.hybrid_endpoints_created       = hybrid.endpoints_created;
-        out.hybrid_host_image_writes       = hybrid.host_image_writes;
-        out.hybrid_host_block_writes       = hybrid.host_block_writes;
-        out.hybrid_host_image_restores     = hybrid.host_image_restores;
-        out.hybrid_host_block_restores     = hybrid.host_block_restores;
-        out.hybrid_host_write_bytes        = hybrid.host_write_bytes;
-        out.hybrid_host_restore_bytes      = hybrid.host_restore_bytes;
-        out.hybrid_evicted_blocks          = hybrid.evicted_blocks;
-        out.hybrid_host_snapshot_evictions = hybrid.host_snapshot_evictions;
-        out.hybrid_host_dead_reclaims      = hybrid.host_dead_reclaims;
-        out.hybrid_unbacked_node_losses    = hybrid.unbacked_node_losses;
+        out.host_kv_occupied_bytes             = out.hybrid_host_used_bytes;
+        out.hybrid_snapshot_hits               = hybrid.snapshot_hits;
+        out.hybrid_reused_tokens               = hybrid.reused_tokens;
+        out.hybrid_blocks_inserted             = hybrid.blocks_inserted;
+        out.hybrid_blocks_reattached           = hybrid.blocks_reattached;
+        out.hybrid_blocks_duplicate            = hybrid.blocks_duplicate;
+        out.hybrid_taps_created                = hybrid.taps_created;
+        out.hybrid_taps_skipped                = hybrid.taps_skipped;
+        out.hybrid_taps_skipped_no_slot        = hybrid.taps_skipped_no_slot;
+        out.hybrid_endpoints_created           = hybrid.endpoints_created;
+        out.hybrid_endpoints_skipped_no_slot   = hybrid.endpoints_skipped_no_slot;
+        out.hybrid_snapshot_host_writes_failed = hybrid.snapshot_host_writes_failed;
+        out.hybrid_host_image_writes           = hybrid.host_image_writes;
+        out.hybrid_host_block_writes           = hybrid.host_block_writes;
+        out.hybrid_host_image_restores         = hybrid.host_image_restores;
+        out.hybrid_host_block_restores         = hybrid.host_block_restores;
+        out.hybrid_host_write_bytes            = hybrid.host_write_bytes;
+        out.hybrid_host_restore_bytes          = hybrid.host_restore_bytes;
+        out.hybrid_evicted_blocks              = hybrid.evicted_blocks;
+        out.hybrid_host_snapshot_evictions     = hybrid.host_snapshot_evictions;
+        out.hybrid_host_dead_reclaims          = hybrid.host_dead_reclaims;
+        out.hybrid_unbacked_node_losses        = hybrid.unbacked_node_losses;
+        out.hybrid_device_slot_evictions       = hybrid.device_slot_evictions;
     }
 
     [[nodiscard]] LogicalLaneState lane_state(LaneId lane) const noexcept {

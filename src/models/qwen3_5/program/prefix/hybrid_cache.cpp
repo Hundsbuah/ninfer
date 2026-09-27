@@ -347,6 +347,7 @@ bool HybridPrefixCache::start_snapshot_host_write(SnapshotRef snapshot, cudaStre
     index_->pin_snapshot(snapshot);
     if (!index_->begin_snapshot_host_fill(snapshot)) {
         index_->unpin_snapshot(snapshot);
+        ++counters_.snapshot_host_writes_failed;
         return false;
     }
     try {

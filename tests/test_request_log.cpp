@@ -598,37 +598,43 @@ int main() {
                       "client disconnect is not an informational cancellation");
 
     ThroughputReport throughput;
-    throughput.interval_seconds                         = 2.0;
-    throughput.computed_prefill_tokens                  = 100;
-    throughput.committed_decode_tokens                  = 40;
-    throughput.decode_rounds                            = 10;
-    throughput.decode_row_rounds                        = 18;
-    throughput.previous.root_selections                 = 2;
-    throughput.previous.state_h2d_bytes                 = 100;
-    throughput.current.running_requests                 = 2;
-    throughput.current.prefilling_requests              = 1;
-    throughput.current.decode_ready_requests            = 1;
-    throughput.current.waiting_requests                 = 3;
-    throughput.current.materializing_requests           = 1;
-    throughput.current.capture_pending_requests         = 1;
-    throughput.current.terminal_pending_requests        = 1;
-    throughput.current.root_selections                  = 3;
-    throughput.current.state_h2d_count                  = 1;
-    throughput.current.state_h2d_bytes                  = 132;
-    throughput.current.state_h2d_seconds                = 0.25;
-    throughput.current.device_state_occupied_slots      = 3;
-    throughput.current.host_state_occupied_slots        = 1;
-    throughput.current.device_main_kv_occupied_pages    = 9;
-    throughput.current.device_main_kv_lease_pages       = 4;
-    throughput.current.device_backend_kv_occupied_pages = 5;
-    throughput.current.device_backend_kv_lease_pages    = 2;
-    throughput.current.active_captures_skipped          = 1;
-    throughput.current.last_selected_frontier_tokens    = 64;
-    throughput.current.pressure_spill_pages             = 4;
-    throughput.current.pressure_private_owners_degraded = 1;
-    throughput.current.pressure_checkpoints_dropped     = 1;
-    throughput.current.pressure_searches                = 1;
-    throughput.current.host_work                        = {
+    throughput.interval_seconds                           = 2.0;
+    throughput.computed_prefill_tokens                    = 100;
+    throughput.committed_decode_tokens                    = 40;
+    throughput.decode_rounds                              = 10;
+    throughput.decode_row_rounds                          = 18;
+    throughput.previous.root_selections                   = 2;
+    throughput.previous.state_h2d_bytes                   = 100;
+    throughput.current.running_requests                   = 2;
+    throughput.current.prefilling_requests                = 1;
+    throughput.current.decode_ready_requests              = 1;
+    throughput.current.waiting_requests                   = 3;
+    throughput.current.materializing_requests             = 1;
+    throughput.current.capture_pending_requests           = 1;
+    throughput.current.terminal_pending_requests          = 1;
+    throughput.current.root_selections                    = 3;
+    throughput.current.state_h2d_count                    = 1;
+    throughput.current.state_h2d_bytes                    = 132;
+    throughput.current.state_h2d_seconds                  = 0.25;
+    throughput.current.device_state_occupied_slots        = 3;
+    throughput.current.host_state_occupied_slots          = 1;
+    throughput.current.device_main_kv_occupied_pages      = 9;
+    throughput.current.device_main_kv_lease_pages         = 4;
+    throughput.current.device_backend_kv_occupied_pages   = 5;
+    throughput.current.device_backend_kv_lease_pages      = 2;
+    throughput.current.active_captures_skipped            = 1;
+    throughput.current.last_selected_frontier_tokens      = 64;
+    throughput.current.pressure_spill_pages               = 4;
+    throughput.current.pressure_private_owners_degraded   = 1;
+    throughput.current.pressure_checkpoints_dropped       = 1;
+    throughput.current.pressure_searches                  = 1;
+    throughput.current.hybrid_snapshots                   = 2;
+    throughput.current.hybrid_blocks_inserted             = 7;
+    throughput.current.hybrid_taps_skipped_no_slot        = 1;
+    throughput.current.hybrid_endpoints_skipped_no_slot   = 3;
+    throughput.current.hybrid_snapshot_host_writes_failed = 4;
+    throughput.current.hybrid_device_slot_evictions       = 5;
+    throughput.current.host_work                            = {
                                .engine_boundary_ns            = 1000000,
                                .program_submit_ns             = 2000000,
                                .program_post_ns               = 3000000,
@@ -739,6 +745,18 @@ int main() {
               "Device KV growth lease is not reported separately from occupied pages");
     failures += check(throughput_json.at("context_cache").at("captures").at("skipped") == 1,
                       "feasibility-skipped captures must be counted and published");
+    failures +=
+        check(throughput_json.at("context_cache").at("hybrid").at("snapshots") == 2 &&
+                  throughput_json.at("context_cache").at("hybrid").at("blocks_inserted") == 7 &&
+                  throughput_json.at("context_cache").at("hybrid")
+                          .at("taps_skipped_no_slot") == 1 &&
+                  throughput_json.at("context_cache").at("hybrid")
+                          .at("endpoints_skipped_no_slot") == 3 &&
+                  throughput_json.at("context_cache").at("hybrid")
+                          .at("snapshot_host_writes_failed") == 4 &&
+                  throughput_json.at("context_cache").at("hybrid")
+                          .at("device_slot_evictions") == 5,
+              "hybrid prefix-cache slot-starvation counters are not published");
 
     const std::filesystem::path log_path =
         std::filesystem::temp_directory_path() /

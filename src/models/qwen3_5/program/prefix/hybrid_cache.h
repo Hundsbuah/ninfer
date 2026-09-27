@@ -41,23 +41,26 @@ struct HybridBlockPages {
 };
 
 struct HybridCacheCounters {
-    std::uint64_t admissions          = 0;
-    std::uint64_t snapshot_hits       = 0;
-    std::uint64_t reused_tokens       = 0;
-    std::uint64_t blocks_inserted     = 0;
-    std::uint64_t blocks_reattached   = 0;
-    std::uint64_t blocks_duplicate    = 0;
-    std::uint64_t taps_created        = 0;
-    std::uint64_t taps_skipped        = 0;
-    std::uint64_t endpoints_created   = 0;
-    std::uint64_t host_image_writes   = 0;
-    std::uint64_t host_block_writes   = 0;
-    std::uint64_t host_image_restores = 0;
-    std::uint64_t host_block_restores = 0;
-    std::uint64_t host_tail_restores  = 0;
-    std::uint64_t host_write_bytes    = 0;
-    std::uint64_t host_restore_bytes  = 0;
-    std::uint64_t evicted_blocks      = 0;
+    std::uint64_t admissions                    = 0;
+    std::uint64_t snapshot_hits                 = 0;
+    std::uint64_t reused_tokens                 = 0;
+    std::uint64_t blocks_inserted               = 0;
+    std::uint64_t blocks_reattached             = 0;
+    std::uint64_t blocks_duplicate              = 0;
+    std::uint64_t taps_created                  = 0;
+    std::uint64_t taps_skipped                  = 0;
+    std::uint64_t taps_skipped_no_slot          = 0;
+    std::uint64_t endpoints_created             = 0;
+    std::uint64_t endpoints_skipped_no_slot     = 0;
+    std::uint64_t host_image_writes             = 0;
+    std::uint64_t snapshot_host_writes_failed   = 0;
+    std::uint64_t host_block_writes             = 0;
+    std::uint64_t host_image_restores           = 0;
+    std::uint64_t host_block_restores           = 0;
+    std::uint64_t host_tail_restores            = 0;
+    std::uint64_t host_write_bytes              = 0;
+    std::uint64_t host_restore_bytes            = 0;
+    std::uint64_t evicted_blocks                = 0;
 };
 
 // One layer of the model's forward pass, in execution order, as a restore sees it: whether it
