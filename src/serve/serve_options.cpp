@@ -228,6 +228,9 @@ std::string serve_usage_text(const char* argv0) {
            "                             suffix output, keep a final call cut by the output\n"
            "                             budget and an undeclared name (strict all-or-nothing\n"
            "                             by default)\n"
+           "  --constrained-tool-decoding M grammar-constrained tool decoding (off|tool-calls-only;\n"
+           "                             default off; reserved, sampling unchanged until\n"
+           "                             the integration lands)\n"
            "\n"
            "NETWORKING & RESOURCES\n"
            "  --host H                   listen address (default 127.0.0.1)\n"
@@ -580,6 +583,16 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.preserve_thinking = true;
         } else if (arg == "--tolerant-tool-calls") {
             options.tolerant_tool_calls = true;
+        } else if (arg == "--constrained-tool-decoding") {
+            const std::string mode = require_value("--constrained-tool-decoding");
+            if (mode == "off") {
+                options.constrained_tool_decoding = ConstrainedToolDecoding::Off;
+            } else if (mode == "tool-calls-only") {
+                options.constrained_tool_decoding = ConstrainedToolDecoding::ToolCallsOnly;
+            } else {
+                throw std::invalid_argument(
+                    "--constrained-tool-decoding must be off or tool-calls-only");
+            }
         } else if (arg == "--cors") {
             options.enable_cors = true;
         } else if (arg == "--usage-chunk-choice") {

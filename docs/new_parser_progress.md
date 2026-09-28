@@ -321,6 +321,60 @@ Result: 160/161 passed on the first run; the single failure (`ninfer_chat_templa
   (the 14 `_real` GPU tests are Skipped by design: no GPU runtime tests per the plan constraints).
 Environment note: `jinja2` is now a required module of the PATH Python for the CPU suite.
 
+## Phase 5
+### P5.1 Documentation update (serving.md, cli.md, tool_call_parser.md)
+Status: complete
+Files changed: `docs/serving.md`, `docs/cli.md`, `docs/tool_call_parser.md` (new), `docs/new_parser_progress.md`
+Implementation decision: `docs/serving.md` updated in three places — (1) the "NInfer does not apply defaults, ..."
+sentence now states that grammar-constrained decoding of the tool wire syntax exists behind
+`--constrained-tool-decoding` (default `off`, sampling path unchanged); (2) the tool-call section now
+attributes marker recognition, accepted header forms (short, attribute, bare openers with quote-aware
+names) and the value/closer rules to the single wire grammar shared by one-shot and streaming parsing,
+linking the new product doc; (3) flag table row for `--constrained-tool-decoding` (server flag).
+`docs/tool_call_parser.md` is the new product doc (wire format with the grammar as sole authority,
+parser architecture, strict vs tolerant recovery, fundamental delimiter ambiguity, constrained
+decoding feature and limits, diagnostic fields incl. `truncated_tail`). `docs/cli.md` gets the CLI
+flag row. No behavior change; docs describe the implemented contract only (verified against source
+and tests before writing).
+Alternatives rejected: documenting the constrained feature as active (it is reserved: CPU state core +
+flag only, sampling integration is the documented next step with acceptance gate in
+`docs/new_parser_phase4_design.md`); keeping the old "or use constrained decoding" sentence (wrong
+after the feature flag exists).
+Tests added: none (docs only)
+Tests executed: `git diff --check` clean; link targets verified (tool_call_parser.md exists, anchor
+sections exist in both docs)
+Result: product docs describe the delivered contract; the flag is documented on both generation
+surfaces (CLI + server) with its reserved state stated accurately
+Known limitations: the flag is reserved (no sampling change in this scope); sampling integration is
+out of delivery scope per the Phase-4 gate and is recorded as the next step with its acceptance gate
+Commit: (this commit)
+
+### P5.2 Feature flag on the server binary (product coherence)
+Status: complete
+Files changed: `src/serve/serve_options.h`, `src/serve/serve_options.cpp`, `src/serve/generation_service.cpp`,
+`tests/test_serve_options.cpp`, `tests/test_cli_options.cpp`
+Implementation decision: the reserved flag now exists on both public generation surfaces, mirroring the
+existing tool-call flag convention (`--tolerant-tool-calls` is a server flag): `ServeOptions` member
+`constrained_tool_decoding` (default `Off`), `--constrained-tool-decoding off|tool-calls-only` parsing
+with invalid/missing-value rejection (same error contract as the CLI flag), help text, and the
+`ServeOptions -> EngineOptions` mapping in `GenerationService`. The CLI flag (delivered with P4) and
+the `EngineOptions` member are unchanged. Default `Off` leaves sampling unchanged on both surfaces.
+Regression tests: default off, both valid modes mapped, unknown mode rejected, missing value rejected,
+help text contains the flag — in `test_serve_options.cpp` (new cases) and `test_cli_options.cpp` (new
+cases for the CLI flag, which previously had none).
+Tests executed: `ninfer_cli_options_test`, `ninfer_serve_options_test` (both green), full build green
+(16 threads). Note: this work required recovering two files that a partial edit pass had damaged
+(`src/serve/serve_options.h` and `src/serve/generation_service.cpp` lost adjacent original lines;
+`tests/test_serve_options.cpp` lost test blocks). Recovery: `git checkout origin/master --` on the three
+files, then the flag changes re-applied as single clean insertions; final diffs are purely additive
+(41 insertions, 0 deletions across the four serve files; verified by `git diff origin/master`). The
+duplicate/lost-line damage was detected via `git diff origin/master` before rebuilding; the build then
+failed on the missing `default_thinking_budget` member, which confirmed the header damage independently.
+Known limitations: the flag is a reservation (no sampling change until the Phase-4 sampling integration
+lands, out of delivery scope); no server/CLI binary smoke run because this build configures
+`NINFER_BUILD_APPS=OFF` (flag parsing is covered by the options tests instead)
+Commit: (this commit)
+
 ## Open Questions
 - (none yet)
 

@@ -30,6 +30,30 @@ int main() {
     int failures       = 0;
     failures += check(parse({"ninfer-serve", "model.ninfer"}).rope_yarn_factor == 1.0F,
                       "serving YaRN must default off");
+    failures += check(parse({"ninfer-serve", "model.ninfer"}).constrained_tool_decoding ==
+                          ninfer::ConstrainedToolDecoding::Off,
+                      "serving constrained tool decoding must default off");
+    for (const auto* mode : {"off", "tool-calls-only"}) {
+        const auto constrained =
+            parse({"ninfer-serve", "model.ninfer", "--constrained-tool-decoding", mode});
+        failures += check(constrained.constrained_tool_decoding ==
+                             (std::string(mode) == "off" ? ninfer::ConstrainedToolDecoding::Off
+                                                          : ninfer::ConstrainedToolDecoding::ToolCallsOnly),
+                          "serving failed to map a constrained tool decoding mode");
+    }
+    bool constrained_rejected = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--constrained-tool-decoding", "bogus"});
+    } catch (const std::invalid_argument&) { constrained_rejected = true; }
+    failures += check(constrained_rejected, "serving accepted an unknown constrained decoding mode");
+    bool constrained_missing_rejected = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--constrained-tool-decoding"});
+    } catch (const std::invalid_argument&) { constrained_missing_rejected = true; }
+    failures += check(constrained_missing_rejected, "serving accepted a missing constrained mode");
+    failures += check(
+        serve_usage_text("ninfer-serve").find("--constrained-tool-decoding") != std::string::npos,
+        "serving help omits constrained tool decoding");
     for (const auto* factor : {"1", "2.5", "4"}) {
         const auto yarn = parse({"ninfer-serve", "model.ninfer", "--rope-yarn-factor", factor});
         failures += check(yarn.rope_yarn_factor == std::stof(factor) && yarn.max_context == 8192 &&

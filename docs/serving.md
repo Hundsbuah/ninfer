@@ -256,10 +256,15 @@ case-insensitive boolean text is normalized to `true` or `false`. A nonempty sch
 a structured call: valid JSON retains its represented type and other text becomes a JSON string so
 the tool consumer can report the validation error and continue the agent loop. Schemas without a
 supported explicit type retain untyped inference. NInfer does not apply defaults, enforce required
-properties, perform recursive JSON Schema validation, or use constrained decoding.
+properties, or perform recursive JSON Schema validation. Grammar-constrained decoding of the tool
+wire syntax is available behind `--constrained-tool-decoding` (default `off`; with `off` the
+sampling path is unchanged), see [Tool-call parser](tool_call_parser.md#constrained-tool-decoding).
 
 String parameters preserve function/tool-call markers and balanced nested
-`<parameter=...>...</parameter>` text as value bytes. The Qwen wire format has no delimiter escape,
+`<parameter=...>...</parameter>` text as value bytes. Marker recognition, the accepted header forms
+(short, attribute and bare openers with quote-aware names) and the value/closer rules come from a
+single wire grammar that one-shot and streaming parsing share ([Tool-call parser](tool_call_parser.md)).
+The Qwen wire format has no delimiter escape,
 so a standalone `</parameter>` ends a value only when whitespace and then another parameter, the
 function's closer, or the end of the output follow it; any other one is value text, such as a shell
 command that echoes the markup. An unmatched nested parameter opener, or a quoted closer that is
@@ -970,6 +975,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--no-thinking` | disable thinking by default | thinking on |
 | `--preserve-thinking` | preserve closed-turn assistant reasoning by default | off |
 | `--tolerant-tool-calls` | recover complete tool calls cut by a malformed wrapper, a trailing suffix or the output budget instead of demoting them to text | off |
+| `--constrained-tool-decoding M` | grammar-constrained decoding of the tool wire syntax (`off` or `tool-calls-only`); reserved feature, the sampling path is unchanged until the integration lands | off |
 | `--cors` | permissive browser CORS headers | off |
 | `--usage-chunk-choice` | give the streamed usage chunk a zero-delta choice, for strict client parsers that reject the OpenAI-conformant empty `choices` array | off |
 | `--temperature F` | process-level temperature override | unset |

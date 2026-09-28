@@ -60,6 +60,9 @@ struct ServeOptions {
     std::optional<bool> preserve_thinking;
     // Recover complete Qwen calls with malformed wrapper/suffix output (opt-in; strict by default).
     bool tolerant_tool_calls = false;
+    // Grammar-constrained tool decoding (reserved; Off leaves sampling unchanged until the
+    // integration lands).
+    ConstrainedToolDecoding constrained_tool_decoding = ConstrainedToolDecoding::Off;
     std::optional<std::uint32_t> default_thinking_budget;
     // End-of-thinking message fed to the model when it hits the thinking budget; empty
     // preserves the model's built-in control suffix.
