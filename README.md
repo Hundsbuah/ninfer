@@ -69,6 +69,9 @@ for creating NInfer!
     TMA-staged FP8 GEMM (upstream PR #167 by Michael Dementii)
 20. keeps what the next turns reuse in the hybrid cache's host tier and prefetches a waiting
     request's host blocks (9 % fewer prompt tokens prefilled at a 52 GB host tier)
+21. speeds up attention over k8v4 and nvfp4 KV cache: a 128K-token prompt prefills 11.5 % faster
+    with k8v4 and 22.5 % faster with nvfp4, at unchanged perplexity; also includes FP8 and NVFP4
+    kernel improvements by Duncan Betts (upstream #328 and #327)
 
 I recommend using this with the NVIDIA NVFP4 artifact I’ve uploaded here, which runs a bit faster
 than the original artifact based on the Unsloth quant and takes up less VRAM:
@@ -466,12 +469,38 @@ BF16 KV.
   columns at 8K 3 % slower). End to end, a 128K-token prompt prefills 11.5 % faster (32K: 2.9 %)
   and single-stream MTP decode is 0.5-1.6 % faster. Perplexity over 64K-token windows moves by
   +1.4e-3 nats per token (about one standard error; 4K windows unchanged).
+  Commit: [`6f8fe8c`][c-k8v4].
+- **Faster NVFP4 KV attention** (default for `--kv-dtype nvfp4`;
+  `--use-original-nvfp4-prefill-kernel` keeps the original prefill kernel). NVFP4 decode and
+  prefill run the K8V4 kernels above, with QK on block-scaled FP4 Tensor Cores (8x the FP16 rate
+  on RTX 5090) reading the stored K codes and scales directly; Q enters as two NVFP4 terms, the row
+  and what it leaves (0.9 % RMS error). Per full-attention layer against the previous build: decode
+  -26 % geometric mean over 1-8 requests, 1-16 columns and 8K-128K keys (one request with 8 columns
+  at 8K is 8 % slower, eight requests with 16 columns at 8K 2 %), prefill -45 % over 256-4096 new
+  tokens. End to end (uncensored 27B), a 128K-token prompt prefills 22.5 % faster (26.4 s to
+  21.5 s) and MTP decode is up to 3 % faster. Perplexity is unchanged (-0.3e-3 nats per token on
+  4K windows, -0.2e-3 on 64K, both within one standard error).
+  Commit: [`641ab41`][c-nvfp4-kv].
+- **NVFP4 KV groups pick the best of five scales** (NVFP4 K and V, K8V4 V): each 16-value group
+  maps its largest magnitude to 6, 4, 4.5, 5 or 5.5 and keeps the scale with the least squared
+  error (Four Over Six, arXiv:2512.02010, generalized); decoding is unchanged. RMS error of the 27B
+  model's rotated K rows falls from 9.5 % to 8.5 %. K8V4 perplexity moves by +0.2e-3 (4K) and
+  -1.4e-3 (64K) nats per token, both within one standard error; K8V4 decode is 0.3 % slower (up to
+  3 % for single-request 8K steps) for the search.
+  Commit: [`ffb3a59`][c-nvfp4-targets].
+- **Reciprocal NVFP4 activation quantizer on the Linear MMA route** (upstream issue #327 by
+  [DuncanBetts](https://github.com/DuncanBetts)): below 1024 tokens the plain Linear A4 route
+  quantizes activations with one reciprocal and multiplies instead of sixteen divisions per group,
+  2-5 % faster at 8-64 tokens and unchanged elsewhere; DFlash2 output is unchanged. The other A4
+  routes keep the divisions, because opting them in changed the generated text.
+  Commit: [`1681a78`][c-pr327].
 - **FP8 Tensor Core MMA on the MX datapath** (upstream PR #328 by
   [DuncanBetts](https://github.com/DuncanBetts)): the shared E4M3 MMA helper issues the
   block-scaled `kind::mxf8f6f4` form with unit scales, which computes the same dot products bit
   for bit on a faster datapath. Paired runs on RTX 5090: FP8 A8 projections -18 to -38 % at
   256-4096 tokens and unchanged at decode widths, K8V4 decode attention -2 %, prefill 10-12 %
   faster end to end with K8V4 KV, decode unchanged. Perplexity is bit-identical.
+  Commit: [`7a69859`][c-pr328].
 - **TMA-staged FP8 prefill GEMM** (upstream PR #167 by Michael Dementii, carried onto upstream's
   unified FP8 template): the FP8 A8 projections of the attention and GDN inputs and the output
   projections run a 256-token tile fed by TMA from 1024 tokens where its cost model favours it,
@@ -865,6 +894,11 @@ well, and for the work this branch builds on.
 [c-host-eviction]: https://github.com/Wallawalla47/ninfer-custom/commit/39bc99c488925b1bb508bba63a2e6c69fd49e6f3
 [c-head-prefetch]: https://github.com/Wallawalla47/ninfer-custom/commit/d9b8d437ca2d1269cf14be9588c1caed7e5aa3c3
 [c-fp8-tma]: https://github.com/Wallawalla47/ninfer-custom/commit/64a4e4f486f0c7ae31c1a21166472d8d0a2fdbe0
+[c-k8v4]: https://github.com/Wallawalla47/ninfer-custom/commit/6f8fe8cb2cb6e4f73a44652f45c27b56b6d8f02a
+[c-pr328]: https://github.com/Wallawalla47/ninfer-custom/commit/7a698599a692db5f65757e3ff26f8e52c28d7ba0
+[c-pr327]: https://github.com/Wallawalla47/ninfer-custom/commit/1681a78ebdfebda49e9e290e1639ccd6849a21f5
+[c-nvfp4-targets]: https://github.com/Wallawalla47/ninfer-custom/commit/ffb3a59fc912b478b003ad79533c4aaaffa70679
+[c-nvfp4-kv]: https://github.com/Wallawalla47/ninfer-custom/commit/641ab41e3cd560b0d6182d13084d514ec5d9d72b
 
 ---
 
