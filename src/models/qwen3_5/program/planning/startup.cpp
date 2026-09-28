@@ -305,7 +305,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     const auto verify = drafts + 1;
     const ops::CausalAttentionExecutionEnvelope text_envelope{1, plan.capacity};
     // Prefill chunks run with the small-prefill route hint and the selected prompt kernel, whose
-    // fast K8V4 form may split keys into workspace (see execution/text.cpp).
+    // fast K8V4 and NVFP4 forms may split keys into workspace (see execution/text.cpp).
     const ops::CausalAttentionExecutionEnvelope prefill_envelope{
         .min_visible_keys   = 1,
         .max_visible_keys   = plan.capacity,
@@ -1037,11 +1037,14 @@ bool uses_fast_int8_prefill(const EngineOptions& options) {
     return options.kv_cache == KvCacheStorage::Int8Group64 && !options.original_int8_prefill_kernel;
 }
 
-// INT8 and K8V4 KV prefill with their fast prompt kernels unless the original one was selected.
+// INT8, K8V4 and NVFP4 KV prefill with their fast prompt kernels unless the original one was
+// selected.
 bool uses_fast_prefill_kernel(const EngineOptions& options) {
     return uses_fast_int8_prefill(options) ||
            (options.kv_cache == KvCacheStorage::Fp8KeyNvfp4Value &&
-            !options.original_k8v4_prefill_kernel);
+            !options.original_k8v4_prefill_kernel) ||
+           (options.kv_cache == KvCacheStorage::Nvfp4Group16 &&
+            !options.original_nvfp4_prefill_kernel);
 }
 } // namespace
 

@@ -85,6 +85,9 @@ std::string serve_usage_text(const char* argv0) {
            "  --use-original-k8v4-prefill-kernel\n"
            "                             prefill K8V4 KV with the original prompt kernel\n"
            "                             (default: the fast kernel)\n"
+           "  --use-original-nvfp4-prefill-kernel\n"
+           "                             prefill NVFP4 KV with the original prompt kernel\n"
+           "                             (default: the fast kernel)\n"
            "  --no-cuda-graph            disable CUDA-graph decode rounds (on by default)\n"
            "  --default-max-tokens N     default max_tokens when a request omits it\n"
            "                             (default " +
@@ -352,6 +355,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.original_int8_prefill_kernel = true;
         } else if (arg == "--use-original-k8v4-prefill-kernel") {
             options.original_k8v4_prefill_kernel = true;
+        } else if (arg == "--use-original-nvfp4-prefill-kernel") {
+            options.original_nvfp4_prefill_kernel = true;
         } else if (arg == "--context-cost-presets") {
             options.context_cost_presets = require_value("--context-cost-presets");
             if (options.context_cost_presets.empty()) {

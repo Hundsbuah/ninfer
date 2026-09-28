@@ -37,6 +37,7 @@ struct ServeOptions {
     std::uint32_t prefill_chunk        = 1024;
     bool original_int8_prefill_kernel  = false;
     bool original_k8v4_prefill_kernel  = false;
+    bool original_nvfp4_prefill_kernel = false;
     std::filesystem::path context_cost_presets;
     std::uint32_t log_stats_interval_ms    = 5000; // 0 disables periodic Engine throughput logs
     std::size_t max_request_bytes          = kDefaultMaxRequestBytes;

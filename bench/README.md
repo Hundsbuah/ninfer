@@ -65,7 +65,7 @@ ninfer_bench --weights <artifact.ninfer>
           [-r, --repetitions <n>] [--warmup <n>]
           [--max-ctx <tokens>] [--prefill-chunk <tokens>]
           [--kv-dtype <bf16|int8|fp8|nvfp4|k8v4>] [--use-original-int8-prefill-kernel]
-          [--use-original-k8v4-prefill-kernel]
+          [--use-original-k8v4-prefill-kernel] [--use-original-nvfp4-prefill-kernel]
           [--spec <mtp|dflash|dflash2> --draft-tokens <n>] [--lm-head-draft]
           [--device <id>] [--no-cuda-graph] [--profile-measured]
           [-o, --output <table|json|csv>] [--output-file <path>]
@@ -567,8 +567,8 @@ choices. `all` emits every storage mode as an independent row.
 
 Append-and-attend accepts `--batch 1,2,4,8`; each ordinary `--context L` point gives every row the
 same context and all `W` columns are valid. `--fast-prompt` and `--small-prefill` set the matching
-envelope hints: the fast INT8 and K8V4 prompt kernels, and chunked small-T for single-row widths
-17-64 over a long context. `--gate standalone|fused` adds the attention output gate. One exact mixed profile
+envelope hints: the fast INT8, NVFP4 and K8V4 prompt kernels, and chunked small-T for single-row
+widths 17-64 over a long context. `--gate standalone|fused` adds the attention output gate. One exact mixed profile
 uses `--row-contexts`, `--valid-columns`, and `--table-rows`, each with exactly `B` entries.
 Cached-only remains B=1. The execution envelope is exact (`[visible, visible]`) by default;
 `--envelope-max N` uses `[1, max(visible, N)]` instead, as production decode Graphs do with their

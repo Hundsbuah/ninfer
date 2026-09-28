@@ -2688,6 +2688,47 @@ int run_fp8_cases() {
     return failures;
 }
 
+// NVFP4 or K8V4 prompt-route widths for one prompt kernel: partial and full row blocks, widths
+// over enough key pages for the fast kernel to split them across CTAs (including an envelope far
+// past the populated keys, so late splits own no visible key), V magnitudes whose group scales need
+// the fast kernel's FP16-partial rescale, and the production prefill chunk after a long history.
+// NVFP4 draws its own seeds.
+int run_rotated_prompt_cases(KvCacheStorage storage, bool fast) {
+    const std::uint32_t seed = storage == KvCacheStorage::Nvfp4Group16 ? 100u : 0u;
+    int failures             = 0;
+    const auto with          = [fast](AttentionCase test_case) {
+        test_case.fast_prompt_kernel = fast;
+        return test_case;
+    };
+    for (const Geometry& geometry : kGeometries) {
+        failures += run_a1_case(geometry, storage, with({64, 0, 128, seed + 804u}),
+                                MappingPattern::Fragmented);
+        failures += run_a3_case(geometry, storage, with({65, 63, 192, seed + 805u}),
+                                MappingPattern::Offset);
+        failures += run_a1_case(geometry, storage, with({256, 4000, 4256, seed + 820u}),
+                                MappingPattern::Fragmented);
+        failures += run_a3_case(geometry, storage, with({130, 1900, 8192, seed + 821u}),
+                                MappingPattern::Offset);
+    }
+    const Geometry& h24 = kGeometries[0];
+    // |V| up to 900 gives rotated V group scales around 150-250, above the fast kernel's unscaled
+    // limit of 128; |V| up to 2048 reaches the largest UE4M3 scales.
+    failures +=
+        run_a1_case(h24, storage, with({200, 1000, 1200, seed + 823u, false, false, false, 900.0f}),
+                    MappingPattern::Identity);
+    failures +=
+        run_a3_case(h24, storage, with({300, 700, 1000, seed + 824u, false, false, false, 2048.0f}),
+                    MappingPattern::Fragmented);
+    AttentionCase chunk{4096, 8192, 8192 + 4096, seed + 825u};
+    chunk.oracle_rows = 64;
+    failures += run_a1_case(h24, storage, with(chunk), MappingPattern::Fragmented);
+    // A masked single-row prompt over enough key pages to split them across CTAs.
+    BatchAttentionCase prompt{40, {3000}, {29}, {0}, MappingPattern::Fragmented, seed + 822u, true};
+    prompt.fast_prompt_kernel = fast;
+    failures += run_batch_case(h24, storage, prompt);
+    return failures;
+}
+
 int run_nvfp4_cases() {
     int failures = 0;
     for (const Geometry& geometry : kGeometries) {
@@ -2732,46 +2773,8 @@ int run_nvfp4_cases() {
                             MappingPattern::Fragmented);
     failures += run_a3_case(kGeometries[0], KvCacheStorage::Nvfp4Group16,
                             {1, 300000, 300001, 1720u}, MappingPattern::Fragmented);
-    return failures;
-}
-
-// K8V4 prompt-route widths for one prompt kernel: partial and full row blocks, widths over enough
-// key pages for the fast kernel to split them across CTAs (including an envelope far past the
-// populated keys, so late splits own no visible key), V magnitudes whose group scales need the
-// fast kernel's FP16-partial rescale, and the production prefill chunk after a long history.
-int run_k8v4_prompt_cases(bool fast) {
-    constexpr KvCacheStorage storage = KvCacheStorage::Fp8KeyNvfp4Value;
-    int failures                     = 0;
-    const auto with                  = [fast](AttentionCase test_case) {
-        test_case.fast_prompt_kernel = fast;
-        return test_case;
-    };
-    for (const Geometry& geometry : kGeometries) {
-        failures += run_a1_case(geometry, storage, with({64, 0, 128, 804u}),
-                                MappingPattern::Fragmented);
-        failures +=
-            run_a3_case(geometry, storage, with({65, 63, 192, 805u}), MappingPattern::Offset);
-        failures += run_a1_case(geometry, storage, with({256, 4000, 4256, 820u}),
-                                MappingPattern::Fragmented);
-        failures += run_a3_case(geometry, storage, with({130, 1900, 8192, 821u}),
-                                MappingPattern::Offset);
-    }
-    const Geometry& h24 = kGeometries[0];
-    // |V| up to 900 gives rotated V group scales around 150-250, above the fast kernel's unscaled
-    // limit of 128; |V| up to 2048 reaches the largest UE4M3 scales.
-    failures +=
-        run_a1_case(h24, storage, with({200, 1000, 1200, 823u, false, false, false, 900.0f}),
-                    MappingPattern::Identity);
-    failures +=
-        run_a3_case(h24, storage, with({300, 700, 1000, 824u, false, false, false, 2048.0f}),
-                    MappingPattern::Fragmented);
-    AttentionCase chunk{4096, 8192, 8192 + 4096, 825u};
-    chunk.oracle_rows = 64;
-    failures += run_a1_case(h24, storage, with(chunk), MappingPattern::Fragmented);
-    // A masked single-row prompt over enough key pages to split them across CTAs.
-    BatchAttentionCase prompt{40, {3000}, {29}, {0}, MappingPattern::Fragmented, 822u, true};
-    prompt.fast_prompt_kernel = fast;
-    failures += run_batch_case(h24, storage, prompt);
+    failures += run_rotated_prompt_cases(KvCacheStorage::Nvfp4Group16, false);
+    failures += run_rotated_prompt_cases(KvCacheStorage::Nvfp4Group16, true);
     return failures;
 }
 
@@ -2787,8 +2790,8 @@ int run_k8v4_cases() {
         failures += run_a3_case(geometry, KvCacheStorage::Fp8KeyNvfp4Value, {1, 2048, 2049, 806u},
                                 MappingPattern::Fragmented);
     }
-    failures += run_k8v4_prompt_cases(false);
-    failures += run_k8v4_prompt_cases(true);
+    failures += run_rotated_prompt_cases(KvCacheStorage::Fp8KeyNvfp4Value, false);
+    failures += run_rotated_prompt_cases(KvCacheStorage::Fp8KeyNvfp4Value, true);
     failures += run_a1_case(kGeometries[0], KvCacheStorage::Fp8KeyNvfp4Value,
                             {1, 64, 65, 807u, false, true}, MappingPattern::Fragmented);
     failures += run_a3_case(kGeometries[0], KvCacheStorage::Fp8KeyNvfp4Value,
@@ -2828,11 +2831,12 @@ int verify_workspace_capacity_contract() {
                             geometry, storage, envelope, 1, tokens, tokens);
                         witness = std::max(witness, exact);
                         // Split-KV widths always need workspace. Wider prompt-route widths need
-                        // none, except fast-kernel K8V4 prompts whose key splits fill otherwise
-                        // idle SMs.
+                        // none, except fast-kernel NVFP4 and K8V4 prompts whose key splits fill
+                        // otherwise idle SMs.
                         const bool small_t = tokens <= (wide ? 64 : 16);
                         const bool prompt_splits =
-                            fast && storage == KvCacheStorage::Fp8KeyNvfp4Value;
+                            fast && (storage == KvCacheStorage::Fp8KeyNvfp4Value ||
+                                     storage == KvCacheStorage::Nvfp4Group16);
                         if ((small_t && exact == 0) || (!small_t && exact != 0 && !prompt_splits)) {
                             std::cerr << "causal_softmax_attention wide route workspace mismatch\n";
                             ++failures;

@@ -24,9 +24,10 @@ for creating NInfer!
    with a raft of fixes and improvements (as I was working on this prior to going with a new
    design – I found the upstream system to be too complex and fragile) – it is gated behind the
    launch parameter `--use-original-prefix-caching`
-4. prefills with a faster prompt-attention kernel by default when using int8 (Hadamard rotated)
-   or k8v4 for KV cache; the original kernels remain available with
-   `--use-original-int8-prefill-kernel` and `--use-original-k8v4-prefill-kernel`
+4. prefills with a faster prompt-attention kernel by default when using int8 (Hadamard rotated),
+   k8v4 or nvfp4 for KV cache; the original kernels remain available with
+   `--use-original-int8-prefill-kernel`, `--use-original-k8v4-prefill-kernel` and
+   `--use-original-nvfp4-prefill-kernel`
 5. adds ngram-mod copy drafting (based on an implementation by
    [remesis](https://github.com/remesis)) to significantly increase the speed of copy-heavy
    workloads
@@ -449,8 +450,8 @@ BF16 KV.
   cached tokens take 1.06 ms per attention layer instead of 9.5 ms.
   Commit: [`c1a59aa`][c-small-prefill].
 - **Faster K8V4 KV attention** (default for `--kv-dtype k8v4`; `--use-original-k8v4-prefill-kernel`
-  keeps the original prefill kernel). K8V4 prefill runs a new prompt kernel
-  (`src/ops/softmax_attention/dense/causal_cache/prompt_k8v4_fast.cuh`): each warp keeps 16 query
+  keeps the original prefill kernel). K8V4 prefill runs a new prompt kernel, now shared with NVFP4
+  (`src/ops/softmax_attention/dense/causal_cache/prompt_rotated_fast.cuh`): each warp keeps 16 query
   rows in registers for the whole key sweep, decodes the NVFP4 V rows in registers, accumulates
   each 64-key tile in FP16 and applies the inverse rotation in registers. A single-row prompt
   launch whose row blocks would leave SMs idle splits every row block's keys across CTAs and

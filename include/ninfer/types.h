@@ -294,6 +294,10 @@ struct EngineOptions {
     // K8V4 KV prefills with the fast prompt-attention kernel, which may split a chunk's keys across
     // CTAs. True selects the original K8V4 prompt kernel; it requires the K8V4 KV cache.
     bool original_k8v4_prefill_kernel  = false;
+    // NVFP4 KV prefills with the fast prompt-attention kernel (block-scaled FP4 QK with a two-term
+    // NVFP4 Q), which may split a chunk's keys across CTAs. True selects the original NVFP4 prompt
+    // kernel; it requires the NVFP4 KV cache.
+    bool original_nvfp4_prefill_kernel = false;
     KvCacheStorage kv_cache            = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;
     std::size_t media_cache_bytes = kDefaultMediaCacheBytes;

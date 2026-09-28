@@ -72,6 +72,10 @@ void validate_options(const EngineOptions& options) {
         throw std::invalid_argument(
             "the original K8V4 prefill kernel requires the K8V4 KV cache (--kv-dtype k8v4)");
     }
+    if (options.original_nvfp4_prefill_kernel && options.kv_cache != KvCacheStorage::Nvfp4Group16) {
+        throw std::invalid_argument(
+            "the original NVFP4 prefill kernel requires the NVFP4 KV cache (--kv-dtype nvfp4)");
+    }
 }
 
 // The hybrid index ranks admission sources and values snapshots with the same calibrated

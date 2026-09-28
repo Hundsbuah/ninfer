@@ -50,7 +50,8 @@ int main() {
         bool invalid_argument  = false;
         const std::string what = construction_error(options, invalid_argument);
         failures += check(what.find("INT8 KV") == std::string::npos &&
-                              what.find("K8V4 KV") == std::string::npos,
+                              what.find("K8V4 KV") == std::string::npos &&
+                              what.find("NVFP4 KV") == std::string::npos,
                           "the default prefill kernel choice was rejected");
     }
     options.original_int8_prefill_kernel = true;
@@ -89,6 +90,25 @@ int main() {
         const std::string what = construction_error(options, invalid_argument);
         failures += check(what.find("K8V4 KV") == std::string::npos,
                           "the original K8V4 prefill kernel was rejected with the K8V4 KV cache");
+    }
+    options.original_k8v4_prefill_kernel  = false;
+    options.original_nvfp4_prefill_kernel = true;
+    for (const auto storage :
+         {ninfer::KvCacheStorage::BFloat16, ninfer::KvCacheStorage::Int8Group64,
+          ninfer::KvCacheStorage::Fp8KeyNvfp4Value}) {
+        options.kv_cache       = storage;
+        bool invalid_argument  = false;
+        const std::string what = construction_error(options, invalid_argument);
+        failures +=
+            check(invalid_argument && what.find("NVFP4 KV") != std::string::npos,
+                  "the original NVFP4 prefill kernel was accepted without the NVFP4 KV cache");
+    }
+    options.kv_cache = ninfer::KvCacheStorage::Nvfp4Group16;
+    {
+        bool invalid_argument  = false;
+        const std::string what = construction_error(options, invalid_argument);
+        failures += check(what.find("NVFP4 KV") == std::string::npos,
+                          "the original NVFP4 prefill kernel was rejected with the NVFP4 KV cache");
     }
     std::cout << (failures == 0 ? "PASS" : "FAIL") << " Engine option validation\n";
     return failures == 0 ? 0 : 1;

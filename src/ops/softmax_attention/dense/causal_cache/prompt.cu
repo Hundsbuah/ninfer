@@ -136,7 +136,8 @@ constexpr std::int32_t kPromptMaxSplits        = 16;
 constexpr std::int32_t kPromptSplitCostPercent = 1;
 
 // Time for one fast-kernel CTA to sweep a launch's keys, as a percentage of the eight-warp CTA
-// (RTX 5090, 4096 columns over 128K keys); the four-warp CTA takes 72 %.
+// (RTX 5090, 4096 columns over 128K keys); the four-warp CTA takes 72 %. The K8V4 and NVFP4 forms
+// of the kernel share the profile.
 struct PromptCtaCost {
     std::int32_t warps;
     std::int32_t rows;
@@ -168,7 +169,10 @@ std::size_t prompt_split_bytes(std::int32_t q_heads, std::int32_t width, std::in
 CausalPromptSplitPlan causal_attention_prompt_split_plan(std::int32_t q_heads, std::int32_t width,
                                                          KvCacheStorage storage,
                                                          CausalAttentionExecutionEnvelope envelope) {
-    if (storage != KvCacheStorage::Fp8KeyNvfp4Value || width <= 0) { return {}; }
+    if ((storage != KvCacheStorage::Fp8KeyNvfp4Value && storage != KvCacheStorage::Nvfp4Group16) ||
+        width <= 0) {
+        return {};
+    }
     if (!envelope.fast_prompt_kernel) { return {.original = true}; }
     // Every CTA of a launch sweeps about the same key range and one CTA fits an SM, so a launch
     // costs about (waves) x (one CTA's sweep); a split CTA sweeps 1/splits of it.
@@ -221,7 +225,8 @@ void causal_attention_prompt_attention_launch(const Tensor& q, const Tensor& pos
         return;
     }
     if (cache.storage == KvCacheStorage::Nvfp4Group16) {
-        causal_attention_prompt_nvfp4_attention_launch(q, positions, scale, cache, out, stream);
+        causal_attention_prompt_nvfp4_attention_launch(q, positions, scale, cache, envelope,
+                                                       workspace, out, stream);
         return;
     }
     if (cache.storage == KvCacheStorage::Fp8E4M3Row256) {
@@ -252,7 +257,7 @@ void causal_attention_prompt_launch(const Tensor& q, const Tensor& k, const Tens
     }
     if (cache.storage == KvCacheStorage::Nvfp4Group16) {
         causal_attention_prompt_nvfp4_launch(q, k, v, positions, valid_columns, table_rows, scale,
-                                             cache, out, stream);
+                                             cache, envelope, workspace, out, stream);
         return;
     }
     if (cache.storage == KvCacheStorage::Fp8E4M3Row256) {

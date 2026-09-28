@@ -313,6 +313,8 @@ std::string usage_text(std::string_view program) {
         << "                              chunks); requires --kv-dtype int8\n"
         << "  --use-original-k8v4-prefill-kernel  original K8V4-KV prompt kernel (default:\n"
         << "                              fast kernel); requires --kv-dtype k8v4\n"
+        << "  --use-original-nvfp4-prefill-kernel  original NVFP4-KV prompt kernel (default:\n"
+        << "                              fast kernel); requires --kv-dtype nvfp4\n"
         << "  --spec <mtp|dflash|dflash2> speculative backend (default: none)\n"
         << "  --draft-tokens <n>         MTP 1..5; DFlash/DFlash2 1..15\n"
         << "  --ngram-draft-tokens <n>   copy proposals 1..63; 0 disables (default: 0)\n"
@@ -375,6 +377,8 @@ BenchOptions parse_args(int argc, char** argv) {
             options.original_int8_prefill_kernel = true;
         } else if (arg == "--use-original-k8v4-prefill-kernel") {
             options.original_k8v4_prefill_kernel = true;
+        } else if (arg == "--use-original-nvfp4-prefill-kernel") {
+            options.original_nvfp4_prefill_kernel = true;
         } else if (arg == "--spec") {
             options.speculative.backend = product::parse_speculative_backend(value("--spec"));
         } else if (arg == "--draft-tokens") {
@@ -625,6 +629,7 @@ std::string format_table(const BenchEnvironment& env, const std::vector<TestResu
         << "  config:     max_context=" << env.max_context << " prefill_chunk=" << env.prefill_chunk
         << " original_int8_prefill_kernel=" << (env.original_int8_prefill_kernel ? "on" : "off")
         << " original_k8v4_prefill_kernel=" << (env.original_k8v4_prefill_kernel ? "on" : "off")
+        << " original_nvfp4_prefill_kernel=" << (env.original_nvfp4_prefill_kernel ? "on" : "off")
         << " rope_yarn_factor=" << env.rope_yarn_factor
         << " kv_cache=" << kv_cache_name(env.kv_cache)
         << " spec=" << product::speculative_backend_name(env.speculative.backend)
@@ -753,6 +758,8 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
         << (env.original_int8_prefill_kernel ? "true" : "false") << ",\n"
         << "    \"original_k8v4_prefill_kernel\": "
         << (env.original_k8v4_prefill_kernel ? "true" : "false") << ",\n"
+        << "    \"original_nvfp4_prefill_kernel\": "
+        << (env.original_nvfp4_prefill_kernel ? "true" : "false") << ",\n"
         << "    \"kv_cache\": \"" << kv_cache_name(env.kv_cache) << "\",\n"
         << "    \"speculative_backend\": \""
         << product::speculative_backend_name(env.speculative.backend) << "\",\n"

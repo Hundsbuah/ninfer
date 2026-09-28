@@ -45,12 +45,16 @@ std::int32_t causal_attention_chunk_tokens(std::int32_t q_heads, std::int32_t wi
     return 8;
 }
 
-// K8V4 computes every full chunk of a chunked small-T call in one co-scheduled partial launch over
-// the appended cache (see CausalSmallTInvocation::chunks); a shorter tail chunk follows in its own
-// launch. Reading each key tile once from DRAM pays off because its small-T route is bound by
-// memory traffic; the NVFP4 route is bound by expanding K and V and measured slower co-scheduled.
-bool co_schedules_chunks(KvCacheStorage storage) {
-    return storage == KvCacheStorage::Fp8KeyNvfp4Value;
+// K8V4 and NVFP4 compute every full chunk of a chunked small-T call in one co-scheduled partial
+// launch over the appended cache (see CausalSmallTInvocation::chunks); a shorter tail chunk
+// follows in its own launch. Reading each key tile once from DRAM pays off because their shared
+// small-T kernel feeds the stored K codes straight to the Tensor Cores and is bound by memory
+// traffic. NVFP4 needs at least two full chunks: with one full chunk and a tail, the standalone
+// append costs more than the shared tile reads save (RTX 5090, B=1-8 over 8K-128K keys: widths 9
+// and 12 were up to 14 % slower co-scheduled, width 16 up to 23 % faster).
+bool co_schedules_chunks(KvCacheStorage storage, std::int32_t width, std::int32_t tile) {
+    return storage == KvCacheStorage::Fp8KeyNvfp4Value ||
+           (storage == KvCacheStorage::Nvfp4Group16 && width >= 2 * tile);
 }
 
 void require_causal_geometry(AttentionHeadGeometry geometry, const char* op) {
@@ -333,9 +337,11 @@ void launch_co_scheduled_chunks(const Tensor& q, const Tensor& positions,
         detail::causal_attention_split_capacity(q.ne[1], tile, cache.storage, envelope, q.ne[3]);
     SmallTWorkspace partial =
         allocate_small_t_workspace(workspace, q.ne[1], tile, splits, q.ne[3], chunks);
-    detail::causal_attention_small_t_k8v4_chunks_launch(
-        q, positions, valid_columns, table_rows, scale, cache, envelope, begin, tile, chunks,
-        partial.acc, partial.m, partial.l, out, stream, gate);
+    const auto chunks_launch = cache.storage == KvCacheStorage::Nvfp4Group16
+                                   ? detail::causal_attention_small_t_nvfp4_chunks_launch
+                                   : detail::causal_attention_small_t_k8v4_chunks_launch;
+    chunks_launch(q, positions, valid_columns, table_rows, scale, cache, envelope, begin, tile,
+                  chunks, partial.acc, partial.m, partial.l, out, stream, gate);
 }
 
 void launch_chunked_small_t(const Tensor& q, const Tensor& k, const Tensor& v,
@@ -343,7 +349,9 @@ void launch_chunked_small_t(const Tensor& q, const Tensor& k, const Tensor& v,
                             const Tensor& table_rows, float scale, PagedKVBatchLayerView cache,
                             CausalAttentionExecutionEnvelope envelope, WorkspaceArena& workspace,
                             Tensor& out, cudaStream_t stream, const void* gate) {
-    if (co_schedules_chunks(cache.storage)) {
+    if (co_schedules_chunks(
+            cache.storage, q.ne[2],
+            causal_attention_chunk_tokens(q.ne[1], q.ne[2], q.ne[3], cache.storage, envelope))) {
         // Every chunk attends the new rows of the chunks before it, so all rows are appended
         // first. The standalone append writes the same bytes as the fused one and serves one
         // batch row per launch; each row's operands are contiguous slices.
@@ -388,7 +396,9 @@ void launch_cached_chunked_small_t(const Tensor& q, const Tensor& positions, flo
                                    const PagedKVLayerView& cache,
                                    CausalAttentionExecutionEnvelope envelope,
                                    WorkspaceArena& workspace, Tensor& out, cudaStream_t stream) {
-    if (co_schedules_chunks(cache.storage)) {
+    if (co_schedules_chunks(
+            cache.storage, q.ne[2],
+            causal_attention_chunk_tokens(q.ne[1], q.ne[2], 1, cache.storage, envelope))) {
         const std::int32_t tile =
             causal_attention_chunk_tokens(q.ne[1], q.ne[2], 1, cache.storage, envelope);
         const std::int32_t full = q.ne[2] / tile;
@@ -399,9 +409,11 @@ void launch_cached_chunked_small_t(const Tensor& q, const Tensor& positions, flo
                 detail::causal_attention_split_capacity(q.ne[1], width, cache.storage, envelope);
             SmallTWorkspace partial =
                 allocate_small_t_workspace(workspace, q.ne[1], width, splits, 1, chunks);
-            detail::causal_attention_cached_small_t_k8v4_launch(
-                q, positions, scale, cache, envelope, begin, width, chunks, partial.acc, partial.m,
-                partial.l, out, stream);
+            const auto cached_launch = cache.storage == KvCacheStorage::Nvfp4Group16
+                                           ? detail::causal_attention_cached_small_t_nvfp4_launch
+                                           : detail::causal_attention_cached_small_t_k8v4_launch;
+            cached_launch(q, positions, scale, cache, envelope, begin, width, chunks, partial.acc,
+                          partial.m, partial.l, out, stream);
         };
         launch(0, tile, full);
         if (tail > 0) { launch(full * tile, tail, 1); }
@@ -530,9 +542,10 @@ std::size_t causal_softmax_attention_workspace_capacity_bytes(
                                    : std::size_t{0};
         }
         if (route == detail::CausalAttentionRoute::SmallT) { return chunk_capacity(width); }
-        if (co_schedules_chunks(cache_storage)) {
-            const std::int32_t tile =
-                causal_attention_chunk_tokens(q_heads, width, batch_size, cache_storage, envelope);
+        const std::int32_t chunk_width =
+            causal_attention_chunk_tokens(q_heads, width, batch_size, cache_storage, envelope);
+        if (co_schedules_chunks(cache_storage, width, chunk_width)) {
+            const std::int32_t tile   = chunk_width;
             const std::int32_t full   = width / tile;
             const std::int32_t tail   = width - full * tile;
             const std::int32_t splits = detail::causal_attention_split_capacity(
@@ -610,11 +623,12 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
     auto scope = workspace.scope();
     const detail::CausalAttentionRoute route =
         detail::causal_attention_resolve_route(q.ne[1], width, batch, cache.storage, envelope);
-    // The shared BF16/INT8 and the K8V4 small-T reducers carry the gate. FP8 and NVFP4 reach
-    // their own reduce kernels, so they take the standalone multiply like the prompt route, where
-    // folding the gate into the epilogue measured slower; every caller sees one contract.
+    // The BF16/INT8 and the rotated NVFP4/K8V4 small-T reducers carry the gate. FP8 reaches its
+    // own reduce kernel, so it takes the standalone multiply like the prompt route, where folding
+    // the gate into the epilogue measured slower; every caller sees one contract.
     const bool fusable     = cache.storage == KvCacheStorage::BFloat16 ||
                              cache.storage == KvCacheStorage::Int8Group64 ||
+                             cache.storage == KvCacheStorage::Nvfp4Group16 ||
                              cache.storage == KvCacheStorage::Fp8KeyNvfp4Value;
     const void* fused_gate = gate != nullptr && fusable ? gate->data : nullptr;
     if (route == detail::CausalAttentionRoute::ChunkedSmallT) {
