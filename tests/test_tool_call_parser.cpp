@@ -1250,6 +1250,79 @@ int test_tolerant_undeclared_and_value_cut() {
     return failures;
 }
 
+int test_grammar_header_forms_one_shot() {
+    const auto contract = contract_for("write", Json{{"content", Json{{"type", "string"}}}});
+    int failures = 0;
+    for (const char* header : {"<function name=\"write\">", "<function name = \"write\">",
+                               "<function\tname=\"write\">", "<function\nname=\"write\">",
+                               "<function name='write'>"}) {
+        const std::string text = std::string("<tool_call>\n") + header +
+                                 "\n<parameter=content>\nhi\n</parameter>\n</function>\n</tool_call>";
+        const auto parsed = fi::parse_qwen_tool_call_output(text, 64, contract);
+        failures += check(parsed.is_tool_call_response && parsed.tool_calls.size() == 1 &&
+                              parsed.tool_calls[0].name == "write" &&
+                              parsed.tool_calls[0].arguments_json == "{\"content\":\"hi\"}",
+                          (std::string("attribute-form header parses: ") + header).c_str());
+    }
+    const std::string quoted =
+        "<tool_call>\n<function name=\"write\">\n<parameter filename=\"a>b\" name=\"content\">\n"
+        "x\n</parameter>\n</function>\n</tool_call>";
+    const auto quoted_parsed = fi::parse_qwen_tool_call_output(quoted, 64, contract);
+    failures += check(quoted_parsed.is_tool_call_response &&
+                          quoted_parsed.tool_calls.size() == 1 &&
+                          quoted_parsed.tool_calls[0].arguments_json == "{\"content\":\"x\"}",
+                      "quoted > does not break the header");
+
+    const std::vector<std::string> broken = {
+        "<tool_call>\n<function name=\"write\"junk=\"x\">\n<parameter=content>\nhi\n</parameter>\n"
+        "</function>\n</tool_call>",
+        "<tool_call>\n<function name=>\n<parameter=content>\nhi\n</parameter>\n</function>\n"
+        "</tool_call>",
+        "<tool_call>\n<function name=\"write>\n<parameter=content>\nhi\n</parameter>\n</function>\n"
+        "</tool_call>",
+    };
+    for (const auto& text : broken) {
+        const auto parsed = fi::parse_qwen_tool_call_output(text, 64, contract);
+        failures += check(!parsed.is_tool_call_response && parsed.content == text &&
+                              parsed.diagnostics.fallback_reason ==
+                                  ninfer::ToolCallParseFallbackReason::MalformedStructure,
+                          "broken header falls back to verbatim text");
+    }
+    return failures;
+}
+
+int test_streaming_recognizes_grammar_markers() {
+    int failures = 0;
+    const std::string long_name = "very-long-tool-name-0123456789";
+    const auto contract =
+        contract_for(long_name.c_str(), Json{{"subject", Json{{"type", "string"}}}});
+    const std::vector<std::string> regions = {
+        std::string("<function name=\"") + long_name +
+        "\">\n<parameter=subject>\ndo it\n</parameter>\n</function>",
+        std::string("<function=") + long_name +
+        ">\n<parameter=subject>\ndo it\n</parameter>\n</function>",
+        std::string("<invoke name=\"") + long_name +
+        "\">\n<parameter=subject>\ndo it\n</parameter>\n</invoke>",
+    };
+    for (const auto& region : regions) {
+        const std::string text = "Creating task. " + region;
+        fi::ToolCallOutputDecoder decoder(
+            std::make_shared<fi::ToolCallOutputContract>(contract), 64, false);
+        std::string visible;
+        for (std::size_t i = 0; i < text.size(); ++i) {
+            visible += decoder.feed(text.substr(i, 1));
+        }
+        auto terminal = decoder.finish();
+        failures += check(visible == "Creating task." && terminal.content.empty() &&
+                              terminal.tool_calls.size() == 1 &&
+                              terminal.tool_calls.front().name == long_name &&
+                              terminal.tool_calls.front().arguments_json ==
+                                  "{\"subject\":\"do it\"}",
+                          "grammar marker recognized while streaming");
+    }
+    return failures;
+}
+
 int main() {
     int failures = 0;
     failures += test_duplicate_parameter_keeps_last_value();
@@ -1284,6 +1357,8 @@ int main() {
     failures += test_tolerant_truncated_final_call();
     failures += test_tolerant_missing_function_close_bracket();
     failures += test_tolerant_undeclared_and_value_cut();
+    failures += test_grammar_header_forms_one_shot();
+    failures += test_streaming_recognizes_grammar_markers();
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }

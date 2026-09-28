@@ -1,4 +1,5 @@
 #include "models/qwen3_5/frontend/tool_call_parser.h"
+#include "models/qwen3_5/frontend/tool_call_grammar.h"
 
 #include <nlohmann/json.hpp>
 
@@ -17,8 +18,6 @@ using NormalizationPolicy = Contract::NormalizationPolicy;
 using SchemaType          = Contract::SchemaType;
 using TypeSet             = Contract::TypeSet;
 
-constexpr std::string_view kToolOpen      = "<tool_call>";
-constexpr std::string_view kToolClose     = "</tool_call>";
 
 struct RawParameter {
     std::string_view name;
@@ -52,7 +51,7 @@ struct NormalizedParameter {
 };
 
 constexpr bool is_format_whitespace(char byte) {
-    return byte == ' ' || byte == '\t' || byte == '\r' || byte == '\n';
+    return is_tool_format_whitespace(byte);
 }
 
 constexpr bool is_ascii_digit(char byte) { return byte >= '0' && byte <= '9'; }
@@ -83,144 +82,7 @@ bool starts_with_at(std::string_view text, std::size_t pos, std::string_view pre
     return pos <= text.size() && text.substr(pos, prefix.size()) == prefix;
 }
 
-std::string_view unquote(std::string_view str) {
-    str = trim_format_whitespace(str);
-    if (str.size() >= 2) {
-        if ((str.front() == '"' && str.back() == '"') ||
-            (str.front() == '\'' && str.back() == '\'')) {
-            return trim_format_whitespace(str.substr(1, str.size() - 2));
-        }
-    }
-    return str;
-}
 
-std::string_view extract_name_from_tag_header(std::string_view header) {
-    header = trim_format_whitespace(header);
-    if (header.starts_with('=')) {
-        return unquote(header.substr(1));
-    }
-    for (std::size_t i = 0; i < header.size();) {
-        if (is_format_whitespace(header[i])) {
-            ++i;
-            continue;
-        }
-        const std::size_t attr_begin = i;
-        while (i < header.size() && header[i] != '=' && !is_format_whitespace(header[i]) && header[i] != '>') {
-            ++i;
-        }
-        const std::string_view attr_name = header.substr(attr_begin, i - attr_begin);
-        skip_format_whitespace(header, i);
-        if (i < header.size() && header[i] == '=') {
-            ++i;
-            skip_format_whitespace(header, i);
-            if (i >= header.size()) break;
-            std::string_view val;
-            if (header[i] == '"' || header[i] == '\'') {
-                const char q = header[i];
-                const std::size_t q_start = i + 1;
-                const std::size_t q_end = header.find(q, q_start);
-                if (q_end != std::string_view::npos) {
-                    val = header.substr(q_start, q_end - q_start);
-                    i = q_end + 1;
-                } else {
-                    val = header.substr(q_start);
-                    i = header.size();
-                }
-            } else {
-                const std::size_t val_begin = i;
-                while (i < header.size() && !is_format_whitespace(header[i]) && header[i] != '/' && header[i] != '>') {
-                    ++i;
-                }
-                val = header.substr(val_begin, i - val_begin);
-            }
-            if (attr_name == "name") {
-                return val;
-            }
-        }
-    }
-    return unquote(header);
-}
-
-bool is_param_open_at(std::string_view text, std::size_t pos, std::size_t& tag_end) {
-    std::size_t header_begin = 0;
-    if (starts_with_at(text, pos, "<parameter")) {
-        header_begin = pos + 10;
-    } else if (starts_with_at(text, pos, "<param")) {
-        header_begin = pos + 6;
-    } else {
-        return false;
-    }
-    if (header_begin >= text.size()) { return false; }
-    if (text[header_begin] != '=' && text[header_begin] != ' ' && text[header_begin] != '\t' &&
-        text[header_begin] != '\r' && text[header_begin] != '\n' && text[header_begin] != '>') {
-        return false;
-    }
-    const std::size_t end = text.find('>', header_begin);
-    if (end != std::string_view::npos && end != header_begin) {
-        tag_end = end;
-        return true;
-    }
-    return false;
-}
-
-bool is_param_close_at(std::string_view text, std::size_t pos, std::size_t& tag_len) {
-    if (starts_with_at(text, pos, "</parameter>")) {
-        tag_len = 12;
-        return true;
-    }
-    if (starts_with_at(text, pos, "</param>")) {
-        tag_len = 8;
-        return true;
-    }
-    return false;
-}
-
-static constexpr std::string_view kToolMarkers[] = {
-    "<tool_call>",
-    "<function_calls>",
-    "<function=",
-    "<function ",
-    "<function>",
-    "<function=\"",
-    "<function=\'",
-    "<invoke=",
-    "<invoke ",
-    "<invoke>",
-    "<invoke=\"",
-    "<invoke=\'",
-};
-
-bool is_prefix_of_any_marker(std::string_view prefix) {
-    for (const auto& marker : kToolMarkers) {
-        if (marker.starts_with(prefix)) { return true; }
-    }
-    return false;
-}
-
-bool matches_any_marker(std::string_view text) {
-    for (const auto& marker : kToolMarkers) {
-        if (text.starts_with(marker)) { return true; }
-    }
-    return false;
-}
-
-std::size_t find_first_tool_marker(std::string_view text) {
-    std::size_t earliest = std::string_view::npos;
-    for (const auto& marker : kToolMarkers) {
-        std::size_t idx = text.find(marker);
-        if (idx != std::string_view::npos && (earliest == std::string_view::npos || idx < earliest)) {
-            earliest = idx;
-        }
-    }
-    return earliest;
-}
-
-bool valid_function_name(std::string_view name, std::size_t max_name_length) {
-    if (name.empty() || name.size() > max_name_length) { return false; }
-    return std::all_of(name.begin(), name.end(), [](char byte) {
-        return is_ascii_alphanumeric(byte) || byte == '_' || byte == '-';
-    });
-}
 
 constexpr std::uint8_t type_bit(SchemaType type) { return static_cast<std::uint8_t>(type); }
 
@@ -553,12 +415,12 @@ public:
             if (pos == text_.size()) {
                 return calls.empty() ? FallbackReason::MalformedStructure : FallbackReason::None;
             }
-            if (starts_with_at(text_, pos, "<tool_call>")) {
+            if (starts_with_at(text_, pos, tool_open_literal(ToolTagKind::ToolCall))) {
                 RawToolCall call;
                 const FallbackReason terminal = finish_call(calls, call, parse_tool_call(pos, call));
                 if (terminal != FallbackReason::None) { return terminal; }
-            } else if (starts_with_at(text_, pos, "<function_calls>")) {
-                pos += 16;
+            } else if (starts_with_at(text_, pos, tool_open_literal(ToolTagKind::FunctionCalls))) {
+                pos += tool_open_literal(ToolTagKind::FunctionCalls).size();
                 bool had_calls = false;
                 for (;;) {
                     skip_format_whitespace(text_, pos);
@@ -624,12 +486,12 @@ private:
     }
 
     FallbackReason parse_tool_call(std::size_t& pos, RawToolCall& call) {
-        if (!consume(pos, "<tool_call>")) { return FallbackReason::MalformedStructure; }
+        if (!consume(pos, tool_open_literal(ToolTagKind::ToolCall))) { return FallbackReason::MalformedStructure; }
         skip_format_whitespace(text_, pos);
         const FallbackReason failure = parse_function(pos, call);
         if (failure != FallbackReason::None) { return failure; }
         skip_format_whitespace(text_, pos);
-        if (consume(pos, "</tool_call>")) { return FallbackReason::None; }
+        if (consume(pos, tool_close_literal(ToolTagKind::ToolCall))) { return FallbackReason::None; }
         // Tolerant: a complete call may be followed by explanatory text, or the model may have
         // stopped at the end of its budget before the closing tag. parse() resolves the terminal
         // flag; the strict parser keeps the hard structural failure.
@@ -637,68 +499,70 @@ private:
     }
 
     FallbackReason parse_function(std::size_t& pos, RawToolCall& call) {
-        std::size_t header_begin = 0;
-        std::string_view fn_close = "</function>";
-        if (starts_with_at(text_, pos, "<function")) {
-            header_begin = pos + 9;
-            fn_close = "</function>";
-        } else if (starts_with_at(text_, pos, "<invoke")) {
-            header_begin = pos + 7;
-            fn_close = "</invoke>";
-        } else if (tolerant_) {
+        ToolOpenTag opener = {};
+        ToolHeaderStatus header_status = parse_tool_function_open(text_.substr(pos), opener);
+
+        std::size_t header_base = 0;
+        if (header_status == ToolHeaderStatus::NoMatch && tolerant_) {
             // Recover a malformed function opener: a dropped or doubled leading '<', a leaked
-            // ChatML turn marker, or a dropped 'function'/'invoke' keyword, followed by '=' or a
-            // name. A form that yields no valid name is rejected by valid_function_name below, so
-            // prose after a marker cannot pass.
+            // ChatML turn marker, or a dropped 'function'/'invoke' keyword. The recovery only
+            // repairs where the header starts; the canonical header grammar still decides what
+            // the header accepts, so no second syntax lives in the recovery path.
             std::size_t scan = pos;
             while (scan < text_.size() && text_[scan] == '<') { ++scan; }
             if (starts_with_at(text_, scan, "|im_start|>")) { scan += 11; }
-            std::size_t kw_len = 0;
-            if (starts_with_at(text_, scan, "function")) { kw_len = 8; }
-            else if (starts_with_at(text_, scan, "invoke")) { kw_len = 6; }
-            else { return FallbackReason::MalformedStructure; }
-            scan += kw_len;
-            if (scan >= text_.size() || (text_[scan] != '=' && !is_format_whitespace(text_[scan]))) {
+            if (starts_with_at(text_, scan, "function")) {
+                opener.kind = ToolTagKind::Function;
+            } else if (starts_with_at(text_, scan, "invoke")) {
+                opener.kind = ToolTagKind::Invoke;
+            } else {
                 return FallbackReason::MalformedStructure;
             }
-            if (text_[scan] == '=') { ++scan; }
-            header_begin = scan;
-            fn_close = kw_len == 8 ? "</function>" : "</invoke>";
+            scan += (opener.kind == ToolTagKind::Function ? 8 : 6);
+            if (scan >= text_.size() ||
+                (text_[scan] != '=' && !is_format_whitespace(text_[scan]))) {
+                return FallbackReason::MalformedStructure;
+            }
+            header_base   = scan;
+            header_status = parse_tool_header_after_keyword(text_.substr(scan), opener.kind, opener);
         } else {
-            return FallbackReason::MalformedStructure;
+            header_base = pos + 1 + (opener.kind == ToolTagKind::Invoke ? 6 : 8);
         }
 
-        std::size_t tag_end = text_.find('>', header_begin);
         bool ws_boundary = false;
-        // Tolerant: the model sometimes drops the '>' after the function name (for example a name
-        // followed directly by a newline and a parameter tag). Recover by scanning the identifier
-        // run and accepting it when format whitespace separates it from the next '<' or end of
-        // region.
-        if (tolerant_) {
-            std::size_t scan = header_begin;
-            while (scan < text_.size() && text_[scan] == '=') { ++scan; }
+        if (header_status == ToolHeaderStatus::Complete) {
+            // `opener.consumed` counts from the tag's '<' at `pos` including the keyword; the tag
+            // ends exactly that many bytes from here. The tolerant recovery paths count from the
+            // keyword boundary instead and keep using `header_base`.
+            call.name = opener.name;
+            pos      += opener.consumed;
+        } else if (tolerant_) {
+            // Tolerant: the model sometimes drops the '>' after the function name (for example a
+            // name followed directly by a newline and a parameter tag). Recover by scanning the
+            // identifier run and accepting it when format whitespace separates it from the next
+            // '<' or the end of region.
+            const std::string_view body = text_.substr(header_base);
+            std::size_t scan            = 0;
+            while (scan < body.size() && body[scan] == '=') { ++scan; }
             const std::size_t ident_begin = scan;
-            while (scan < text_.size() && scan - header_begin < max_name_length_) {
-                const char byte = text_[scan];
-                if (!is_ascii_alphanumeric(byte) && byte != '_' && byte != '-') { break; }
+            while (scan < body.size() && scan - ident_begin < max_name_length_ &&
+                   is_tool_name_char(body[scan])) {
                 ++scan;
             }
-            if (scan > ident_begin && scan < text_.size() && is_format_whitespace(text_[scan]) &&
-                (tag_end == std::string_view::npos || scan < tag_end)) {
+            if (scan > ident_begin && scan < body.size() && is_format_whitespace(body[scan])) {
                 std::size_t after = scan;
-                while (after < text_.size() && is_format_whitespace(text_[after])) { ++after; }
-                if (after >= text_.size() || text_[after] == '<') {
-                    tag_end     = scan;
+                while (after < body.size() && is_format_whitespace(body[after])) { ++after; }
+                if (after >= body.size() || body[after] == '<') {
+                    call.name   = body.substr(ident_begin, scan - ident_begin);
                     ws_boundary = true;
+                    pos         = header_base + scan;
                 }
             }
         }
-        if (tag_end == std::string_view::npos || tag_end == header_begin) {
-            return FallbackReason::InvalidToolName;
+        if (!ws_boundary && header_status != ToolHeaderStatus::Complete) {
+            return FallbackReason::MalformedStructure;
         }
-        const std::string_view header = text_.substr(header_begin, tag_end - header_begin);
-        call.name = extract_name_from_tag_header(header);
-        if (!valid_function_name(call.name, max_name_length_)) {
+        if (!is_valid_tool_name(call.name, max_name_length_)) {
             return FallbackReason::InvalidToolName;
         }
         // Strict mode rejects a name outside the declared tool set. Tolerant mode keeps an
@@ -708,7 +572,7 @@ private:
             find_tool_contract(contract_, call.name) == nullptr) {
             return FallbackReason::UndeclaredTool;
         }
-        pos = ws_boundary ? tag_end : tag_end + 1;
+        const std::string_view fn_close = tool_close_literal(opener.kind);
 
         for (;;) {
             skip_format_whitespace(text_, pos);
@@ -727,32 +591,20 @@ private:
     }
 
     FallbackReason parse_parameter(std::size_t& pos, RawToolCall& call) {
-        std::size_t header_begin = 0;
-        std::string_view param_close = "</parameter>";
-        if (starts_with_at(text_, pos, "<parameter")) {
-            header_begin = pos + 10;
-            param_close  = "</parameter>";
-        } else if (starts_with_at(text_, pos, "<param")) {
-            header_begin = pos + 6;
-            param_close  = "</param>";
-        } else {
+        ToolOpenTag opener = {};
+        const ToolHeaderStatus status = parse_tool_parameter_open(text_.substr(pos), opener);
+        if (status != ToolHeaderStatus::Complete) {
             return FallbackReason::MalformedStructure;
         }
-
-        const std::size_t tag_end = text_.find('>', header_begin);
-        if (tag_end == std::string_view::npos || tag_end == header_begin) {
-            return FallbackReason::MalformedStructure;
-        }
-        const std::string_view header = text_.substr(header_begin, tag_end - header_begin);
-        const std::string_view name   = extract_name_from_tag_header(header);
+        const std::string_view name = opener.name;
         if (name.empty()) {
             return FallbackReason::MalformedStructure;
         }
 
-        const std::size_t value_begin = tag_end + 1;
+        const std::size_t value_begin = pos + opener.consumed;
         std::size_t value_end         = 0;
         std::size_t close_len         = 0;
-        if (!find_parameter_close(value_begin, value_end, close_len, param_close)) {
+        if (!find_parameter_close(value_begin, value_end, close_len, opener.kind)) {
             if (tolerant_) {
                 // Tolerant: the region ends before the closing tag, so the output budget cut the
                 // parameter value. Keep the value up to the cut (last occurrence wins, as with a
@@ -795,17 +647,23 @@ private:
     // text the value quotes, such as a command that echoes tool markup.
     bool closes_parameter(std::size_t pos) const {
         skip_format_whitespace(text_, pos);
-        std::size_t tag_end = 0;
-        return pos >= text_.size() || is_param_open_at(text_, pos, tag_end) ||
-               starts_with_at(text_, pos, "</function>") || starts_with_at(text_, pos, "</invoke>");
+        if (pos >= text_.size()) { return true; }
+        ToolOpenTag opener = {};
+        if (parse_tool_parameter_open(text_.substr(pos), opener) == ToolHeaderStatus::Complete) {
+            return true;
+        }
+        return starts_with_at(text_, pos, tool_close_literal(ToolTagKind::Function)) ||
+               starts_with_at(text_, pos, tool_close_literal(ToolTagKind::Invoke));
     }
 
     bool find_parameter_close(std::size_t value_begin, std::size_t& value_end,
-                              std::size_t& close_len, std::string_view required_close) const {
-        std::size_t depth = 1;
-        std::size_t scan  = value_begin;
+                              std::size_t& close_len, ToolTagKind param_family) const {
+        const std::string_view required_close = tool_close_literal(param_family);
+        std::size_t depth      = 1;
+        std::size_t scan       = value_begin;
+        std::size_t next_close = text_.find(required_close, scan);
         while (scan < text_.size()) {
-            if (starts_with_at(text_, scan, required_close)) {
+            if (scan == next_close) {
                 // Closers of parameters the value quotes whole always balance their openers; only
                 // the outermost one must be followed by the grammar's next token.
                 if (depth != 1 || closes_parameter(scan + required_close.size())) { --depth; }
@@ -814,13 +672,15 @@ private:
                     close_len = required_close.size();
                     return true;
                 }
-                scan += required_close.size();
+                scan       += required_close.size();
+                next_close  = text_.find(required_close, scan);
                 continue;
             }
-            std::size_t open_tag_end = 0;
-            if (is_param_open_at(text_, scan, open_tag_end)) {
+            ToolOpenTag nested = {};
+            if (text_[scan] == '<' &&
+                parse_tool_parameter_open(text_.substr(scan), nested) == ToolHeaderStatus::Complete) {
                 ++depth;
-                scan = open_tag_end + 1;
+                scan = scan + nested.consumed;
                 continue;
             }
             ++scan;
@@ -895,7 +755,7 @@ ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text,
                                                  const ToolCallOutputContract& contract,
                                                  bool tolerant) {
     const std::string_view source(text);
-    std::size_t candidate = find_first_tool_marker(source);
+    std::size_t candidate = find_tool_marker(source);
     if (candidate == std::string::npos) { return fallback(text); }
 
     ParsedToolCallOutput out;
@@ -930,7 +790,7 @@ ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text,
         }
         // Retries move only to a later `<tool_call>` wrapper: the markup nested inside a failed
         // region (its `<function=...>` or `<invoke>`) must not re-read a truncated call.
-        candidate = text.find(kToolOpen, candidate + 1);
+        candidate = text.find(tool_open_literal(ToolTagKind::ToolCall), candidate + 1);
     }
     if (accepted == std::string::npos) {
         // No region parsed. A truncated tail that kept no call carries no arguments either, so
@@ -972,7 +832,9 @@ std::string ToolCallOutputDecoder::feed(std::string_view text) {
         const char byte = text[index];
         if (!pending_tag_.empty()) {
             pending_tag_.push_back(byte);
-            if (matches_any_marker(pending_tag_)) {
+            ToolOpenTag marker = {};
+            const ToolMarkerStatus state = classify_tool_marker_prefix(pending_tag_, marker);
+            if (state == ToolMarkerStatus::Complete) {
                 tool_region_ = std::move(trailing_whitespace_);
                 trailing_whitespace_.clear();
                 tool_region_.append(pending_tag_);
@@ -981,7 +843,7 @@ std::string ToolCallOutputDecoder::feed(std::string_view text) {
                 saw_tool_marker_ = true;
                 break;
             }
-            if (!is_prefix_of_any_marker(pending_tag_)) {
+            if (state == ToolMarkerStatus::NotMarker) {
                 visible.append(trailing_whitespace_);
                 trailing_whitespace_.clear();
                 visible.append(pending_tag_);

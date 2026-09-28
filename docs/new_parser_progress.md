@@ -66,6 +66,109 @@ Findings from the baseline read (verified against source, pre-Phase-1):
    non-tag byte, which is the reason the test records. Verified green by build + ctest.
 6. Second CPU regression target identified: `ninfer_qwen3_5_frontend_test` (OutputSession-level
    tool-call integration, `tests/models/qwen3_5/test_frontend.cpp`), CPU-only, run per phase gate.
+### P1.2 Authoritative wire grammar component
+Status: complete
+Files changed: `src/models/qwen3_5/frontend/tool_call_grammar.h` (new), `tool_call_grammar.cpp` (new), `frontend_sources.cmake` (+grammar source)
+Implementation decision: one namespace-scoped authority — tag families (`ToolTagKind`), exact wrapper
+  literals (`tool_open_literal`/`tool_close_literal`), one header grammar
+  (`parse_tool_function_open`/`parse_tool_parameter_open`/`parse_tool_header_after_keyword`) with
+  statuses NoMatch/NeedMore/Complete/Invalid, plus streaming prefix classification
+  (`classify_tool_marker_prefix`) and marker discovery (`find_tool_marker`). Header grammar: short
+  form `=value`, attribute list `attr = value`, or bare opener; quoted values (both quote chars, `>`
+  may appear inside), unquoted values end at whitespace/`>`/`/`; after a value only whitespace or `>`
+  is allowed; the first `name` attribute is the tag name. `ToolOpenTag.consumed` counts from the tag's
+  `<` through the terminating `>`.
+Alternatives rejected: a PEG/GBNF engine (llama.cpp style) — the wire syntax is fixed and small; the
+  hand-written recursive descent returns the same clarity with fewer moving parts and keeps the
+  NeedMore/Complete distinction the streaming decoder requires. Keeping the family in the result —
+  the consumer needs it for family-matched closers, a `name`-only dispatch could not.
+Tests added: none (see P1.3)
+Tests executed: standalone probe harness (temporary, deleted) — grammar verified in isolation before
+  integration: short/attribute/bare headers, quoted names with `>`, marker discovery and prefix
+  classification all correct
+Result: grammar standalone-correct
+Known limitations: none
+Commit: (see P1.5 commit)
+
+### P1.3 Grammar test matrix
+Status: complete
+Files changed: `tests/test_tool_call_grammar.cpp` (new), `tests/models/qwen3_5/tests.cmake` (+grammar test target)
+Implementation decision: direct tests of the public grammar API (no parser indirection), so the
+  grammar's own contract is protected before consumers migrate
+Tests added: `ninfer_tool_call_grammar_test` — function header forms (short/attribute/bare, quote
+  variants, whitespace variations, cut-off prefixes), function name semantics (empty, invalid chars,
+  length limit, `name` attribute vs short value), parameter header forms (parameter/param families,
+  quoted names containing `>`), quote-aware headers (unterminated quote = cut, not silent
+  truncation), marker prefixes (per-byte streaming prefixes; 1/2/3/7 and all-split chunk
+  equivalence), marker discovery (first-marker scan, prose rejection)
+Tests executed: `ctest -R ninfer_tool_call_grammar_test` -> passed
+Result: green
+Known limitations: none
+Commit: (see P1.5 commit)
+
+### P1.4 Migrate marker discovery and consumers to the grammar
+Status: complete
+Files changed: `src/models/qwen3_5/frontend/tool_call_parser.cpp`
+Implementation decision: removed the second marker grammar (`kToolMarkers`, `matches_any_marker`,
+  `is_prefix_of_any_marker`), the header re-implementation (`extract_name_from_tag_header`,
+  `valid_function_name`, `kToolOpen`/`kToolClose`), and the unquoted `unquote` helper; all of
+  `parse_qwen_tool_call_output`, `parse_tool_call`, `parse_function`, `parse_parameter`,
+  `closes_parameter`, `find_parameter_close`, and the streaming decoder's pending-tag logic now take
+  tag rules from the grammar. Behavior changes vs. the old parser (expected, no test pinned the old
+  bytes):
+1. streaming now recognizes attribute-form and long short-form openers (old decoder held only
+   literal prefixes up to 16 bytes and leaked those regions to content, while one-shot parsed them);
+2. a `>` inside a quoted attribute no longer breaks the header (`<parameter filename="a>b" name="x">`
+   now parses the name `x` instead of `a`);
+3. unterminated quotes at the region end are rejected (MalformedStructure) instead of silently
+   truncated;
+4. an attribute value must be followed by whitespace or `>` (missing separator = MalformedStructure);
+5. the boundary lookahead (`closes_parameter`/`find_parameter_close`) now uses the grammar's opener
+   rule instead of its own `is_param_open_at` + literal checks (plan P3 invariant: one source of
+   truth for the "next token after a quoted closer" decision); a malformed opener inside a value no
+   longer counts as a nested opener (grammar-consistent, stricter in the data-swallowing direction);
+6. strict mode maps a broken function header to MalformedStructure where the old broken-name
+   fallback produced InvalidToolName (reason change only; no test pinned the old reason).
+Tests added: none (existing matrix carries the semantics; new cases in P1.5)
+Tests executed: none yet (build in progress)
+Result: (see P1.5)
+Known limitations: none
+Commit: (see P1.5 commit)
+
+### P1.5 One-shot semantics via the same grammar + parser-level matrix
+Status: complete
+Files changed: `tests/test_tool_call_parser.cpp` (+2 test functions, registered in main)
+Implementation decision: the public API is unchanged (`parse_qwen_tool_call_output`,
+  `ToolCallOutputDecoder`, `build_tool_call_output_contract`); one-shot and streaming go through the
+  same grammar by construction (same functions, same literals)
+Tests added: `test_grammar_header_forms_one_shot` (attribute form, spaces around `=`, tab/newline
+  after the keyword, both quote chars, quoted `>` in a parameter attribute, broken header ->
+  verbatim fallback with MalformedStructure: missing separator, empty unquoted value, unterminated
+  quote) and `test_streaming_recognizes_grammar_markers` (byte-wise feeds of attribute-form,
+  long short-form, and invoke attribute-form openers with prose prefix: marker recognized, call
+  committed, no byte lost or duplicated)
+Tests executed: `ctest -R "parser|grammar|frontend"` -> 3/3 passed (0.51 s total)
+Result: Phase 1 gate green — `ninfer_tool_call_parser_test`, `ninfer_tool_call_grammar_test`,
+  `ninfer_qwen3_5_frontend_test`
+Verification finding (bug found and fixed during this gate): `parse_function`'s Complete branch
+  advanced `pos = header_base + opener.consumed`, but `consumed` already counts from the tag's `<`
+  including the keyword, so `pos` overshot the tag end by 9-11 bytes. Symptom: every success-path
+  test failed while every fallback-path test passed, and the pre-fix frontend test hung in the
+  OutputSession feed loop. Isolated with a standalone grammar probe (grammar 100% green) and fixed
+  to `pos += opener.consumed`; all gates re-run green afterwards.
+Known limitations: none
+Commit: this commit
+
+## Environment note (2026-09-28)
+- `ninfer_qwen3_5_frontend_test` links the FFMPEG DLLs dynamically (avcodec-63, avformat-63,
+  avutil-61, swscale-10, z + transitive avdevice/swresample). `ninfer_stage_test_runtime_dlls` is
+  only applied to `ninfer_device_test`, and this machine's PATH does not include
+  `F:\GIT\vcpkg\installed\x64-windows\bin`, so the frontend test exe fails to load (shell exit 53)
+  unless the DLLs are reachable. Workaround: the vcpkg DLLs were copied into
+  `build-new-parser/tests/Release/` (build-dir only; no repo change). The frontend test was never
+  executed at the P0 baseline (only the parser test was); the Phase 1 gate executes it and it is
+  green.
+
 
 ## Phase 2
 (pending)

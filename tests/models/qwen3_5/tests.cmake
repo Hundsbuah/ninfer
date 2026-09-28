@@ -120,6 +120,10 @@ ninfer_add_test(ninfer_tool_call_parser_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../../test_tool_call_parser.cpp"
   LIBRARIES ninfer_engine ninfer::json)
 
+ninfer_add_test(ninfer_tool_call_grammar_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../../test_tool_call_grammar.cpp"
+  LIBRARIES ninfer_engine ninfer::json)
+
 ninfer_add_test(ninfer_qwen3_5_visual_scatter_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_visual_scatter.cpp"
   LIBRARIES ninfer_engine ninfer_core)
