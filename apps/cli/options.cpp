@@ -90,6 +90,7 @@ std::string usage_text(const char* argv0) {
            "       [--ngram-draft-tokens 1..63] [--ngram-min-match 4..64]\n"
            "       [--temperature F] [--top-p F] [--top-k N] [--min-p F]\n"
            "       [--presence-penalty F] [--frequency-penalty F] [--seed N] [--greedy]\n"
+           "       [--constrained-tool-decoding off|tool-calls-only]\n"
            "       [--stop-token-id N]... [--stop <text>]... [--reasoning-stop <text>]...\n"
            "       [--chat-template FILE]\n"
            "       [--raw-output] [--print-token-ids] [--no-thinking] [--thinking-budget N]\n"
@@ -147,6 +148,7 @@ std::string usage_text(const char* argv0) {
            "  --frequency-penalty F    -2 to 2\n"
            "  --seed N                 fixed random seed\n"
            "  --greedy                 force temperature 0 (exact argmax)\n"
+           "  --constrained-tool-decoding M  grammar-constrained tool decoding (off|tool-calls-only; default off)\n"
            "  --stop-token-id N...     stop token ids\n"
            "  --stop <text>...         stop on this text\n"
            "  --reasoning-stop <text>  stop reasoning on this text\n"
@@ -307,6 +309,15 @@ Options parse_options(int argc, char** argv) {
             options.sampling.seed = parse_u64(value(arg), "seed");
         } else if (arg == "--greedy") {
             options.greedy = true;
+        } else if (arg == "--constrained-tool-decoding") {
+            const std::string mode = value(arg);
+            if (mode == "off") {
+                options.constrained_tool_decoding = ConstrainedToolDecoding::Off;
+            } else if (mode == "tool-calls-only") {
+                options.constrained_tool_decoding = ConstrainedToolDecoding::ToolCallsOnly;
+            } else {
+                throw std::invalid_argument("--constrained-tool-decoding must be off or tool-calls-only");
+            }
         } else if (arg == "--log-level") {
             options.log_level = product::parse_log_level(value(arg));
         } else {

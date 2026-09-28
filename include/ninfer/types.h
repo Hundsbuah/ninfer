@@ -269,6 +269,13 @@ struct ContextCostOptions {
     std::filesystem::path preset_path;
 };
 
+// Grammar-constrained tool decoding: restricts the token support of the tool-call wire
+// syntax while a tool region is being generated. Off leaves sampling unchanged.
+enum class ConstrainedToolDecoding : std::uint8_t {
+    Off,          // default: sampling is unconstrained
+    ToolCallsOnly // constrain the support while a tool region is open (prose stays free)
+};
+
 struct EngineOptions {
     std::filesystem::path artifact_path;
     std::filesystem::path chat_template_path;
@@ -311,6 +318,9 @@ struct EngineOptions {
     // Upper bound on merged tokens per vision item; zero leaves the compiled limit.
     std::uint32_t vision_max_merged_tokens = 32768;
     bool use_cuda_graph                    = true;
+    // Grammar-constrained tool decoding (feature flag; Off is the default and the sampling
+    // path stays bit-identical when Off).
+    ConstrainedToolDecoding constrained_tool_decoding = ConstrainedToolDecoding::Off;
     ContextCacheOptions context_cache;
     ContextCostOptions context_cost;
     StartupObserver startup_observer;

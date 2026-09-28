@@ -234,7 +234,92 @@ Commit deviation: P2 and P3 share files deeply (the state machine is both the P2
   recovery policy` (plan §8 recommended per-step commits; deviation recorded here and in §12 DoD)
 
 ## Phase 4
-(pending)
+### P4.1–P4.2 Design doc + llama.cpp grammar research
+Status: complete
+Files changed: `docs/new_parser_phase4_design.md` (new)
+Content: sampling data flow (logits -> mask -> sample), where the constraint state lives (per-request
+  OutputSession, not sampling internals), speculative-decode interaction (grammar state must be the
+  commit point's state, never the draft's), lazy activation (prose stays unconstrained until the
+  full `<tool_call>` marker is seen; the constraint then owns the whole region until its close),
+  token/byte semantics (the mask consumes decoded UTF-8 bytes of the accepted prefix, never raw
+  token ids), rollback/checkpoint contract for speculative paths, and the acceptance gate for a
+  later sampling-integration change. Research log above (2026-09-28 llama.cpp entry) is the primary
+  source for the architecture.
+Commit: this commit
+
+### P4.3–P4.6 Pure CPU grammar-state core (ToolCallGrammarConstraint)
+Status: complete
+Files changed: `src/models/qwen3_5/frontend/tool_call_grammar_state.h` (new),
+  `tool_call_grammar_state.cpp` (new), `frontend_sources.cmake` (+source), `tool_call_stream.h/.cpp`
+  (+public `parse_tool_call_region` with the `prefix` policy flag and the `policy.prefix` branches:
+  a machine state that is still open at the input end is a legal partial prefix, not a break — the
+  constraint's streaming contract)
+Implementation decision: a per-request `ToolCallGrammarConstraint` that advances on decoded UTF-8
+  bytes and exposes `check` (verdict without mutation), `commit`, `active`, `finished`,
+  `observed_bytes`. While inactive it tracks the `<tool_call>` marker prefix (single source: the
+  grammar's `classify_tool_marker_prefix`); at the marker it buffers the region and re-parses the
+  full region with the Phase-3 `ToolCallParsePolicy` (strict policy, prefix mode) on every step —
+  the machine stays the single authority, the constraint only owns state. `check` copies the state,
+  so the verdict is computed without mutation (speculative sampling can probe without committing).
+  `ToolCallParsePolicy` gains `prefix` (default false; one-shot parsing is byte-identical to before —
+  pinned by the existing P1/P2/P3 matrix).
+Speculative semantics (implemented at the state level, per the design doc): commit is the only
+  mutation point; `check` is pure; a draft/sampling path that must roll back re-advances a copy.
+Sampling integration: intentionally NOT wired into the logits path in this phase (plan gate: build-
+  verified CPU core + tests only). The sampling interface design is documented in
+  `docs/new_parser_phase4_design.md` with the acceptance gate.
+Known limitations: O(n^2) re-parse per committed byte (n = region length); acceptable for
+  tool-call regions at this phase's gate, the design doc records the incremental alternative.
+
+### P4.7 Feature flag (default off)
+Status: complete
+Files changed: `include/ninfer/types.h` (`ConstrainedToolDecoding` enum +
+  `EngineOptions::constrained_tool_decoding`, default `Off`), `apps/cli/options.h/.cpp` (member +
+  `--constrained-tool-decoding=off|tool-calls-only` flag + help text), `apps/cli/main.cpp` (mapping
+  into `EngineOptions`)
+Implementation decision: the flag exists end-to-end (CLI -> EngineOptions) but the engine sampling
+  path ignores it in this phase (default Off keeps the sampling path bit-identical; the CPU core is
+  the deliverable, per the plan gate).
+
+### P4.8 CPU tests + gate
+Status: complete
+Tests added: `tests/test_tool_call_grammar_state.cpp` (new target `ninfer_tool_call_grammar_state_test`)
+  — 30 tests: marker tracking (byte-wise accumulation, false-prefix clearing, trigger boundary),
+  region buffering (observed_bytes accounting), parse-policy pinning (full region Complete, cut
+  prefixes EndOfInput, broken prefix Definitive), check/commit asymmetry (check never mutates),
+  finished/active transitions, and an exhaustive all-byte-splits streaming equivalence test (every
+  split point of a realistic region with embedded newlines and `<markup>`: one-byte + long-tail
+  candidates must all be accepted and finish exactly once).
+Tests executed: `ctest -R "tool_call|output_session|serving|cli"` -> 4/4 passed
+  (ninfer_cli_options_test, ninfer_tool_call_parser_test, ninfer_tool_call_grammar_test,
+  ninfer_tool_call_grammar_state_test); full CPU suite re-run at the phase gate.
+Result: Phase 4 gate green (build-verified, CPU-only, flag default off)
+Known limitations: no GPU runtime verification (constraint); no sampling integration (by gate scope)
+Commit: this commit
+
+### P4 finding (root cause of the flaky byte-split test, recorded per the reporting rules)
+The all-byte-splits streaming test rejected one layout-dependent byte position in early builds.
+Root cause: the test itself, not the machine. The test declared `const std::string region` and
+derived `const std::string_view first = region.substr(pos, 1)` — `std::string::substr` returns a
+temporary `std::string`, so `first`/`second` were views into freed heap memory (use-after-free).
+The bytes "worked" until the heap reused that block, then corrupted at a layout-dependent position.
+Fix: `region` is a `std::string_view` over the string literal (static storage; `substr` returns a
+stable view). Production code was audited for the same pattern (grep `string_view x = y.substr(`
+across src/include/apps): every hit reads from a `std::string_view` receiver (view, no temporary) —
+`tool_call_grammar.cpp:96`, `tool_call_stream.cpp:241`, `log_colour.h:275`, and the constraint's
+`advance` (string_view parameter) — all safe. The constraint core and the Phase-3 machine are
+unaffected; the machine's parse of the full valid region is deterministic `Complete + None`
+(verified 5x in a throwaway probe, probe deleted).
+
+### Final CPU-only verification (all phases, 2026-09-28)
+Command: `ctest --test-dir build-new-parser -C Release --output-on-failure --parallel 8` (full suite)
+Result: 160/161 passed on the first run; the single failure (`ninfer_chat_templates_test`)
+  was environmental, not a code regression: it runs `tests/text/test_chat_templates.py` with the
+  system Python 3.14 (the AGENTS.md miniconda py311 path does not exist on this Windows machine;
+  ctest resolves Python from PATH), which lacked `jinja2`. Installed `jinja2 3.1.6` into that
+  interpreter (test dependency, task-required) and re-ran: **161/161 CPU tests passed**
+  (the 14 `_real` GPU tests are Skipped by design: no GPU runtime tests per the plan constraints).
+Environment note: `jinja2` is now a required module of the PATH Python for the CPU suite.
 
 ## Open Questions
 - (none yet)

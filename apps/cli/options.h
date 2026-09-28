@@ -51,6 +51,8 @@ struct Options {
     // Omitted fields are resolved from the loaded model and rendered prompt mode by Engine.
     SamplingOverrides sampling;
     bool greedy                 = false;
+    // Grammar-constrained tool decoding (default off: the sampling path stays unchanged).
+    ConstrainedToolDecoding constrained_tool_decoding = ConstrainedToolDecoding::Off;
     product::LogLevel log_level = product::LogLevel::Info;
 };
 

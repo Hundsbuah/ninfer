@@ -10,6 +10,13 @@ constexpr std::string_view kImStartMarker = "|im_start|>";
 bool starts_with_at(std::string_view text, std::size_t pos, std::string_view literal) noexcept {
     return pos <= text.size() && text.substr(pos, literal.size()) == literal;
 }
+// True when the bytes from pos form a non-empty proper prefix of `literal` (an in-progress
+// write of that literal, cut off at the slice end).
+bool is_strict_prefix_of(std::string_view literal, std::string_view text, std::size_t pos) noexcept {
+    const std::size_t len = text.size() - pos;
+    return len > 0 && len < literal.size() && literal.compare(0, len, text.substr(pos, len)) == 0;
+}
+
 
 std::size_t skip_ws(std::string_view text, std::size_t pos) noexcept {
     while (pos < text.size() && is_tool_format_whitespace(text[pos])) { ++pos; }
@@ -143,6 +150,12 @@ ToolCallParseProgress parse_region(std::string_view text, const ToolCallParsePol
                 complete();
                 return out;
             }
+            if (policy.prefix && s.inside_function_calls &&
+                is_strict_prefix_of(tool_close_literal(ToolTagKind::FunctionCalls), text, i)) {
+                // An in-progress </function_calls> close at the slice end.
+                truncated(false);
+                return out;
+            }
             if (starts_with_at(text, i, tool_open_literal(ToolTagKind::ToolCall))) {
                 s.pos                  = i + tool_open_literal(ToolTagKind::ToolCall).size();
                 s.wrapper_close_expected = true;
@@ -166,6 +179,15 @@ ToolCallParseProgress parse_region(std::string_view text, const ToolCallParsePol
                 s.pos  = i;
                 s.mode = RegionState::Mode::FunctionHeader;
                 continue;
+            }
+            if (policy.prefix &&
+                (opener_status == ToolHeaderStatus::NeedMore ||
+                 is_strict_prefix_of(tool_open_literal(ToolTagKind::ToolCall), text, i) ||
+                 is_strict_prefix_of(tool_open_literal(ToolTagKind::FunctionCalls), text, i))) {
+                // An in-progress opener or wrapper literal at the slice end: the generated
+                // prefix may still complete into a valid structure.
+                truncated(false);
+                return out;
             }
             // A byte that is not a marker: trailing text after complete calls, or a broken
             // region start. A definitive structural outcome: tolerant recovery commits the
@@ -285,10 +307,18 @@ ToolCallParseProgress parse_region(std::string_view text, const ToolCallParsePol
                 continue;
             }
             ToolOpenTag opener = {};
-            if (parse_tool_parameter_open(text.substr(i), opener) == ToolHeaderStatus::Complete) {
+            const ToolHeaderStatus param_status = parse_tool_parameter_open(text.substr(i), opener);
+            if (param_status == ToolHeaderStatus::Complete) {
                 s.pos  = i;
                 s.mode = RegionState::Mode::ParameterHeader;
                 continue;
+            }
+            if (policy.prefix &&
+                (param_status == ToolHeaderStatus::NeedMore ||
+                 is_strict_prefix_of(tool_close_literal(s.fn_family), text, i))) {
+                // An in-progress parameter opener or function close at the slice end.
+                truncated(false);
+                return out;
             }
             invalid(ToolCallParseFailure::MalformedStructure);
             return out;
@@ -394,6 +424,11 @@ ToolCallParseProgress parse_region(std::string_view text, const ToolCallParsePol
                 s.mode = RegionState::Mode::Top;
                 continue;
             }
+            if (policy.prefix && is_strict_prefix_of(tool_close_literal(ToolTagKind::ToolCall), text, i)) {
+                // An in-progress </tool_call> close at the slice end.
+                truncated(false);
+                return out;
+            }
             invalid(ToolCallParseFailure::MalformedStructure);
             return out;
         }
@@ -402,6 +437,9 @@ ToolCallParseProgress parse_region(std::string_view text, const ToolCallParsePol
 }
 
 } // namespace
+ToolCallParseProgress parse_tool_call_region(std::string_view text, const ToolCallParsePolicy& policy) {
+    return parse_region(text, policy);
+}
 
 ToolCallStreamParser::ToolCallStreamParser(ToolCallParsePolicy policy) : policy_(policy) {}
 

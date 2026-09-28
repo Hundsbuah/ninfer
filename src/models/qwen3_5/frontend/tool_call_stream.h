@@ -55,6 +55,11 @@ struct ParsedToolRegion {
 struct ToolCallParsePolicy {
     std::size_t max_name_length = 64;
     bool tolerant               = false;
+    // Evaluate `text` as a generated prefix instead of a complete region: a structure cut
+    // off at the slice end (an in-progress opener, wrapper, or close literal) reports
+    // EndOfInput rather than a definitive break. A byte that is not a prefix of any valid
+    // continuation is still definitive. The Phase-4 grammar-constraint core uses this mode.
+    bool prefix = false;
     bool enforce_declared_names = false;
     bool (*declared_check)(const void* contract, std::string_view name) = nullptr;
     const void* contract = nullptr;
@@ -169,6 +174,12 @@ struct ToolCallStreamResult {
 //                   grammar's next-token lookahead after a quoted closer) -> FunctionBody
 //   function close -> ExpectWrapperClose (tool_call wrapper) | Top (bare / function_calls)
 //   Top -> next call | wrapper close | end | trailing
+
+// The strict region parse (single source of truth for in-region legality): parses `text` as a
+// complete tool region and reports where it ended. Independent of any recovery policy;
+// the Phase-4 grammar-constraint core consumes it directly.
+[[nodiscard]] ToolCallParseProgress parse_tool_call_region(std::string_view text,
+                                                           const ToolCallParsePolicy& policy);
 
 class ToolCallStreamParser {
 public:
