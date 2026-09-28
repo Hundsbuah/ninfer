@@ -321,6 +321,17 @@ Result: 160/161 passed on the first run; the single failure (`ninfer_chat_templa
   (the 14 `_real` GPU tests are Skipped by design: no GPU runtime tests per the plan constraints).
 Environment note: `jinja2` is now a required module of the PATH Python for the CPU suite.
 
+### Final CPU re-verification (delivered tree, 2026-09-29)
+Command: `ctest --test-dir build-new-parser -C Release --output-on-failure --parallel 8` (full suite)
+State: branch `test3` at `ff784035`, worktree clean (re-verification of the delivered tree; no code
+  changes since the 161/161 run above)
+Result: **161/161 CPU tests passed** (100% tests passed out of 161; total 981.68 s, parallel 8).
+  The 14 `_real` GPU tests remain Skipped by design (no GPU runtime tests per the plan constraints).
+Build note: a bare `cmake --build` (without `--config`) in this session first rebuilt the Debug
+  configuration (a reconfigure had invalidated its incremental state; its DLL-staging target also
+  needed `build-new-parser/tests/Debug` to exist, created in the build dir only). The Release
+  configuration was up to date (4.5 s) and is the one verified here.
+
 ## Phase 5
 ### P5.1 Documentation update (serving.md, cli.md, tool_call_parser.md)
 Status: complete
