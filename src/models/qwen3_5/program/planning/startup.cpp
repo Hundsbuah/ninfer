@@ -304,9 +304,13 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     const auto drafts = static_cast<std::int32_t>(plan.draft_window);
     const auto verify = drafts + 1;
     const ops::CausalAttentionExecutionEnvelope text_envelope{1, plan.capacity};
-    // Prefill chunks run with the small-prefill route hint (see execution/text.cpp).
+    // Prefill chunks run with the small-prefill route hint and the selected prompt kernel, whose
+    // fast K8V4 form may split keys into workspace (see execution/text.cpp).
     const ops::CausalAttentionExecutionEnvelope prefill_envelope{
-        .min_visible_keys = 1, .max_visible_keys = plan.capacity, .small_prefill = true};
+        .min_visible_keys   = 1,
+        .max_visible_keys   = plan.capacity,
+        .fast_prompt_kernel = plan.fast_prefill_kernel,
+        .small_prefill      = true};
     const ops::CausalAttentionExecutionEnvelope verify_envelope{1, plan.capacity,
                                                                 plan.ngram_draft_window > 15};
 
@@ -1032,10 +1036,17 @@ namespace {
 bool uses_fast_int8_prefill(const EngineOptions& options) {
     return options.kv_cache == KvCacheStorage::Int8Group64 && !options.original_int8_prefill_kernel;
 }
+
+// INT8 and K8V4 KV prefill with their fast prompt kernels unless the original one was selected.
+bool uses_fast_prefill_kernel(const EngineOptions& options) {
+    return uses_fast_int8_prefill(options) ||
+           (options.kv_cache == KvCacheStorage::Fp8KeyNvfp4Value &&
+            !options.original_k8v4_prefill_kernel);
+}
 } // namespace
 
-// Every chunk but a prompt's last one has the effective width, so with the fast prefill kernel it
-// is rounded down to whole prompt-attention waves, keeping each full chunk's attention free of a
+// Every chunk but a prompt's last one has the effective width, so with the fast INT8 prefill kernel
+// it is rounded down to whole prompt-attention waves, keeping each full chunk's attention free of a
 // partial last wave.
 std::uint32_t effective_prefill_chunk(const execution::Parameters& parameters,
                                       const EngineOptions& options) {
@@ -1061,7 +1072,7 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         .capacity            = options.max_context,
         .max_concurrency     = options.max_concurrency,
         .prefill_chunk       = effective_prefill_chunk(parameters, options),
-        .fast_prefill_kernel = uses_fast_int8_prefill(options),
+        .fast_prefill_kernel = uses_fast_prefill_kernel(options),
         .draft_window =
             std::max(options.speculative.draft_tokens, options.speculative.ngram_draft_tokens),
         .speculative_backend = options.speculative.backend,

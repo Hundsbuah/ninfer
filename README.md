@@ -25,7 +25,8 @@ for creating NInfer!
    design – I found the upstream system to be too complex and fragile) – it is gated behind the
    launch parameter `--use-original-prefix-caching`
 4. prefills with a faster prompt-attention kernel by default when using int8 (Hadamard rotated)
-   for KV cache; the original kernel remains available with `--use-original-int8-prefill-kernel`
+   or k8v4 for KV cache; the original kernels remain available with
+   `--use-original-int8-prefill-kernel` and `--use-original-k8v4-prefill-kernel`
 5. adds ngram-mod copy drafting (based on an implementation by
    [remesis](https://github.com/remesis)) to significantly increase the speed of copy-heavy
    workloads
@@ -447,6 +448,23 @@ BF16 KV.
 - **Short prefill steps over long contexts use split-KV attention**: 32 new tokens against 180K
   cached tokens take 1.06 ms per attention layer instead of 9.5 ms.
   Commit: [`c1a59aa`][c-small-prefill].
+- **Faster K8V4 KV attention** (default for `--kv-dtype k8v4`; `--use-original-k8v4-prefill-kernel`
+  keeps the original prefill kernel). K8V4 prefill runs a new prompt kernel
+  (`src/ops/softmax_attention/dense/causal_cache/prompt_k8v4_fast.cuh`): each warp keeps 16 query
+  rows in registers for the whole key sweep, decodes the NVFP4 V rows in registers, accumulates
+  each 64-key tile in FP16 and applies the inverse rotation in registers. A single-row prompt
+  launch whose row blocks would leave SMs idle splits every row block's keys across CTAs and
+  merges their partial rows, in at most 64 MiB of workspace. K8V4 decode runs 32-key tiles at two
+  CTAs per SM and six-warp CTAs for three row tiles, rounds batched split counts to whole waves,
+  folds the output gate into the reduce, and computes verification widths 9-16 as co-scheduled
+  8-column chunks that read each key tile from DRAM once. Per full-attention layer (27B geometry,
+  RTX 5090, cold L2, against the previous build): prefill -29 % geometric mean over 256-4096 new
+  tokens at 16K-128K cached keys (-53 % at 256 tokens, -20 % at 1024, -1 to -4 % at 2048, -17 to
+  -21 % at 3584-4096); decode -14 % over 1-8 requests, 1-16 columns and 8K-128K keys under a 240K
+  Graph envelope (up to -40 %; one request with 8 columns at 8K is 13 % and eight requests with 16
+  columns at 8K 3 % slower). End to end, a 128K-token prompt prefills 11.5 % faster (32K: 2.9 %)
+  and single-stream MTP decode is 0.5-1.6 % faster. Perplexity over 64K-token windows moves by
+  +1.4e-3 nats per token (about one standard error; 4K windows unchanged).
 - **FP8 Tensor Core MMA on the MX datapath** (upstream PR #328 by
   [DuncanBetts](https://github.com/DuncanBetts)): the shared E4M3 MMA helper issues the
   block-scaled `kind::mxf8f6f4` form with unit scales, which computes the same dot products bit

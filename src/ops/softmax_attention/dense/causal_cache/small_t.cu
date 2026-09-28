@@ -224,6 +224,29 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
     CUDA_CHECK(cudaGetLastError());
 }
 
+// K8V4 batch rows share one grid of KVHeads x splits x B CTAs. At long contexts the page-safety
+// floor sets the split count, which can leave a nearly empty last wave (B=2: 488 CTAs on 340
+// two-per-SM slots). Rounding down to whole waves keeps every wave full; each split then covers
+// more keys. The K8V4 partial kernel reads page IDs past its 64 staged ones from the block table,
+// so a split may exceed the page-safety span. The slots follow the partial kernel's launch
+// profile: two CTAs per SM, except one for three row tiles at B=2-3.
+std::int32_t k8v4_whole_wave_splits(std::int32_t splits, std::int32_t tokens,
+                                    std::int32_t batch_size) {
+    static const int multiprocessors = [] {
+        int device = 0;
+        int count  = 0;
+        CUDA_CHECK(cudaGetDevice(&device));
+        CUDA_CHECK(cudaDeviceGetAttribute(&count, cudaDevAttrMultiProcessorCount, device));
+        return count;
+    }();
+    const std::int32_t row_tiles = div_up(tokens * CausalD256H24Kv4::GroupSize, 16);
+    const std::int32_t per_sm    = row_tiles == 3 && (batch_size == 2 || batch_size == 3) ? 1 : 2;
+    const std::int32_t per_wave =
+        multiprocessors * per_sm / (CausalD256H24Kv4::KVHeads * batch_size);
+    if (per_wave <= 0 || splits <= per_wave) { return splits; }
+    return splits / per_wave * per_wave;
+}
+
 } // namespace
 
 std::int32_t causal_attention_split_capacity(std::int32_t q_heads, std::int32_t tokens,
@@ -254,7 +277,11 @@ std::int32_t causal_attention_split_capacity(std::int32_t q_heads, std::int32_t 
             // A split stages at most 64 physical-page IDs. Leave two 64-key pages for
             // key-tile rounding and page alignment at the 262144-key resource limit.
             const int page_limit = div_up(static_cast<int>(envelope.max_visible_keys), 3968);
-            return std::min(capacity, std::max({4, grid_limit, page_limit}));
+            const int splits     = std::min(capacity, std::max({4, grid_limit, page_limit}));
+            if (cache_storage == KvCacheStorage::Fp8KeyNvfp4Value) {
+                return k8v4_whole_wave_splits(splits, tokens, batch_size);
+            }
+            return splits;
         }
         return capacity;
     }
@@ -393,7 +420,7 @@ void causal_attention_small_t_launch(const Tensor& q, const Tensor& k, const Ten
     if (cache.storage == KvCacheStorage::Fp8KeyNvfp4Value) {
         causal_attention_small_t_k8v4_launch(q, k, v, pos, valid_columns, table_rows, scale, cache,
                                              envelope, column_begin, width, partial_acc, partial_m,
-                                             partial_l, out, stream);
+                                             partial_l, out, stream, gate);
         return;
     }
     if (cache.storage == KvCacheStorage::Fp8E4M3Row256) {
@@ -435,8 +462,8 @@ void causal_attention_cached_small_t_launch(const Tensor& q, const Tensor& pos, 
                                             Tensor& partial_acc, Tensor& partial_m,
                                             Tensor& partial_l, Tensor& out, cudaStream_t stream) {
     if (cache.storage == KvCacheStorage::Fp8KeyNvfp4Value) {
-        causal_attention_cached_small_t_k8v4_launch(q, pos, scale, cache, envelope, partial_acc,
-                                                    partial_m, partial_l, out, stream);
+        causal_attention_cached_small_t_k8v4_launch(q, pos, scale, cache, envelope, 0, q.ne[2], 1,
+                                                    partial_acc, partial_m, partial_l, out, stream);
         return;
     }
     if (cache.storage == KvCacheStorage::Fp8E4M3Row256) {

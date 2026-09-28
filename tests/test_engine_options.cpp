@@ -41,14 +41,16 @@ int main() {
     }
     int failures = 0;
     ninfer::EngineOptions options;
-    // Without the opt-out every KV format passes this check; INT8 then takes the fast kernel.
+    // Without an opt-out every KV format passes this check; INT8 and K8V4 then take their fast
+    // kernels.
     for (const auto storage :
          {ninfer::KvCacheStorage::BFloat16, ninfer::KvCacheStorage::Int8Group64,
-          ninfer::KvCacheStorage::Nvfp4Group16}) {
+          ninfer::KvCacheStorage::Nvfp4Group16, ninfer::KvCacheStorage::Fp8KeyNvfp4Value}) {
         options.kv_cache       = storage;
         bool invalid_argument  = false;
         const std::string what = construction_error(options, invalid_argument);
-        failures += check(what.find("INT8 KV") == std::string::npos,
+        failures += check(what.find("INT8 KV") == std::string::npos &&
+                              what.find("K8V4 KV") == std::string::npos,
                           "the default prefill kernel choice was rejected");
     }
     options.original_int8_prefill_kernel = true;
@@ -62,11 +64,32 @@ int main() {
                   "the original INT8 prefill kernel was accepted without the INT8 KV cache");
     }
     // With INT8 KV the options pass, so construction proceeds to (and fails on) the artifact.
-    options.kv_cache       = ninfer::KvCacheStorage::Int8Group64;
-    bool invalid_argument  = false;
-    const std::string what = construction_error(options, invalid_argument);
-    failures += check(what.find("INT8 KV") == std::string::npos,
-                      "the original INT8 prefill kernel was rejected with the INT8 KV cache");
+    options.kv_cache = ninfer::KvCacheStorage::Int8Group64;
+    {
+        bool invalid_argument  = false;
+        const std::string what = construction_error(options, invalid_argument);
+        failures += check(what.find("INT8 KV") == std::string::npos,
+                          "the original INT8 prefill kernel was rejected with the INT8 KV cache");
+    }
+    options.original_int8_prefill_kernel = false;
+    options.original_k8v4_prefill_kernel = true;
+    for (const auto storage :
+         {ninfer::KvCacheStorage::BFloat16, ninfer::KvCacheStorage::Int8Group64,
+          ninfer::KvCacheStorage::Nvfp4Group16}) {
+        options.kv_cache       = storage;
+        bool invalid_argument  = false;
+        const std::string what = construction_error(options, invalid_argument);
+        failures +=
+            check(invalid_argument && what.find("K8V4 KV") != std::string::npos,
+                  "the original K8V4 prefill kernel was accepted without the K8V4 KV cache");
+    }
+    options.kv_cache = ninfer::KvCacheStorage::Fp8KeyNvfp4Value;
+    {
+        bool invalid_argument  = false;
+        const std::string what = construction_error(options, invalid_argument);
+        failures += check(what.find("K8V4 KV") == std::string::npos,
+                          "the original K8V4 prefill kernel was rejected with the K8V4 KV cache");
+    }
     std::cout << (failures == 0 ? "PASS" : "FAIL") << " Engine option validation\n";
     return failures == 0 ? 0 : 1;
 }

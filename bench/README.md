@@ -65,6 +65,7 @@ ninfer_bench --weights <artifact.ninfer>
           [-r, --repetitions <n>] [--warmup <n>]
           [--max-ctx <tokens>] [--prefill-chunk <tokens>]
           [--kv-dtype <bf16|int8|fp8|nvfp4|k8v4>] [--use-original-int8-prefill-kernel]
+          [--use-original-k8v4-prefill-kernel]
           [--spec <mtp|dflash|dflash2> --draft-tokens <n>] [--lm-head-draft]
           [--device <id>] [--no-cuda-graph] [--profile-measured]
           [-o, --output <table|json|csv>] [--output-file <path>]
@@ -566,10 +567,14 @@ choices. `all` emits every storage mode as an independent row.
 
 Append-and-attend accepts `--batch 1,2,4,8`; each ordinary `--context L` point gives every row the
 same context and all `W` columns are valid. `--fast-prompt` and `--small-prefill` set the matching
-envelope hints: the fast INT8 prompt kernel, and chunked small-T for single-row widths 17-64 over a
-long context. `--gate standalone|fused` adds the attention output gate. One exact mixed profile
+envelope hints: the fast INT8 and K8V4 prompt kernels, and chunked small-T for single-row widths
+17-64 over a long context. `--gate standalone|fused` adds the attention output gate. One exact mixed profile
 uses `--row-contexts`, `--valid-columns`, and `--table-rows`, each with exactly `B` entries.
-Cached-only remains B=1. The timed call consumes the whole batch once; metadata copies and graph
+Cached-only remains B=1. The execution envelope is exact (`[visible, visible]`) by default;
+`--envelope-max N` uses `[1, max(visible, N)]` instead, as production decode Graphs do with their
+context capacity. The envelope can change split capacity (for example through the page-safety
+floor), so decode results meant to represent a server should pass its `--max-context`. Block-table
+pages past the populated context are never read and consume no KV memory. The timed call consumes the whole batch once; metadata copies and graph
 capture remain outside the interval. Uniform full-width profiles use the dense public contract;
 exact partial profiles use device-resident valid extents. Q/K/V contain nonuniform finite values;
 initial cache rows are encoded by the public KV append Op before timing. Reported useful

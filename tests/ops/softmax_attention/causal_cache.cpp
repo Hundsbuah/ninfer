@@ -22,6 +22,7 @@
 #include "core/device.h"
 #include <span>
 #include <string>
+#include <utility>
 #include <vector>
 
 using namespace ninfer;
@@ -2344,16 +2345,27 @@ int run_quantized_batch_cases(KvCacheStorage storage, std::uint32_t seed) {
                                 {7, 0, 5, 2, 6, 1, 4, 3},
                                 MappingPattern::Fragmented,
                                 seed + 3u});
-    if (storage == KvCacheStorage::Nvfp4Group16) {
-        failures += run_batch_case(kGeometries[0], storage,
-                                   {12,
-                                    {0, 17, 61, 127, 0, 128, 63, 31},
-                                    {12, 11, 1, 0, 7, 3, 0, 12},
-                                    {7, 0, 4, 2, 6, 1, 5, 3},
-                                    MappingPattern::Fragmented,
-                                    seed + 4u,
-                                    true});
-    }
+    // Chunked widths past a page: K8V4 co-schedules the full chunks over the appended cache, so
+    // W=12 has one full chunk and a tail and W=16 two full chunks and no tail.
+    failures += run_batch_case(kGeometries[0], storage,
+                               {12,
+                                {0, 17, 61, 127, 0, 128, 63, 31},
+                                {12, 11, 1, 0, 7, 3, 0, 12},
+                                {7, 0, 4, 2, 6, 1, 5, 3},
+                                MappingPattern::Fragmented,
+                                seed + 4u,
+                                true});
+    failures += run_batch_case(kGeometries[0], storage,
+                               {16,
+                                {4093, 57, 1030, 0},
+                                {16, 9, 8, 0},
+                                {2, 0, 3, 1},
+                                MappingPattern::Fragmented,
+                                seed + 5u,
+                                true});
+    failures += run_batch_case(
+        kGeometries[1], storage,
+        {16, {2047, 0, 700}, {16, 13, 6}, {1, 2, 0}, MappingPattern::Offset, seed + 6u});
     return failures;
 }
 
@@ -2701,6 +2713,46 @@ int run_nvfp4_cases() {
     return failures;
 }
 
+// K8V4 prompt-route widths for one prompt kernel: partial and full row blocks, widths over enough
+// key pages for the fast kernel to split them across CTAs (including an envelope far past the
+// populated keys, so late splits own no visible key), V magnitudes whose group scales need the
+// fast kernel's FP16-partial rescale, and the production prefill chunk after a long history.
+int run_k8v4_prompt_cases(bool fast) {
+    constexpr KvCacheStorage storage = KvCacheStorage::Fp8KeyNvfp4Value;
+    int failures                     = 0;
+    const auto with                  = [fast](AttentionCase test_case) {
+        test_case.fast_prompt_kernel = fast;
+        return test_case;
+    };
+    for (const Geometry& geometry : kGeometries) {
+        failures += run_a1_case(geometry, storage, with({64, 0, 128, 804u}),
+                                MappingPattern::Fragmented);
+        failures +=
+            run_a3_case(geometry, storage, with({65, 63, 192, 805u}), MappingPattern::Offset);
+        failures += run_a1_case(geometry, storage, with({256, 4000, 4256, 820u}),
+                                MappingPattern::Fragmented);
+        failures += run_a3_case(geometry, storage, with({130, 1900, 8192, 821u}),
+                                MappingPattern::Offset);
+    }
+    const Geometry& h24 = kGeometries[0];
+    // |V| up to 900 gives rotated V group scales around 150-250, above the fast kernel's unscaled
+    // limit of 128; |V| up to 2048 reaches the largest UE4M3 scales.
+    failures +=
+        run_a1_case(h24, storage, with({200, 1000, 1200, 823u, false, false, false, 900.0f}),
+                    MappingPattern::Identity);
+    failures +=
+        run_a3_case(h24, storage, with({300, 700, 1000, 824u, false, false, false, 2048.0f}),
+                    MappingPattern::Fragmented);
+    AttentionCase chunk{4096, 8192, 8192 + 4096, 825u};
+    chunk.oracle_rows = 64;
+    failures += run_a1_case(h24, storage, with(chunk), MappingPattern::Fragmented);
+    // A masked single-row prompt over enough key pages to split them across CTAs.
+    BatchAttentionCase prompt{40, {3000}, {29}, {0}, MappingPattern::Fragmented, 822u, true};
+    prompt.fast_prompt_kernel = fast;
+    failures += run_batch_case(h24, storage, prompt);
+    return failures;
+}
+
 int run_k8v4_cases() {
     int failures = 0;
     for (const Geometry& geometry : kGeometries) {
@@ -2710,13 +2762,11 @@ int run_k8v4_cases() {
                                 MappingPattern::Fragmented);
         failures += run_a1_case(geometry, KvCacheStorage::Fp8KeyNvfp4Value, {6, 61, 192, 803u},
                                 MappingPattern::Fragmented);
-        failures += run_a1_case(geometry, KvCacheStorage::Fp8KeyNvfp4Value, {64, 0, 128, 804u},
-                                MappingPattern::Fragmented);
-        failures += run_a3_case(geometry, KvCacheStorage::Fp8KeyNvfp4Value, {65, 63, 192, 805u},
-                                MappingPattern::Offset);
         failures += run_a3_case(geometry, KvCacheStorage::Fp8KeyNvfp4Value, {1, 2048, 2049, 806u},
                                 MappingPattern::Fragmented);
     }
+    failures += run_k8v4_prompt_cases(false);
+    failures += run_k8v4_prompt_cases(true);
     failures += run_a1_case(kGeometries[0], KvCacheStorage::Fp8KeyNvfp4Value,
                             {1, 64, 65, 807u, false, true}, MappingPattern::Fragmented);
     failures += run_a3_case(kGeometries[0], KvCacheStorage::Fp8KeyNvfp4Value,
@@ -2742,8 +2792,9 @@ int verify_workspace_capacity_contract() {
          {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64, KvCacheStorage::Fp8E4M3Row256,
           KvCacheStorage::Nvfp4Group16, KvCacheStorage::Fp8KeyNvfp4Value}) {
         for (const Geometry& heads : kGeometries) {
-            for (bool wide : {false, true}) {
-                const ops::CausalAttentionExecutionEnvelope envelope{1, 1025, wide};
+            for (const auto [wide, fast] : {std::pair{false, false}, std::pair{true, false},
+                                            std::pair{false, true}, std::pair{true, true}}) {
+                const ops::CausalAttentionExecutionEnvelope envelope{1, 1025, wide, fast};
                 const ops::AttentionHeadGeometry geometry{kHeadDim, heads.q_heads, heads.kv_heads};
                 for (int first : {1, 17, 32, 33, 64, 65}) {
                     const std::size_t interval =
@@ -2754,7 +2805,13 @@ int verify_workspace_capacity_contract() {
                         const auto exact = ops::causal_softmax_attention_workspace_capacity_bytes(
                             geometry, storage, envelope, 1, tokens, tokens);
                         witness = std::max(witness, exact);
-                        if ((tokens <= (wide ? 64 : 16)) != (exact != 0)) {
+                        // Split-KV widths always need workspace. Wider prompt-route widths need
+                        // none, except fast-kernel K8V4 prompts whose key splits fill otherwise
+                        // idle SMs.
+                        const bool small_t = tokens <= (wide ? 64 : 16);
+                        const bool prompt_splits =
+                            fast && storage == KvCacheStorage::Fp8KeyNvfp4Value;
+                        if ((small_t && exact == 0) || (!small_t && exact != 0 && !prompt_splits)) {
                             std::cerr << "causal_softmax_attention wide route workspace mismatch\n";
                             ++failures;
                         }
@@ -2799,8 +2856,16 @@ int verify_workspace_capacity_contract() {
 int run_softmax_attention_extended_tests() {
     if (cuda_unavailable()) return 77;
     std::cout << "NVFP4 attention: 300001 visible keys, fragmented pages, independent FP64 oracle\n" << std::flush;
-    const int failures = run_a3_case(kGeometries[0], KvCacheStorage::Nvfp4Group16,
-                                     {1, 300000, 300001, 1720u}, MappingPattern::Fragmented);
+    int failures = run_a3_case(kGeometries[0], KvCacheStorage::Nvfp4Group16,
+                               {1, 300000, 300001, 1720u}, MappingPattern::Fragmented);
+    // K8V4 rounds batched split counts down to whole waves, so at B=2 over 170K keys a split
+    // spans more pages than the 64 page IDs it stages.
+    std::cout << "K8V4 attention: B=2 over 170K visible keys, splits past 64 pages\n" << std::flush;
+    failures +=
+        run_batch_case(kGeometries[0], KvCacheStorage::Fp8KeyNvfp4Value,
+                       {4, {170000, 168500}, {4, 3}, {1, 0}, MappingPattern::Fragmented, 1721u});
+    failures += run_batch_case(kGeometries[0], KvCacheStorage::Fp8KeyNvfp4Value,
+                               {8, {170000, 0}, {8, 5}, {0, 1}, MappingPattern::Fragmented, 1722u});
     std::cout << (failures ? "FAIL" : "PASS") << " extended attention\n";
     return failures ? 1 : 0;
 }

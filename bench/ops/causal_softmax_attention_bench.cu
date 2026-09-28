@@ -86,6 +86,9 @@ struct Options {
     bool fast_prompt = false;
     // The small-prefill hint: single-row widths 17-64 over a long context take chunked small-T.
     bool small_prefill = false;
+    // Graph-replay resource envelope upper bound (0: exact). Production decode graphs launch with
+    // [1, capacity], which can change split capacity; this reproduces that envelope.
+    std::int32_t envelope_max = 0;
     std::string csv_out;
 };
 
@@ -93,8 +96,13 @@ struct Options {
 bool envelope_wide          = false;
 bool envelope_fast_prompt   = false;
 bool envelope_small_prefill = false;
+std::int32_t envelope_max   = 0;
 
 ops::CausalAttentionExecutionEnvelope bench_envelope(std::int32_t visible) {
+    if (envelope_max > 0) {
+        return {1U, static_cast<std::uint32_t>(std::max(visible, envelope_max)), envelope_wide,
+                envelope_fast_prompt, envelope_small_prefill};
+    }
     return {static_cast<std::uint32_t>(visible), static_cast<std::uint32_t>(visible), envelope_wide,
             envelope_fast_prompt, envelope_small_prefill};
 }
@@ -153,7 +161,7 @@ GateMode effective_gate(GateMode requested, Entry entry) noexcept {
                  "[--mapping identity|fragmented] [--gate off|standalone|fused] "
                  "[--warmup N] [--repeat N] [--graph-calls N] [--profile] [--wide] [--fast-prompt] "
                  "[--small-prefill] "
-                 "[--csv-out PATH]\n",
+                 "[--envelope-max N] [--csv-out PATH]\n",
                  message);
     std::exit(2);
 }
@@ -300,6 +308,11 @@ Options parse_options(int argc, char** argv) {
             options.fast_prompt = true;
         } else if (argument == "--small-prefill") {
             options.small_prefill = true;
+        } else if (argument == "--envelope-max") {
+            options.envelope_max =
+                parse_i32(next("--envelope-max requires a value"), 1,
+                          static_cast<std::int32_t>(ops::kCausalAttentionMaximumVisibleKeys),
+                          "--envelope-max");
         } else if (argument == "--csv-out") {
             options.csv_out = next("--csv-out requires a path");
         } else if (argument == "--help" || argument == "-h") {
@@ -479,7 +492,9 @@ public:
           masked_(std::any_of(valid_columns.begin(), valid_columns.end(),
                               [tokens](std::int32_t valid) { return valid != tokens; })),
           visible_(profile_visible(contexts, valid_columns)), padded_(align_context(visible_)),
-          mapping_(mapping), logical_pages_(padded_ / kPagedKVPageSize),
+          table_padded_(align_context(std::max(visible_, envelope_max))),
+          table_pages_(table_padded_ / kPagedKVPageSize), mapping_(mapping),
+          logical_pages_(padded_ / kPagedKVPageSize),
           physical_pages_(mapping == PageMapping::Identity ? batch_ * logical_pages_
                                                            : 2 * batch_ * logical_pages_ + 1),
           q_(varied_values(static_cast<std::size_t>(kHeadDim) * geometry.query_heads * tokens *
@@ -504,7 +519,7 @@ public:
               storage_layout_.value.has_scale()
                   ? scale_plane_bytes(geometry, storage_layout_.value, physical_pages_)
                   : std::size_t{1})),
-          block_table_(static_cast<std::size_t>(logical_pages_) * batch_ * sizeof(std::int32_t)),
+          block_table_(static_cast<std::size_t>(table_pages_) * batch_ * sizeof(std::int32_t)),
           output_(bench::make_zeros(static_cast<std::size_t>(kHeadDim) * geometry.query_heads *
                                     tokens * batch_ * 2)),
           gate_buffer_(bench::make_bf16(static_cast<std::size_t>(kHeadDim) * geometry.query_heads *
@@ -521,10 +536,11 @@ public:
           gate_tensor_(gate_buffer_.p, DType::BF16,
                        {kHeadDim, geometry.query_heads, tokens, batch_}),
           cache_view_(make_cache_view(cache_k_, cache_v_, cache_k_scale_, cache_v_scale_,
-                                      block_table_, geometry, storage, padded_, physical_pages_)),
+                                      block_table_, geometry, storage, table_padded_,
+                                      physical_pages_)),
           batch_cache_view_(make_batch_cache_view(cache_k_, cache_v_, cache_k_scale_,
                                                   cache_v_scale_, block_table_, geometry, storage,
-                                                  padded_, physical_pages_, batch_)),
+                                                  table_padded_, physical_pages_, batch_)),
           envelope_(bench_envelope(visible_)) {
         std::vector<std::int32_t> host_positions(static_cast<std::size_t>(tokens) * batch_, 0);
         for (std::int32_t row = 0; row < batch_; ++row) {
@@ -539,11 +555,14 @@ public:
                 host_positions[static_cast<std::size_t>(row) * tokens + token] = padding_position;
             }
         }
-        std::vector<std::int32_t> host_table(static_cast<std::size_t>(logical_pages_) * batch_);
+        // Envelope pages past the populated context are never read; they alias the row's first
+        // page.
+        std::vector<std::int32_t> host_table(static_cast<std::size_t>(table_pages_) * batch_);
         for (std::int32_t row = 0; row < batch_; ++row) {
-            for (std::int32_t page = 0; page < logical_pages_; ++page) {
-                const std::int32_t linear = row * logical_pages_ + page;
-                host_table[static_cast<std::size_t>(row) * logical_pages_ + page] =
+            for (std::int32_t page = 0; page < table_pages_; ++page) {
+                const std::int32_t linear =
+                    row * logical_pages_ + (page < logical_pages_ ? page : 0);
+                host_table[static_cast<std::size_t>(row) * table_pages_ + page] =
                     mapping_ == PageMapping::Identity ? linear : 2 * linear + 1;
             }
         }
@@ -571,8 +590,8 @@ public:
             Tensor v(initial_v.p, DType::BF16, {kHeadDim, geometry.kv_heads, padded_});
             auto row_cache = cache_view_;
             row_cache.block_table =
-                Tensor(static_cast<std::int32_t*>(block_table_.p) + row * logical_pages_,
-                       DType::I32, {logical_pages_});
+                Tensor(static_cast<std::int32_t*>(block_table_.p) + row * table_pages_, DType::I32,
+                       {table_pages_});
             ops::kv_cache_append(k, v, positions, row_cache, nullptr);
             CUDA_CHECK(cudaDeviceSynchronize());
         }
@@ -611,6 +630,8 @@ private:
     bool masked_;
     std::int32_t visible_;
     std::int32_t padded_;
+    std::int32_t table_padded_;
+    std::int32_t table_pages_;
     PageMapping mapping_;
     std::int32_t logical_pages_;
     std::int32_t physical_pages_;
@@ -930,6 +951,7 @@ int main(int argc, char** argv) {
         envelope_wide         = options.wide;
         envelope_fast_prompt  = options.fast_prompt;
         envelope_small_prefill = options.small_prefill;
+        envelope_max           = options.envelope_max;
         cudaStream_t stream   = nullptr;
         CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
         DeviceBuffer flush(kFlushBytes);

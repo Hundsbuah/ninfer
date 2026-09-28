@@ -11,21 +11,25 @@
 namespace ninfer::ops::detail {
 namespace {
 
+// Floats of partial_acc owned by one chunk; partial_m and partial_l hold 1/D of that per chunk.
+template <typename Geometry>
+std::int64_t k8v4_chunk_stride(const CausalSmallTInvocation& invocation, std::int32_t splits) {
+    return static_cast<std::int64_t>(kCausalHeadDim) * Geometry::QHeads * invocation.width *
+           splits * invocation.batch_size;
+}
+
 template <typename Geometry, int TokenTile, bool MultiBatch, bool Masked, typename CacheInput>
 void launch_k8v4_partial(const Tensor& q, CacheInput input, const Tensor& positions, float scale,
                          PagedKVBatchLayerView cache, const CausalSmallTInvocation& invocation,
                          std::int32_t logical_capacity, std::int32_t splits, Tensor& partial_acc,
                          Tensor& partial_m, Tensor& partial_l, cudaStream_t stream) {
-    constexpr int RowCount             = TokenTile * Geometry::GroupSize;
-    constexpr int RowTiles             = (RowCount + 15) / 16;
-    constexpr int Warps                = RowTiles == 3 ? 12 : 8;
-    constexpr int KeyBlock             = TokenTile == 1 ? 32 : 64;
-    constexpr int MinBlocks            = TokenTile == 1 ? 2 : 1;
-    constexpr std::size_t DynamicBytes = 7u * KeyBlock * kCausalHeadDim / 2u;
-    using KernelInput                  = CacheInput;
-    const dim3 grid(Geometry::KVHeads, splits, invocation.batch_size);
-    const auto launch = [&]() {
-        auto kernel = causal_attention_small_t_k8v4_tiled_kernel<
+    constexpr int RowCount = TokenTile * Geometry::GroupSize;
+    constexpr int RowTiles = (RowCount + 15) / 16;
+    using KernelInput      = CacheInput;
+    const dim3 grid(Geometry::KVHeads * invocation.chunks, splits, invocation.batch_size);
+    const auto launch = [&]<int Warps, int MinBlocks, int KeyBlock>() {
+        constexpr std::size_t DynamicBytes = 7u * KeyBlock * kCausalHeadDim / 2u;
+        auto kernel                        = causal_attention_small_t_k8v4_tiled_kernel<
             Geometry, TokenTile, Warps, MinBlocks, KeyBlock, true, MultiBatch, Masked, KernelInput>;
         static const cudaError_t attr = cudaFuncSetAttribute(
             kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(DynamicBytes));
@@ -52,48 +56,67 @@ void launch_k8v4_partial(const Tensor& q, CacheInput input, const Tensor& positi
             q_ptr, input, positions_ptr, cache_k_ptr, cache_v_ptr, k_scale_ptr, v_scale_ptr,
             tables_ptr, valid_ptr, rows_ptr, cache.block_tables.ne[0], invocation.full_width,
             invocation.column_begin, logical_capacity, scale, partial_acc_ptr, partial_m_ptr,
-            partial_l_ptr);
+            partial_l_ptr, k8v4_chunk_stride<Geometry>(invocation, splits));
         CUDA_CHECK(cudaGetLastError());
     };
 
-    launch();
+    // 32-key tiles let two CTAs share an SM, so one CTA's load hides behind the other's math;
+    // 64-key tiles fill the SM alone. Measured on RTX 5090 (graph replay over a 240K-key envelope,
+    // 8K-128K keys, B=1-8): two 32-key CTAs are 4-33 % faster for one or two row tiles. For three
+    // row tiles six warps are 2-13 % faster, except for the 27B geometry at B=2-3, where the
+    // resulting grid leaves a partial second wave at long contexts (up to 15 % slower) and the
+    // single 64-key CTA stays.
+    if constexpr (RowTiles <= 2) {
+        launch.template operator()<8, 2, 32>();
+    } else if (Geometry::QHeads == 24 && invocation.chunks == 1 &&
+               (invocation.batch_size == 2 || invocation.batch_size == 3)) {
+        launch.template operator()<12, 1, 64>();
+    } else {
+        launch.template operator()<6, 2, 32>();
+    }
 }
 
 template <typename Geometry, bool MultiBatch, bool Masked>
 void launch_k8v4_reduce(const Tensor& positions, const CausalSmallTInvocation& invocation,
                         std::int32_t splits, const Tensor& partial_acc, const Tensor& partial_m,
-                        const Tensor& partial_l, Tensor& out, cudaStream_t stream) {
-    constexpr int Block = 256;
+                        const Tensor& partial_l, Tensor& out, cudaStream_t stream,
+                        const void* gate) {
+    constexpr int Block      = 256;
+    const std::int64_t acc   = k8v4_chunk_stride<Geometry>(invocation, splits);
+    const std::int64_t stats = acc / kCausalHeadDim;
     const dim3 grid(Geometry::QHeads, invocation.width * invocation.batch_size);
-    const auto launch = [&]<bool Offset>() {
-        causal_attention_small_t_k8v4_reduce_output_kernel<Geometry, MultiBatch, Masked, Offset>
-            <<<grid, Block, 0, stream>>>(
-                static_cast<const float*>(partial_acc.data),
-                static_cast<const float*>(partial_m.data),
-                static_cast<const float*>(partial_l.data),
-                static_cast<const std::int32_t*>(positions.data),
-                invocation.valid_columns == nullptr
-                    ? nullptr
-                    : static_cast<const std::int32_t*>(invocation.valid_columns->data),
-                invocation.width, invocation.full_width, invocation.column_begin,
-                invocation.batch_size, splits, static_cast<__nv_bfloat16*>(out.data));
-    };
-    if (invocation.column_begin == 0) {
-        launch.template operator()<false>();
-    } else {
-        launch.template operator()<true>();
+    for (std::int32_t chunk = 0; chunk < invocation.chunks; ++chunk) {
+        const std::int32_t column_begin = invocation.column_begin + chunk * invocation.width;
+        const auto launch               = [&]<bool Offset>() {
+            causal_attention_small_t_k8v4_reduce_output_kernel<Geometry, MultiBatch, Masked,
+                                                               Offset>
+                <<<grid, Block, 0, stream>>>(
+                    static_cast<const float*>(partial_acc.data) + chunk * acc,
+                    static_cast<const float*>(partial_m.data) + chunk * stats,
+                    static_cast<const float*>(partial_l.data) + chunk * stats,
+                    static_cast<const std::int32_t*>(positions.data),
+                    invocation.valid_columns == nullptr
+                        ? nullptr
+                        : static_cast<const std::int32_t*>(invocation.valid_columns->data),
+                    invocation.width, invocation.full_width, column_begin, invocation.batch_size,
+                    splits, static_cast<__nv_bfloat16*>(out.data),
+                    static_cast<const __nv_bfloat16*>(gate));
+        };
+        if (column_begin == 0) {
+            launch.template operator()<false>();
+        } else {
+            launch.template operator()<true>();
+        }
+        CUDA_CHECK(cudaGetLastError());
     }
-    CUDA_CHECK(cudaGetLastError());
 }
 
 template <typename Geometry, typename CacheInput>
-void causal_attention_small_t_k8v4_launch_for(const Tensor& q, CacheInput input,
-                                              const Tensor& positions, float scale,
-                                              PagedKVBatchLayerView cache,
-                                              const CausalSmallTInvocation& invocation,
-                                              CausalAttentionExecutionEnvelope envelope,
-                                              Tensor& partial_acc, Tensor& partial_m,
-                                              Tensor& partial_l, Tensor& out, cudaStream_t stream) {
+void causal_attention_small_t_k8v4_launch_for(
+    const Tensor& q, CacheInput input, const Tensor& positions, float scale,
+    PagedKVBatchLayerView cache, const CausalSmallTInvocation& invocation,
+    CausalAttentionExecutionEnvelope envelope, Tensor& partial_acc, Tensor& partial_m,
+    Tensor& partial_l, Tensor& out, cudaStream_t stream, const void* gate) {
     const auto logical_capacity = static_cast<std::int32_t>(envelope.max_visible_keys);
     const auto splits           = causal_attention_split_capacity(
         Geometry::QHeads, invocation.width, cache.storage, envelope, invocation.batch_size);
@@ -157,27 +180,47 @@ void causal_attention_small_t_k8v4_launch_for(const Tensor& q, CacheInput input,
     if (invocation.batch_size == 1) {
         if (masked) {
             launch_k8v4_reduce<Geometry, false, true>(positions, invocation, splits, partial_acc,
-                                                      partial_m, partial_l, out, stream);
+                                                      partial_m, partial_l, out, stream, gate);
         } else {
             launch_k8v4_reduce<Geometry, false, false>(positions, invocation, splits, partial_acc,
-                                                       partial_m, partial_l, out, stream);
+                                                       partial_m, partial_l, out, stream, gate);
         }
     } else if (masked) {
         launch_k8v4_reduce<Geometry, true, true>(positions, invocation, splits, partial_acc,
-                                                 partial_m, partial_l, out, stream);
+                                                 partial_m, partial_l, out, stream, gate);
     } else {
         launch_k8v4_reduce<Geometry, true, false>(positions, invocation, splits, partial_acc,
-                                                  partial_m, partial_l, out, stream);
+                                                  partial_m, partial_l, out, stream, gate);
     }
+}
+
+template <typename CacheInput>
+void causal_attention_small_t_k8v4_dispatch(
+    const Tensor& q, CacheInput input, const Tensor& positions, float scale,
+    PagedKVBatchLayerView cache, const CausalSmallTInvocation& invocation,
+    CausalAttentionExecutionEnvelope envelope, Tensor& partial_acc, Tensor& partial_m,
+    Tensor& partial_l, Tensor& out, cudaStream_t stream, const void* gate) {
+    if (q.ne[1] == CausalD256H24Kv4::QHeads) {
+        causal_attention_small_t_k8v4_launch_for<CausalD256H24Kv4>(
+            q, input, positions, scale, cache, invocation, envelope, partial_acc, partial_m,
+            partial_l, out, stream, gate);
+        return;
+    }
+    causal_attention_small_t_k8v4_launch_for<CausalD256H16Kv2>(
+        q, input, positions, scale, cache, invocation, envelope, partial_acc, partial_m, partial_l,
+        out, stream, gate);
 }
 
 } // namespace
 
-void causal_attention_small_t_k8v4_launch(
-    const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& positions,
-    const Tensor& valid_columns, const Tensor& table_rows, float scale, PagedKVBatchLayerView cache,
-    CausalAttentionExecutionEnvelope envelope, std::int32_t column_begin, std::int32_t width,
-    Tensor& partial_acc, Tensor& partial_m, Tensor& partial_l, Tensor& out, cudaStream_t stream) {
+void causal_attention_small_t_k8v4_launch(const Tensor& q, const Tensor& k, const Tensor& v,
+                                          const Tensor& positions, const Tensor& valid_columns,
+                                          const Tensor& table_rows, float scale,
+                                          PagedKVBatchLayerView cache,
+                                          CausalAttentionExecutionEnvelope envelope,
+                                          std::int32_t column_begin, std::int32_t width,
+                                          Tensor& partial_acc, Tensor& partial_m, Tensor& partial_l,
+                                          Tensor& out, cudaStream_t stream, const void* gate) {
     const CausalAppendInput input{static_cast<const __nv_bfloat16*>(k.data),
                                   static_cast<const __nv_bfloat16*>(v.data)};
     const CausalSmallTInvocation invocation{
@@ -188,42 +231,48 @@ void causal_attention_small_t_k8v4_launch(
         .width         = width,
         .batch_size    = q.ne[3],
     };
-    if (q.ne[1] == CausalD256H24Kv4::QHeads) {
-        causal_attention_small_t_k8v4_launch_for<CausalD256H24Kv4>(
-            q, input, positions, scale, cache, invocation, envelope, partial_acc, partial_m,
-            partial_l, out, stream);
-        return;
-    }
-    causal_attention_small_t_k8v4_launch_for<CausalD256H16Kv2>(q, input, positions, scale, cache,
-                                                               invocation, envelope, partial_acc,
-                                                               partial_m, partial_l, out, stream);
+    causal_attention_small_t_k8v4_dispatch(q, input, positions, scale, cache, invocation, envelope,
+                                           partial_acc, partial_m, partial_l, out, stream, gate);
+}
+
+void causal_attention_small_t_k8v4_chunks_launch(
+    const Tensor& q, const Tensor& positions, const Tensor& valid_columns, const Tensor& table_rows,
+    float scale, PagedKVBatchLayerView cache, CausalAttentionExecutionEnvelope envelope,
+    std::int32_t column_begin, std::int32_t width, std::int32_t chunks, Tensor& partial_acc,
+    Tensor& partial_m, Tensor& partial_l, Tensor& out, cudaStream_t stream, const void* gate) {
+    const CausalSmallTInvocation invocation{
+        .valid_columns = valid_columns.data == nullptr ? nullptr : &valid_columns,
+        .table_rows    = &table_rows,
+        .full_width    = q.ne[2],
+        .column_begin  = column_begin,
+        .width         = width,
+        .batch_size    = q.ne[3],
+        .chunks        = chunks,
+    };
+    causal_attention_small_t_k8v4_dispatch(q, CausalCachedInput{}, positions, scale, cache,
+                                           invocation, envelope, partial_acc, partial_m, partial_l,
+                                           out, stream, gate);
 }
 
 void causal_attention_cached_small_t_k8v4_launch(const Tensor& q, const Tensor& positions,
                                                  float scale, const PagedKVLayerView& cache,
                                                  CausalAttentionExecutionEnvelope envelope,
-                                                 Tensor& partial_acc, Tensor& partial_m,
-                                                 Tensor& partial_l, Tensor& out,
+                                                 std::int32_t column_begin, std::int32_t width,
+                                                 std::int32_t chunks, Tensor& partial_acc,
+                                                 Tensor& partial_m, Tensor& partial_l, Tensor& out,
                                                  cudaStream_t stream) {
-    const CausalCachedInput input{};
     const CausalSmallTInvocation invocation{
         .valid_columns = nullptr,
         .table_rows    = nullptr,
         .full_width    = q.ne[2],
-        .column_begin  = 0,
-        .width         = q.ne[2],
+        .column_begin  = column_begin,
+        .width         = width,
         .batch_size    = 1,
+        .chunks        = chunks,
     };
-    PagedKVBatchLayerView batch_cache = single_row_paged_kv_batch_view(cache);
-    if (q.ne[1] == CausalD256H24Kv4::QHeads) {
-        causal_attention_small_t_k8v4_launch_for<CausalD256H24Kv4>(
-            q, input, positions, scale, batch_cache, invocation, envelope, partial_acc, partial_m,
-            partial_l, out, stream);
-        return;
-    }
-    causal_attention_small_t_k8v4_launch_for<CausalD256H16Kv2>(
-        q, input, positions, scale, batch_cache, invocation, envelope, partial_acc, partial_m,
-        partial_l, out, stream);
+    causal_attention_small_t_k8v4_dispatch(
+        q, CausalCachedInput{}, positions, scale, single_row_paged_kv_batch_view(cache), invocation,
+        envelope, partial_acc, partial_m, partial_l, out, stream, nullptr);
 }
 
 } // namespace ninfer::ops::detail

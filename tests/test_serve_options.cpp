@@ -757,6 +757,14 @@ int main() {
     failures += check(serve_usage_text("ninfer-serve").find("--use-original-int8-prefill-kernel") !=
                           std::string::npos,
                       "serve help omits --use-original-int8-prefill-kernel");
+    failures += check(!archive.original_k8v4_prefill_kernel,
+                      "the original K8V4 prefill kernel must default off");
+    failures += check(parse({"ninfer-serve", "model.ninfer", "--use-original-k8v4-prefill-kernel"})
+                          .original_k8v4_prefill_kernel,
+                      "--use-original-k8v4-prefill-kernel was not preserved");
+    failures += check(serve_usage_text("ninfer-serve").find("--use-original-k8v4-prefill-kernel") !=
+                          std::string::npos,
+                      "serve help omits --use-original-k8v4-prefill-kernel");
     bool fast_flag_rejected = false;
     try {
         (void)parse({"ninfer-serve", "model.ninfer", "--fast-prefill-kernel"});

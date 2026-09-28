@@ -184,6 +184,14 @@ int run_tests() {
                       "--use-original-int8-prefill-kernel was not parsed");
     failures += check(help.find("--use-original-int8-prefill-kernel") != std::string::npos,
                       "CLI help omits --use-original-int8-prefill-kernel");
+    failures += check(!k8v4.original_k8v4_prefill_kernel,
+                      "the CLI original K8V4 prefill kernel must default off");
+    failures += check(parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--kv-dtype",
+                             "k8v4", "--use-original-k8v4-prefill-kernel"})
+                          .original_k8v4_prefill_kernel,
+                      "--use-original-k8v4-prefill-kernel was not parsed");
+    failures += check(help.find("--use-original-k8v4-prefill-kernel") != std::string::npos,
+                      "CLI help omits --use-original-k8v4-prefill-kernel");
     const ninfer::cli::Options logging =
         parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--log-level", "debug"});
     failures += check(logging.log_level == ninfer::product::LogLevel::Debug,

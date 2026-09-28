@@ -9,7 +9,9 @@
 #include "ops/softmax_attention/dense/causal_cache/prompt_i8_fast.cuh"
 #include "core/device.h" // CUDA_CHECK
 
+#include <cstddef>
 #include <cstdint>
+#include <limits>
 
 namespace ninfer::ops::detail {
 static_assert(kPromptWaveRows == CausalPromptI8FastShape<8>::Br);
@@ -126,13 +128,96 @@ void causal_attention_prompt_attention_launch_for(const Tensor& q, const Tensor&
     CUDA_CHECK(cudaGetLastError());
 }
 
+// Split partials may use at most this much workspace; the planner reserves the largest amount any
+// prefill width can take, so the budget bounds the Device memory the split costs.
+constexpr std::size_t kPromptSplitBudgetBytes  = std::size_t{64} << 20;
+constexpr std::int32_t kPromptMinPagesPerSplit = 8;
+constexpr std::int32_t kPromptMaxSplits        = 16;
+constexpr std::int32_t kPromptSplitCostPercent = 1;
+
+// Time for one fast-kernel CTA to sweep a launch's keys, as a percentage of the eight-warp CTA
+// (RTX 5090, 4096 columns over 128K keys); the four-warp CTA takes 72 %.
+struct PromptCtaCost {
+    std::int32_t warps;
+    std::int32_t rows;
+    std::int64_t percent;
+};
+
+constexpr PromptCtaCost kPromptK8V4Costs[] = {{8, 128, 100}, {4, 64, 72}};
+
+int prompt_multiprocessor_count() {
+    static const int multiprocessors = [] {
+        int device = 0;
+        int count  = 0;
+        CUDA_CHECK(cudaGetDevice(&device));
+        CUDA_CHECK(cudaDeviceGetAttribute(&count, cudaDevAttrMultiProcessorCount, device));
+        return count;
+    }();
+    return multiprocessors;
+}
+
+std::size_t prompt_split_bytes(std::int32_t q_heads, std::int32_t width, std::int32_t splits) {
+    if (splits <= 1) { return 0; }
+    WorkspaceLayoutBuilder layout;
+    (void)allocate_causal_prompt_split_partials(layout, q_heads, width, splits);
+    return layout.peak_bytes(1);
+}
+
 } // namespace
 
+CausalPromptSplitPlan causal_attention_prompt_split_plan(std::int32_t q_heads, std::int32_t width,
+                                                         KvCacheStorage storage,
+                                                         CausalAttentionExecutionEnvelope envelope) {
+    if (storage != KvCacheStorage::Fp8KeyNvfp4Value || width <= 0) { return {}; }
+    if (!envelope.fast_prompt_kernel) { return {.original = true}; }
+    // Every CTA of a launch sweeps about the same key range and one CTA fits an SM, so a launch
+    // costs about (waves) x (one CTA's sweep); a split CTA sweeps 1/splits of it.
+    const std::int32_t multiprocessors = prompt_multiprocessor_count();
+    const auto pages                   = static_cast<std::int32_t>(
+        (static_cast<std::uint64_t>(envelope.max_visible_keys) + kPagedKVPageSize - 1) /
+        kPagedKVPageSize);
+    CausalPromptSplitPlan best{};
+    std::int64_t best_cost = std::numeric_limits<std::int64_t>::max();
+    for (const PromptCtaCost& cta : kPromptK8V4Costs) {
+        const std::int32_t ctas = div_up(width, cta.rows) * q_heads;
+        const std::int64_t per  = cta.percent;
+        for (std::int32_t splits = 1; splits <= kPromptMaxSplits; ++splits) {
+            if (splits > 1 &&
+                (pages < splits * kPromptMinPagesPerSplit ||
+                 prompt_split_bytes(q_heads, width, splits) > kPromptSplitBudgetBytes)) {
+                break;
+            }
+            const std::int64_t waves = div_up(static_cast<std::int64_t>(ctas) * splits,
+                                              static_cast<std::int64_t>(multiprocessors));
+            // Scaled by kPromptMaxSplits so every split count divides exactly.
+            const std::int64_t cost = waves * per * kPromptMaxSplits / splits +
+                                      (splits - 1) * kPromptSplitCostPercent * kPromptMaxSplits;
+            if (cost < best_cost) {
+                best_cost = cost;
+                best      = {cta.warps, splits};
+            }
+        }
+    }
+    return best;
+}
+
+std::size_t causal_attention_prompt_split_workspace_bytes(std::int32_t q_heads, std::int32_t width,
+                                                          KvCacheStorage storage,
+                                                          CausalAttentionExecutionEnvelope envelope) {
+    const CausalPromptSplitPlan plan =
+        causal_attention_prompt_split_plan(q_heads, width, storage, envelope);
+    return prompt_split_bytes(q_heads, width, plan.splits);
+}
+
 void causal_attention_prompt_attention_launch(const Tensor& q, const Tensor& positions, float scale,
-                                              const PagedKVLayerView& cache, Tensor& out, bool fast,
+                                              const PagedKVLayerView& cache,
+                                              CausalAttentionExecutionEnvelope envelope,
+                                              WorkspaceArena& workspace, Tensor& out,
                                               cudaStream_t stream) {
+    const bool fast = envelope.fast_prompt_kernel;
     if (cache.storage == KvCacheStorage::Fp8KeyNvfp4Value) {
-        causal_attention_prompt_k8v4_attention_launch(q, positions, scale, cache, out, stream);
+        causal_attention_prompt_k8v4_attention_launch(q, positions, scale, cache, envelope,
+                                                      workspace, out, stream);
         return;
     }
     if (cache.storage == KvCacheStorage::Nvfp4Group16) {
@@ -156,11 +241,13 @@ void causal_attention_prompt_attention_launch(const Tensor& q, const Tensor& pos
 void causal_attention_prompt_launch(const Tensor& q, const Tensor& k, const Tensor& v,
                                     const Tensor& positions, const Tensor& valid_columns,
                                     const Tensor& table_rows, float scale,
-                                    PagedKVBatchLayerView cache, Tensor& out, bool fast,
-                                    cudaStream_t stream) {
+                                    PagedKVBatchLayerView cache,
+                                    CausalAttentionExecutionEnvelope envelope,
+                                    WorkspaceArena& workspace, Tensor& out, cudaStream_t stream) {
+    const bool fast = envelope.fast_prompt_kernel;
     if (cache.storage == KvCacheStorage::Fp8KeyNvfp4Value) {
         causal_attention_prompt_k8v4_launch(q, k, v, positions, valid_columns, table_rows, scale,
-                                            cache, out, stream);
+                                            cache, envelope, workspace, out, stream);
         return;
     }
     if (cache.storage == KvCacheStorage::Nvfp4Group16) {

@@ -21,9 +21,11 @@ struct CausalAttentionExecutionEnvelope {
     // Opt into chunked single-row verification through width 64; ordinary prompts keep
     // their existing route. Workspace planning and execution must use the same hint.
     bool wide_verification = false;
-    // Select the fast INT8 prompt kernel (FP16 per-tile PV accumulation) for prompt-route
-    // launches over an INT8-G64 cache. Other routes and cache formats ignore it; it never changes
-    // the route or workspace.
+    // Select the fast prompt kernel for prompt-route launches over an INT8-G64 or K8V4 cache (FP16
+    // per-tile PV accumulation; K8V4 also decodes V in registers). Other routes and cache formats
+    // ignore it, and it never changes the route. Over K8V4 it can change the workspace: the fast
+    // kernel may split a single-row launch's keys, so workspace planning and execution must use
+    // the same hint.
     bool fast_prompt_kernel = false;
     // Single-row prefill: widths 17 through 64 take the chunked small-T route once the visible
     // keys make it faster than the prompt route. The prompt route runs one CTA per query head and
@@ -135,8 +137,11 @@ void packed_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
  * through the inert tail; an empty row uses zero positions. Other tail values are safe dummies.
  * Tail columns do not mutate cache and produce exact BF16 zero.
  *
- * The registered prompt route consumes the paged cache directly and requires zero transient
- * workspace. Small-T routes may use the split state returned by the capacity query below.
+ * The registered prompt route consumes the paged cache directly. Over a K8V4 cache the fast
+ * prompt kernel may divide the keys of every row block of a single-row launch whose row blocks
+ * alone would leave SMs idle among CTAs and merge their normalized FP32 partial rows; that split,
+ * like the split state of the small-T routes, uses the transient capacity returned by the query
+ * below.
  *
  * The caller guarantees that the maximum p+1 over live rows lies within envelope. The envelope is
  * a host launch/workspace resource promise over that batch maximum, not a mask and not persistent
@@ -175,7 +180,8 @@ void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
 /**
  * Return transient capacity for every W in the inclusive interval at one exact batch size. The
  * head geometry, cache dtype, and execution envelope are fixed implementation-profile inputs.
- * Invalid profiles or intervals throw; an interval containing only prompt routes returns zero.
+ * Invalid profiles or intervals throw. An interval containing only prompt routes returns zero,
+ * except for single-row K8V4 prompts whose fast kernel splits their keys.
  */
 [[nodiscard]] std::size_t causal_softmax_attention_workspace_capacity_bytes(
     AttentionHeadGeometry geometry, KvCacheStorage cache_storage,

@@ -28,7 +28,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
         const std::int32_t* valid_columns, const std::int32_t* table_rows,
         std::int32_t table_stride, std::int32_t full_width, std::int32_t column_begin,
         std::int32_t logical_capacity, float attention_scale, float* partial_acc, float* partial_m,
-        float* partial_l) {
+        float* partial_l, std::int64_t chunk_stride) {
     constexpr int Wc                   = WarpsPerCta;
     constexpr int RowCount             = TokenTile * Geometry::GroupSize;
     constexpr int RowTiles             = (RowCount + 15) / 16;
@@ -71,7 +71,15 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     __shared__ __align__(16) std::uint8_t v_scale_s[Bc * kKVCacheNvfp4Groups];
     __shared__ std::int32_t physical_pages_s[PageIds];
 
-    const int kv_head     = static_cast<int>(blockIdx.x);
+    // Over an appended cache gridDim.x holds KVHeads x chunks. The chunks of one KV head and split
+    // are adjacent CTAs, so they stream the same key tiles together and all but the first read
+    // them from L2. Chunk c owns query columns [column_begin + c * TokenTile, +TokenTile) and its
+    // own partial block. An appending launch is always one chunk.
+    constexpr bool Chunked = !CacheInput::writes_cache;
+    const int chunks       = Chunked ? static_cast<int>(gridDim.x) / Geometry::KVHeads : 1;
+    const int kv_head =
+        Chunked ? static_cast<int>(blockIdx.x) / chunks : static_cast<int>(blockIdx.x);
+    const int chunk       = Chunked ? static_cast<int>(blockIdx.x) - kv_head * chunks : 0;
     const int split       = static_cast<int>(blockIdx.y);
     const int batch       = MultiBatch ? static_cast<int>(blockIdx.z) : 0;
     const int split_count = static_cast<int>(gridDim.y);
@@ -79,6 +87,12 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     const int warp        = tid >> 5;
     const int lane        = tid & 31;
 
+    if constexpr (Chunked) {
+        column_begin += chunk * TokenTile;
+        partial_acc += chunk * chunk_stride;
+        partial_m += chunk * (chunk_stride / kCausalHeadDim);
+        partial_l += chunk * (chunk_stride / kCausalHeadDim);
+    }
     int valid_tokens = TokenTile;
     if constexpr (Masked) {
         const int remaining = valid_columns[batch] - column_begin;
@@ -579,12 +593,14 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     }
 }
 
+// A non-null gate finishes with out *= sigmoid(gate), bit-identical to the standalone multiply:
+// that kernel reads the stored BF16 attention output, multiplies in FP32 and rounds to nearest.
 template <typename Geometry, bool MultiBatch, bool Masked, bool Offset>
 __launch_bounds__(256) __global__ void causal_attention_small_t_k8v4_reduce_output_kernel(
     const float* partial_acc, const float* partial_m, const float* partial_l,
     const std::int32_t* positions, const std::int32_t* valid_columns, std::int32_t tokens,
     std::int32_t full_width, std::int32_t column_begin, std::int32_t batch_size,
-    std::int32_t split_count, __nv_bfloat16* out) {
+    std::int32_t split_count, __nv_bfloat16* out, const __nv_bfloat16* __restrict__ gate) {
     const int q_head      = static_cast<int>(blockIdx.x);
     const int flat_column = static_cast<int>(blockIdx.y);
     int batch             = 0;
@@ -604,15 +620,33 @@ __launch_bounds__(256) __global__ void causal_attention_small_t_k8v4_reduce_outp
     int output_column = token;
     if constexpr (Offset) output_column += column_begin;
     if constexpr (MultiBatch) output_column += batch * full_width;
+
+    // The warp that applies the inverse rotation loads its gate values first, so their latency
+    // overlaps the split merge instead of following it.
+    float gate_values[8];
+    if (gate != nullptr && tid < 32) {
+#pragma unroll
+        for (int r = 0; r < 8; ++r) {
+            gate_values[r] = __bfloat162float(
+                gate[causal_q_index<Geometry>(q_head, tid + 32 * r, output_column)]);
+        }
+    }
+    const auto store = [&](int d, float value) {
+        const auto index             = causal_q_index<Geometry>(q_head, d, output_column);
+        const __nv_bfloat16 attended = __float2bfloat16(value);
+        out[index] = gate == nullptr ? attended
+                                     : __float2bfloat16_rn(__bfloat162float(attended) *
+                                                           sigmoid(__bfloat162float(gate[index])));
+    };
     if constexpr (Masked) {
         const int absolute_column = token + (Offset ? column_begin : 0);
         if (absolute_column >= valid_columns[batch]) {
-            if (tid < kCausalHeadDim)
-                out[causal_q_index<Geometry>(q_head, tid, output_column)] = __float2bfloat16(0.0f);
+            // 0 * sigmoid(g) is 0 for every finite g but not for a NaN gate, which the standalone
+            // multiply would propagate, so the gated form multiplies either way.
+            if (tid < kCausalHeadDim) store(tid, 0.0F);
             return;
         }
     }
-
 
     if constexpr (MultiBatch) {
         partial_acc += static_cast<std::int64_t>(batch) * kCausalHeadDim * Geometry::QHeads *
@@ -645,8 +679,12 @@ __launch_bounds__(256) __global__ void causal_attention_small_t_k8v4_reduce_outp
     normalized_hadamard_d256_inplace(values, tid);
 #pragma unroll
     for (int r = 0; r < 8; ++r) {
-        const int d                                             = tid + 32 * r;
-        out[causal_q_index<Geometry>(q_head, d, output_column)] = __float2bfloat16(values[r]);
+        const auto index = causal_q_index<Geometry>(q_head, tid + 32 * r, output_column);
+        const __nv_bfloat16 attended = __float2bfloat16(values[r]);
+        out[index] =
+            gate == nullptr
+                ? attended
+                : __float2bfloat16_rn(__bfloat162float(attended) * sigmoid(gate_values[r]));
     }
 }
 

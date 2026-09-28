@@ -921,6 +921,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--pending-timeout-ms N` | maximum preparation-plus-admission wait | `30000` |
 | `--prefill-chunk N` | text-prefill chunk | `1024` |
 | `--use-original-int8-prefill-kernel` | prefill INT8-KV prompt attention with the original kernel at the requested `--prefill-chunk`. Without it INT8 KV uses the fast kernel (FP16 per-tile PV accumulation) and rounds `--prefill-chunk` down to whole prompt-attention waves (896 tokens for the 24-head model on RTX 5090: `4096` runs as `3584`); requires `--kv-dtype int8` (startup rejects it with any other KV format) | off |
+| `--use-original-k8v4-prefill-kernel` | prefill K8V4-KV prompt attention with the original kernel. Without it K8V4 KV uses the fast kernel (V decoded in registers, FP16 per-tile PV accumulation), which splits a chunk's keys across CTAs when its row blocks alone would leave SMs idle; the split uses at most 64 MiB of workspace. Requires `--kv-dtype k8v4` (startup rejects it with any other KV format) | off |
 | `--log-stats-interval-ms N` | aggregate throughput report interval; `0` disables it | `5000` |
 | `--log-stats-panel on\|off` | pin the session statistics panel beneath the console log on an interactive terminal | `on` |
 | `--log-colours on\|off` | colour the console statistics lines; never applies to file logs | `off` |
@@ -1116,7 +1117,8 @@ the KV sizing reserved, and `cuda_graph_measured_bytes` the Device memory graph 
 actually took at startup (`0` without CUDA Graphs); the startup log warns when the second exceeds
 the first.
 
-`server_start.engine.original_int8_prefill_kernel` records `--use-original-int8-prefill-kernel`. `ngram_draft_window` and
+`server_start.engine.original_int8_prefill_kernel` and `original_k8v4_prefill_kernel` record
+`--use-original-int8-prefill-kernel` and `--use-original-k8v4-prefill-kernel`. `ngram_draft_window` and
 `ngram_min_match` record `--ngram-draft-tokens` (`0` disables n-gram drafting) and
 `--ngram-min-match`; `ngram_archive_bytes` and `ngram_session_bytes` are the draft-archive budgets
 from `--ngram-archive-mib` (`0` keeps drafting request-local) and `--ngram-session-mib`; and
