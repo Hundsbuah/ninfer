@@ -1,5 +1,7 @@
-#include "models/qwen3_5/frontend/tool_call_parser.h"
+#include "models/qwen3_5/frontend/tool_call_stream.h"
 
+
+#include "models/qwen3_5/frontend/tool_call_parser.h"
 #include <nlohmann/json.hpp>
 
 #include <initializer_list>
@@ -240,35 +242,42 @@ int test_parameter_delimiters_in_values() {
         }
     }
 
-    // Markup the grammar could continue from stays ambiguous, so those calls still fall back.
-    failures += check_rejected(tool_call("bash", {{"command", "echo '<parameter=unterminated>'"}}),
-                               contract, Reason::MalformedStructure,
-                               "unbalanced nested parameter open was silently repaired");
-    failures += check_rejected(tool_call("bash", {{"command", "echo '</parameter></function>'"}}),
-                               contract, Reason::MalformedStructure,
-                               "a closer followed by a function closer was guessed to be text");
+    // Markup the grammar could continue from used to fall back as ambiguous. Inside a
+    // <tool_call> wrapper the function close must be followed by the wrapper close (P3.10),
+    // so a closer pair followed by anything else is text the value quotes: the value keeps
+    // scanning and the call is parsed with the markup preserved exactly.
+    const std::string quoted_pair =
+        tool_call("bash", {{"command", "echo '</parameter></function>'"}});
+    const auto pair_parsed = fi::parse_qwen_tool_call_output(quoted_pair, 64, contract);
+    failures += check(pair_parsed.is_tool_call_response && pair_parsed.tool_calls.size() == 1,
+                      "a quoted closer pair inside a wrapper was rejected as ambiguous");
+    if (pair_parsed.tool_calls.size() == 1) {
+        const Json pair_args = Json::parse(pair_parsed.tool_calls.front().arguments_json);
+        failures += check(pair_args.at("command") == "echo '</parameter></function>'",
+                          "a quoted closer pair was not preserved in the value");
+    }
 
-    // Tolerant truncation: a closer at the region end still closes the value, and a quoted closer
-    // inside a value the budget cut stays part of the kept partial value.
+    // Tolerant truncation: a value closed at the region end is committed as a truncated tail;
+    // a value the budget cut before its closer is never committed (integrity over
+    // availability), so the region falls back to text with the truncated-tail reason.
     const std::string open  = std::string("<") + "parameter=command>\n";
     const std::string close = std::string("</") + "parameter>";
     const std::string head  = "<tool_call>\n<function=bash>\n" + open;
     const auto closed_cut =
         fi::parse_qwen_tool_call_output(head + "ls\n" + close + "\n", 64, contract, true);
-    const auto quoted_cut = fi::parse_qwen_tool_call_output(
-        head + "echo '" + close + "' more", 64, contract, true);
-    for (const auto* cut : {&closed_cut, &quoted_cut}) {
-        failures += check(cut->is_tool_call_response && cut->tool_calls.size() == 1 &&
-                              cut->diagnostics.fallback_reason == Reason::TruncatedTail,
-                          "a tolerant cut call was not kept as a truncated tail");
-    }
-    if (closed_cut.tool_calls.size() == 1 && quoted_cut.tool_calls.size() == 1) {
+    const auto quoted_cut =
+        fi::parse_qwen_tool_call_output(head + "echo '" + close + "' more", 64, contract, true);
+    failures += check(closed_cut.is_tool_call_response && closed_cut.tool_calls.size() == 1 &&
+                          closed_cut.diagnostics.fallback_reason == Reason::TruncatedTail,
+                      "a tolerant cut call with a closed value was not kept as a truncated tail");
+    if (closed_cut.tool_calls.size() == 1) {
         const Json closed_args = Json::parse(closed_cut.tool_calls.front().arguments_json);
-        const Json quoted_args = Json::parse(quoted_cut.tool_calls.front().arguments_json);
-        failures += check(closed_args.at("command") == "ls" &&
-                              quoted_args.at("command") == "echo '" + close + "' more",
+        failures += check(closed_args.at("command") == "ls",
                           "a tolerant cut call ended its value at the wrong closer");
     }
+    failures += check(!quoted_cut.is_tool_call_response && quoted_cut.tool_calls.empty() &&
+                          quoted_cut.diagnostics.fallback_reason == Reason::TruncatedTail,
+                      "a tolerant cut value was committed instead of falling back to text");
     return failures;
 }
 
@@ -1214,19 +1223,16 @@ int test_tolerant_undeclared_and_value_cut() {
                           strict.diagnostics.fallback_reason == Reason::UndeclaredTool,
                       "strict mode did not reject the undeclared-name call");
 
+    // A value cut before its closer is never committed: its bytes may still grow into a
+    // different value (P3.4). The region falls back to text with the truncated-tail reason,
+    // whatever the finish reason was.
     const std::string value_cut = "Now\n"
                                   "<tool_call>\n"
                                   "<function=delete_file>\n"
                                   + open_tag + "/tmp/out";
     const auto cut_tolerant = fi::parse_qwen_tool_call_output(value_cut, 64, *contract, true);
-    failures += check(cut_tolerant.is_tool_call_response && cut_tolerant.tool_calls.size() == 1 &&
-                          cut_tolerant.tool_calls.front().name == "delete_file",
-                      "tolerant mode did not keep the value-cut call");
-    if (cut_tolerant.tool_calls.size() == 1) {
-        const Json args = Json::parse(cut_tolerant.tool_calls.front().arguments_json);
-        failures += check(args.at("filePath").get<std::string>() == "/tmp/out",
-                          "tolerant mode lost the partial value-cut argument");
-    }
+    failures += check(!cut_tolerant.is_tool_call_response && cut_tolerant.tool_calls.empty(),
+                      "tolerant mode committed a cut string value");
     failures += check(cut_tolerant.diagnostics.fallback_reason == Reason::TruncatedTail,
                       "tolerant value-cut was not flagged as a truncated tail");
     const auto cut_strict = fi::parse_qwen_tool_call_output(value_cut, 64, *contract);
@@ -1323,6 +1329,212 @@ int test_streaming_recognizes_grammar_markers() {
     return failures;
 }
 
+int test_recovery_policy_phase3() {
+    using Reason = ninfer::ToolCallParseFallbackReason;
+    using ninfer::FinishReason;
+    using fi::ToolCallParseFailure;
+    using fi::ToolCallParseProgress;
+    using fi::ToolCallRecoveryDecision;
+    using fi::ToolCallRecoveryPolicy;
+    using fi::ToolCallRegionTermination;
+    int failures = 0;
+
+    // P3.5: the recovery decision is a pure function of the objective progress; strict and
+    // tolerant consume the same progress and differ only in this decision.
+    {
+        ToolCallParseProgress progress;
+        progress.calls.push_back(fi::ParsedFunctionCall{
+            .name       = "read",
+            .parameters = {fi::ParsedParameter{.name = "path", .value = "foo.cpp"}}});
+        const ToolCallRecoveryPolicy strict;
+        const ToolCallRecoveryPolicy tolerant{.tolerant = true};
+        failures += check(fi::decide_tool_call_recovery(progress, strict).decision ==
+                              ToolCallRecoveryDecision::CommitCalls,
+                          "complete progress was not committed by strict");
+        failures += check(fi::decide_tool_call_recovery(progress, tolerant).diagnostic ==
+                              ToolCallParseFailure::None,
+                          "complete progress recorded a diagnostic");
+
+        // Input ended after a complete call whose closing tags were cut: strict maps it to a
+        // structural failure; tolerant commits the open call because every argument byte is
+        // closed.
+        ToolCallParseProgress cut   = progress;
+        cut.termination             = ToolCallRegionTermination::EndOfInput;
+        cut.calls                  = {};
+        cut.open_call              = fi::ParsedFunctionCall{
+            .name       = "read",
+            .parameters = {fi::ParsedParameter{.name = "path", .value = "foo.cpp"}}};
+        failures += check(fi::decide_tool_call_recovery(cut, strict).decision ==
+                              ToolCallRecoveryDecision::Reject,
+                          "strict committed a truncated call");
+        failures += check(fi::decide_tool_call_recovery(cut, strict).diagnostic ==
+                              ToolCallParseFailure::MalformedStructure,
+                          "strict truncation lost the structural failure class");
+        failures += check(fi::decide_tool_call_recovery(cut, tolerant).decision ==
+                              ToolCallRecoveryDecision::CommitCallsAndOpenCall,
+                          "tolerant did not commit a call whose argument bytes are closed");
+        failures += check(fi::decide_tool_call_recovery(cut, tolerant).diagnostic ==
+                              ToolCallParseFailure::TruncatedTail,
+                          "tolerant truncation lost the truncated-tail diagnostic");
+
+        // An open value is never committable, whatever the finish reason was.
+        cut.open_value_open = true;
+        for (const FinishReason reason : {FinishReason::StopToken, FinishReason::OutputLimit,
+                                          FinishReason::ContextCapacity}) {
+            const ToolCallRecoveryPolicy budget{.tolerant = true, .finish_reason = reason};
+            failures += check(fi::decide_tool_call_recovery(cut, budget).decision ==
+                                  ToolCallRecoveryDecision::Reject,
+                              "an open value was committed under a budget finish reason");
+        }
+
+        // A name-only truncation carries no arguments and is never committed.
+        ToolCallParseProgress name_only = cut;
+        name_only.open_value_open       = false;
+        name_only.open_call             = {};
+        failures += check(fi::decide_tool_call_recovery(name_only, tolerant).decision ==
+                              ToolCallRecoveryDecision::Reject,
+                          "a name-only truncation was committed");
+        failures += check(fi::decide_tool_call_recovery(name_only, tolerant).diagnostic ==
+                              ToolCallParseFailure::TruncatedTail,
+                          "a name-only truncation lost the truncated-tail diagnostic");
+
+        // Trailing content after complete calls: tolerant keeps the calls, strict rejects.
+        ToolCallParseProgress trailing = progress;
+        trailing.termination           = ToolCallRegionTermination::Definitive;
+        trailing.failure               = ToolCallParseFailure::TrailingContent;
+        failures += check(fi::decide_tool_call_recovery(trailing, strict).decision ==
+                              ToolCallRecoveryDecision::Reject,
+                          "strict committed calls with trailing content");
+        failures += check(fi::decide_tool_call_recovery(trailing, strict).diagnostic ==
+                              ToolCallParseFailure::TrailingContent,
+                          "strict trailing content lost its reason class");
+        failures += check(fi::decide_tool_call_recovery(trailing, tolerant).decision ==
+                              ToolCallRecoveryDecision::CommitCalls,
+                          "tolerant dropped calls before trailing content");
+        failures += check(fi::decide_tool_call_recovery(trailing, tolerant).diagnostic ==
+                              ToolCallParseFailure::TruncatedTail,
+                          "tolerant trailing content was not recorded as a truncated tail");
+
+        // A broken later call keeps the complete earlier calls under tolerant policy.
+        ToolCallParseProgress later_broken = progress;
+        later_broken.termination           = ToolCallRegionTermination::Definitive;
+        later_broken.failure               = ToolCallParseFailure::MalformedStructure;
+        failures += check(fi::decide_tool_call_recovery(later_broken, tolerant).decision ==
+                              ToolCallRecoveryDecision::CommitCalls,
+                          "tolerant dropped complete calls before a broken later call");
+        failures += check(fi::decide_tool_call_recovery(later_broken, strict).decision ==
+                              ToolCallRecoveryDecision::Reject,
+                          "strict kept calls before a broken later call");
+
+        // The empty function_calls wrapper is the one break no policy forgives.
+        ToolCallParseProgress empty_wrapper = progress;
+        empty_wrapper.termination           = ToolCallRegionTermination::Definitive;
+        empty_wrapper.failure               = ToolCallParseFailure::MalformedStructure;
+        empty_wrapper.unrecoverable_break   = true;
+        failures += check(fi::decide_tool_call_recovery(empty_wrapper, tolerant).decision ==
+                              ToolCallRecoveryDecision::Reject,
+                          "an empty function_calls wrapper was committed");
+    }
+
+    // P3.9: the one-shot entry and the streaming decoder agree on every rule, and an output
+    // budget cut (P3.6) changes nothing about what is safe to commit.
+    const auto contract =
+        output_contract_for("read", Json{{"path", Json{{"type", "string"}}}});
+    const std::string open  = std::string("<") + "parameter=path>\n";
+    const std::string close = std::string("</") + "parameter>";
+    const std::string complete =
+        "<tool_call>\n<function=read>\n" + open + "foo.cpp\n" + close + "\n";
+    const std::string missing_wrapper = complete + "</function>";
+    const std::string missing_function = complete;
+    const std::string value_cut = complete + std::string("<") + "parameter=extra>\npartial";
+    const std::string trailing   = complete + "</function>\n</tool_call>\nextra answer";
+    auto stream = [&](std::string_view text, bool tolerant, FinishReason reason,
+                      fi::ToolCallOutputDecoder::Terminal& terminal) {
+        fi::ToolCallOutputDecoder decoder(contract, 64, tolerant);
+        std::string visible;
+        for (std::size_t offset = 0; offset < text.size(); offset += 7) {
+            visible += decoder.feed(std::string_view(text).substr(offset, 7));
+        }
+        terminal = decoder.finish(reason);
+        return visible;
+    };
+    for (const FinishReason reason : {FinishReason::StopToken, FinishReason::OutputLimit,
+                                      FinishReason::ContextCapacity}) {
+        const auto one_shot = fi::parse_qwen_tool_call_output(missing_wrapper, 64, *contract,
+                                                              true, reason);
+        failures += check(one_shot.is_tool_call_response && one_shot.tool_calls.size() == 1 &&
+                              one_shot.tool_calls.front().name == "read" &&
+                              one_shot.diagnostics.fallback_reason == Reason::TruncatedTail,
+                          "missing wrapper close was not recovered");
+        auto terminal = fi::ToolCallOutputDecoder::Terminal{};
+        const std::string visible = stream(missing_wrapper, true, reason, terminal);
+        failures += check(visible.empty() && terminal.content.empty() &&
+                              terminal.tool_calls.size() == 1 &&
+                              terminal.diagnostics.fallback_reason == Reason::TruncatedTail,
+                          "streaming recovery of a missing wrapper close diverged from one-shot");
+        const auto strict = fi::parse_qwen_tool_call_output(missing_wrapper, 64, *contract);
+        failures += check(!strict.is_tool_call_response &&
+                              strict.diagnostics.fallback_reason == Reason::MalformedStructure,
+                          "strict recovered a missing wrapper close");
+
+        const auto closed = fi::parse_qwen_tool_call_output(missing_function, 64, *contract,
+                                                            true, reason);
+        failures += check(closed.is_tool_call_response && closed.tool_calls.size() == 1 &&
+                              closed.diagnostics.fallback_reason == Reason::TruncatedTail,
+                          "missing function close was not recovered");
+
+        const auto cut = fi::parse_qwen_tool_call_output(value_cut, 64, *contract, true, reason);
+        failures += check(!cut.is_tool_call_response && cut.tool_calls.empty() &&
+                              cut.diagnostics.fallback_reason == Reason::TruncatedTail,
+                          "a cut string value was committed");
+        auto cut_terminal = fi::ToolCallOutputDecoder::Terminal{};
+        stream(value_cut, true, reason, cut_terminal);
+        failures += check(cut_terminal.tool_calls.empty() &&
+                              cut_terminal.diagnostics.fallback_reason == Reason::TruncatedTail,
+                          "streaming committed a cut string value");
+
+        const auto tail = fi::parse_qwen_tool_call_output(trailing, 64, *contract, true, reason);
+        failures += check(tail.is_tool_call_response && tail.tool_calls.size() == 1 &&
+                              tail.diagnostics.fallback_reason == Reason::TruncatedTail,
+                          "complete calls before trailing prose were not recovered");
+        const auto tail_strict = fi::parse_qwen_tool_call_output(trailing, 64, *contract);
+        failures += check(!tail_strict.is_tool_call_response &&
+                              tail_strict.diagnostics.fallback_reason == Reason::TrailingContent,
+                          "strict recovered calls with trailing prose");
+    }
+
+    // P3.10: markup that quotes the closing tags inside a declared string argument must not
+    // commit the string early; the region is broken and falls back to text. Inside a
+    // <tool_call> wrapper a function/invoke close must be followed by the wrapper close, so
+    // the quoted closer pair is text and the value keeps scanning.
+    const auto write_contract = output_contract_for(
+        "write", Json{{"content", Json{{"type", "string"}}},
+                      {"command", Json{{"type", "string"}}}});
+    const std::string function_fixture =
+        "<tool_call>\n<function=write>\n<parameter=content>\n"
+        "A</parameter></function><function=bad.name><parameter=command>echo hi";
+    const std::string invoke_fixture =
+        "<tool_call>\n<invoke=write>\n<parameter=content>\n"
+        "A</parameter></invoke><invoke=bad.name><parameter=command>echo hi";
+    for (const std::string& fixture : {function_fixture, invoke_fixture}) {
+        const auto tolerant = fi::parse_qwen_tool_call_output(fixture, 64, *write_contract, true);
+        failures += check(!tolerant.is_tool_call_response && tolerant.tool_calls.empty() &&
+                              tolerant.content == fixture &&
+                              tolerant.diagnostics.fallback_reason == Reason::TruncatedTail,
+                          "a quoted closer committed a string value early (tolerant)");
+        const auto strict = fi::parse_qwen_tool_call_output(fixture, 64, *write_contract);
+        failures += check(!strict.is_tool_call_response && strict.tool_calls.empty() &&
+                              strict.diagnostics.fallback_reason == Reason::MalformedStructure,
+                          "a quoted closer committed a string value early (strict)");
+        auto terminal = fi::ToolCallOutputDecoder::Terminal{};
+        stream(fixture, true, FinishReason::StopToken, terminal);
+        failures += check(terminal.tool_calls.empty() && terminal.content == fixture &&
+                              terminal.diagnostics.fallback_reason == Reason::TruncatedTail,
+                          "streaming committed a string value at a quoted closer");
+    }
+    return failures;
+}
+
 int main() {
     int failures = 0;
     failures += test_duplicate_parameter_keeps_last_value();
@@ -1359,6 +1571,7 @@ int main() {
     failures += test_tolerant_undeclared_and_value_cut();
     failures += test_grammar_header_forms_one_shot();
     failures += test_streaming_recognizes_grammar_markers();
+    failures += test_recovery_policy_phase3();
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }

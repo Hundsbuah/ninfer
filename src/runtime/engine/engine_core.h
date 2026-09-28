@@ -990,7 +990,7 @@ private:
 
     void complete_cancelled(const std::shared_ptr<Request>& request) {
         (void)request->output.preview_terminal(FinishReason::Cancelled);
-        append_output(request, request->output.commit_preview());
+        append_output(request, request->output.commit_preview(FinishReason::Cancelled));
         complete_success(request, FinishReason::Cancelled);
     }
 
@@ -1328,7 +1328,7 @@ private:
                     request->budget->commit(accepted);
                     if (decode_round) { Scheduling::consume_service_work(*request, accepted); }
                 }
-                auto published = request->output.commit_preview();
+                auto published = request->output.commit_preview(finish_reasons[row]);
                 auto timing    = record_committed_output(request, accepted);
                 append_output(request, std::move(published), std::move(timing));
                 if (decisions[row].terminal) {

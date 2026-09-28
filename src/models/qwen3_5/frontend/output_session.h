@@ -75,7 +75,7 @@ public:
                                                           std::uint32_t total_budget_remaining);
     void validate_generation_capacity(std::uint32_t effective_output_tokens) const;
     [[nodiscard]] runtime::OutputDecision preview_terminal(FinishReason reason);
-    [[nodiscard]] PublishedOutput commit_preview();
+    [[nodiscard]] PublishedOutput commit_preview(FinishReason finish_reason = FinishReason::None);
     [[nodiscard]] std::vector<GeneratedToolCall> take_tool_calls() noexcept;
     [[nodiscard]] ToolCallParseDiagnostics tool_call_parse_diagnostics() const noexcept;
     [[nodiscard]] std::uint32_t reasoning_tokens() const noexcept;

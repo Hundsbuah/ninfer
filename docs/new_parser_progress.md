@@ -171,10 +171,67 @@ Commit: this commit
 
 
 ## Phase 2
-(pending)
+### P2.1–P2.5 Incremental parser (state machine, AST, streaming feed, one-shot + decoder migration)
+Status: complete
+Files changed: `src/models/qwen3_5/frontend/tool_call_stream.h/.cpp` (new), `tool_call_parser.cpp`
+  (cutover: the 296-line batch `QwenToolRegionParser` removed; `parse_qwen_tool_call_output` and
+  `ToolCallOutputDecoder` now drive one `ToolCallStreamParser` instance), `frontend_sources.cmake`
+  (+stream source)
+Implementation decision: one policy-aware region state machine (Top/ExpectFunction/FunctionHeader/
+  FunctionBody/ParameterHeader/ParameterValue/ExpectWrapperClose) over the Phase-1 grammar; the
+  streaming decoder feeds chunks into the same machine the one-shot entry feeds in full (P2: one
+  parser for both routes). The tolerant missing-`>` header recovery and the tolerant dispatch to
+  broken openers remain parse-point rules (single grammar, P3.11: no tolerant-specific grammar).
+Verification findings (bug found and fixed during the gate): two missing `mode = Top` transitions
+  (after a wrapper close and after a non-wrapper function close) made every region fail at the
+  region end; isolated with a standalone machine probe, fixed, re-run green.
+Known limitations: none (all pre-P2 behavior pinned by the test matrix)
+Commit: see Phase 3 note (P2+P3 committed together, deviation documented)
 
 ## Phase 3
-(pending)
+### P3.1–P3.11 Objective parse progress + explicit recovery policy
+Status: complete
+Files changed: `tool_call_stream.h` (+`ToolCallParseProgress`, `ToolCallRecoveryDecision`/
+  `ToolCallRecoveryResult`, `ToolCallRecoveryPolicy`, pure `decide_tool_call_recovery`; `finish`
+  gains `FinishReason`), `tool_call_stream.cpp` (parse_region now produces objective progress:
+  termination class Complete/EndOfInput/Definitive, open-call state, unrecoverable empty
+  function_calls; retention moved out of the parse into the pure decision; `is_close_continuation`
+  gains the tool_call-wrapper structural rule), `tool_call_parser.h/.cpp` (entry + decoder carry
+  `FinishReason`), `output_session.h/.cpp` (`commit_preview(FinishReason)`), `engine_core.h`
+  (per-round `finish_reasons[row]` and the cancel path pass the reason)
+Behavior changes vs. the old parser (intended, plan P3.4/P3.10; old pins updated to the new
+  contract):
+1. a parameter value cut before its closing tag is never committed in tolerant mode (old: the
+   partial value was committed and executed); the region now falls back to text with
+   `TruncatedTail`, whatever the finish reason was; a name-only truncation keeps its old text
+   fallback;
+2. inside a `<tool_call>` wrapper a `</parameter>` followed by `</function>`/`</invoke>` is only a
+   real closer when the wrapper close (or the region end) follows the function close — a new
+   function/invoke opener there is structurally impossible, so the value keeps scanning (P3.10
+   regression fixture, function and invoke variants, tested one-shot and streaming). Outside the
+   wrapper context the old ambiguity rule is unchanged (documented limitation: truly ambiguous
+   wire there still commits at the closer);
+3. a previously ambiguous quoted closer pair inside a wrapper (`echo '</parameter></function>'`
+   with a real closer later) is now parsed with the markup preserved in the value instead of
+   falling back.
+Semantics preserved (pinned): strict all-or-nothing (EndOfInput -> MalformedStructure, trailing
+  -> TrailingContent, undeclared -> UndeclaredTool); tolerant keeps complete calls before a
+  broken later call, trailing prose (TruncatedTail), missing wrapper/function close after a
+  complete value (TruncatedTail), the empty function_calls wrapper stays unrecoverable.
+Tests added: `test_recovery_policy_phase3` — pure decision matrix (complete/EndOfInput/Definitive
+  x strict/tolerant x open states, budget finish reasons, name-only, trailing, later-broken,
+  unrecoverable), one-shot + 7-byte-chunked streaming counterparts for each rule under
+  StopToken/OutputLimit/ContextCapacity, and the P3.10 regression fixtures (function + invoke,
+  tolerant + strict, one-shot + streaming)
+Tests updated: `test_parameter_delimiters_in_values` (quoted pair now parses; cut value now
+  falls back), `test_tolerant_undeclared_and_value_cut` (value-cut case now expects text
+  fallback)
+Tests executed: `ctest -R "parser|grammar|frontend"` -> 3/3 passed
+Result: Phase 3 gate green
+Commit deviation: P2 and P3 share files deeply (the state machine is both the P2 machine and the
+  P3 progress producer); reconstructing a P2-only intermediate state would fabricate history, so
+  both phases are one commit: `feat: policy-free incremental tool-call parser with explicit
+  recovery policy` (plan §8 recommended per-step commits; deviation recorded here and in §12 DoD)
 
 ## Phase 4
 (pending)

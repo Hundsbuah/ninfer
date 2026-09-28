@@ -62,13 +62,16 @@ struct ParsedToolCallOutput {
 [[nodiscard]] std::shared_ptr<const ToolCallOutputContract>
 build_tool_call_output_contract(std::span<const std::string> tool_jsons, bool enabled);
 
-// Parse Qwen's XML-like tool-call format. In tolerant mode, a complete function call is
-// recovered even when the model adds malformed wrapper markup, a trailing suffix, or stops at
-// its output budget before the closing tags; the strict parser keeps its all-or-nothing
-// behavior.
+// Parse Qwen's XML-like tool-call format. The parse itself is policy-free: it reports the
+// complete calls, the state of the open call, and where the input ended. The recovery policy
+// (decide_tool_call_recovery) then decides what may be committed: tolerant mode commits a
+// call only when all of its argument bytes are unambiguously closed — a cut string value is
+// never committed, whatever the finish reason was — while strict mode keeps its
+// all-or-nothing behavior.
 [[nodiscard]] ParsedToolCallOutput
 parse_qwen_tool_call_output(const std::string& text, std::size_t max_tool_name_length,
-                            const ToolCallOutputContract& contract, bool tolerant = false);
+                            const ToolCallOutputContract& contract, bool tolerant = false,
+                            FinishReason finish_reason = FinishReason::None);
 
 // Incrementally publishes bytes that are provably outside a possible terminal Qwen tool-call
 // suffix. At terminal time, valid calls are retained structurally; malformed output is restored
@@ -85,7 +88,7 @@ public:
                           std::size_t max_tool_name_length, bool tolerant = false);
 
     [[nodiscard]] std::string feed(std::string_view text);
-    [[nodiscard]] Terminal finish();
+    [[nodiscard]] Terminal finish(FinishReason finish_reason = FinishReason::None);
 
 private:
     std::shared_ptr<const ToolCallOutputContract> contract_;

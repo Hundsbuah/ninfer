@@ -673,7 +673,7 @@ runtime::OutputDecision OutputSession::preview_terminal(FinishReason reason) {
     return runtime::OutputDecision{.accepted_tokens = 0, .finish_reason = reason};
 }
 
-PublishedOutput OutputSession::commit_preview() {
+PublishedOutput OutputSession::commit_preview(FinishReason finish_reason) {
     if (impl_ == nullptr || !impl_->preview_ready) { std::terminate(); }
     using std::swap;
     swap(impl_->state, impl_->preview_state);
@@ -689,7 +689,7 @@ PublishedOutput OutputSession::commit_preview() {
         }
     }
     if (impl_->state.terminal) {
-        fi::ToolCallOutputDecoder::Terminal terminal = impl_->tool_call_output.finish();
+        fi::ToolCallOutputDecoder::Terminal terminal = impl_->tool_call_output.finish(finish_reason);
         impl_->tool_calls                            = std::move(terminal.tool_calls);
         impl_->tool_call_parse                       = terminal.diagnostics;
         if (!terminal.content.empty()) {
