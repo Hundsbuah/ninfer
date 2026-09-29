@@ -58,9 +58,11 @@ public:
     // True while a tool region is open (the trigger fired, the region has not closed).
     // While inactive the constraint imposes no restriction.
     [[nodiscard]] bool active() const noexcept;
-    // True once the current region closed cleanly (a new region may retrigger).
+    // True while no region is open: initially (nothing has triggered) and after a region
+    // closed (a new region may retrigger).
     [[nodiscard]] bool finished() const noexcept;
-    // Bytes observed since construction or the last region close (diagnostics).
+    // Diagnostics only: the open region's byte count while active, otherwise the length
+    // of the pending marker candidate (not a count of all bytes observed).
     [[nodiscard]] std::size_t observed_bytes() const noexcept;
 
 private:
@@ -73,14 +75,11 @@ private:
     std::size_t max_tool_name_length_;
     // Bytes of the open region since the trigger (empty while inactive).
     std::string buffer_;
-    // The accumulating marker-trigger candidate (starts with '<') while inactive.
+    // The accumulating marker-trigger candidate while inactive (starts with '<'; may
+    // contain further '<' bytes inside a quoted header value).
     std::string marker_prefix_;
     bool triggered_ = false;  // a complete marker fired; the region machine is live
 };
 
-// The strict region parse used by the constraint (and by the machine): one source of truth
-// for in-region legality, independent of any recovery policy.
-[[nodiscard]] ToolCallParseProgress parse_tool_call_region(std::string_view text,
-                                                           const ToolCallParsePolicy& policy);
 
 } // namespace ninfer::models::qwen3_5::frontend

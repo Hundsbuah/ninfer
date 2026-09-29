@@ -445,7 +445,6 @@ ToolCallStreamParser::ToolCallStreamParser(ToolCallParsePolicy policy) : policy_
 
 void ToolCallStreamParser::publish(std::string_view bytes, std::string& visible) {
     content_.append(bytes);
-    published_.append(bytes);
     visible.append(bytes);
 }
 

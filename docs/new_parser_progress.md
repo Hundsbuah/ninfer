@@ -401,3 +401,58 @@ Question: how does current llama.cpp keep one tool-call syntax across parsing, s
 Sources: local checkout `E:\KI\llama.cpp` at 136887b66 (verified current): `docs/autoparser.md`; `common/chat-auto-parser.h`; `common/chat-auto-parser-generator.cpp` (`build_tool_parser_tag_tagged`); `common/parsers/qwen3-coder.cpp`; `common/chat-peg-parser.h`; `src/llama-grammar.h`.
 Conclusion: (a) template diff analysis -> one structured format description -> PEG parser -> optional GBNF grammar; (b) TAG_WITH_TAGGED string values use `until(value_suffix)` — the same fundamental delimiter ambiguity the plan documents; (c) Qwen3-Coder parser: `until("\n</parameter>\n")` framing, required args in any order (permute), lazy grammar triggers on the full `<tool_call>` or complete `<function=NAME>` opener (avoids `<function` prose false positives), preserved tokens `<tool_call>`/`</tool_call>`; (d) `llama_grammar`: stacks over GBNF elements advanced per accepted token (decoded UTF-8), lazy trigger buffer with replay, clone for checkpoint/rollback. NInfer design adopts the architecture (single declarative wire grammar as source of truth, one incremental parser, pure CPU grammar-state core) without copying code.
 Confidence: verified (primary sources read in full)
+## Code Review & Fixes (2026-09-29)
+
+Full review of the delivered parser stack (target state vs origin/master), with static path
+tracing and throwaway probes (compiled against the repo sources with MSVC, deleted
+afterwards). Findings and fixes:
+
+- M1 (fixed): the constraint's inactive scan reset the marker candidate on every '<',
+  while the machine appends and classifies (a NotMarker candidate is flushed as content
+  and the breaking byte is consumed). Bidirectional divergence, verified by probes: on
+  `<function<tool_call>...` the constraint overtriggered (the machine publishes
+  `<function<` as content and latches at the later bare function opener); on
+  `<function name="a<b">...` the machine latches at the header close while the constraint
+  lost the candidate and never triggered. Fix: the inactive scan now mirrors
+  ToolCallStreamParser::feed byte for byte for the marker candidate (first trigger ==
+  parser latch). Regression tests: `test_second_angle_flushes_candidate_without_restarting`,
+  `test_quoted_angle_bracket_in_header_keeps_candidate`. Residual (documented in design doc
+  D2, not a correctness issue): the rescan after a region close retriggers on any complete
+  marker, a superset of the machine's wrapper-only retry on the narrow degenerate case of
+  prose between complete calls followed by a bare function/invoke opener; the machine
+  remains the final authority (guidance-only difference, Phase-4 integration gate).
+- L1 (fixed): docs/tool_call_parser.md said duplicate parameter names keep "the first
+  value wins"; the code, serving.md, and the test all use last-value-wins. Corrected.
+- L2 (fixed): ToolCallStreamParser::published_ was a write-only copy of content_.
+  Removed.
+- L3 (fixed): constraint header comments for finished()/observed_bytes() described
+  semantics the implementation does not have (finished() is also true initially;
+  observed_bytes() is the candidate/region length, not a byte count since
+  construction). Corrected.
+- L4 (retracted as an invalid finding): the review claimed the strict retry loop could only
+  re-prove the same rejection. Wrong: decide_tool_call_recovery commits Complete slices
+  under every policy — the strict check applies to failed slices only — so a broken leading
+  region is recovered at a later clean wrapper even in strict (pinned by
+  test_quoted_marker_before_real_call and test_incremental_quoted_marker_preserves_bytes).
+  The proposed short-circuit was implemented, the parser suite caught the regression, and it
+  was reverted; finish() keeps the original retry loop.
+- L5 (fixed): ToolCallRecoveryPolicy::finish_reason comment claimed the decision can use it
+  as a signal; the decision deliberately ignores it (pinned by test). Corrected.
+- L6 (fixed): ToolCallOutputDecoder kept a duplicated pre-marker scan (whitespace hold,
+  tag hold, latch, flush) instead of delegating to ToolCallStreamParser. The decoder now
+  owns one machine (new accessors latched()/latched_region()/held_tail()); feed() delegates
+  and finish() reads the latched region. Behavior preserved byte for byte (the decoder's
+  is_format_whitespace is the machine's is_tool_format_whitespace; the non-latched finish
+  path still parses the empty region as before, keeping its diagnostics).
+- L8 (fixed): ToolCallStreamParser data members and publish()/latch() made private (no
+  external users); the redundant parse_tool_call_region redeclaration in
+  tool_call_grammar_state.h removed (declared in tool_call_stream.h, which it includes).
+
+Verification: full suite re-run green in the Release build (161/161, 19 min; GPU tests are
+not runnable here — no free GPU — consistent with the no-GPU-runtime-test constraint; the
+13 _real tests are skipped for missing artifacts); probe checks: machine vs constraint on
+`<function<tool_call>` (both now treat the inner marker as content; the constraint triggers
+at the machine's latch byte, not at the inner marker) and on
+`<function name="a<b">` (both trigger at the header close, byte 20: machine
+Invalid/InvalidToolName, constraint rejects there as a definitive break).
+Commit: (this commit)

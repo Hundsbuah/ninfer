@@ -298,6 +298,28 @@ void test_all_byte_splits_of_valid_region() {
     check(whole.finished(), "all byte splits: the whole region completes");
 }
 
+// Review (M1): the inactive scan mirrors the parser machine's feed rule byte for byte.
+// A marker prefix broken by a second '<' is flushed as prose and the breaking byte is
+// consumed: the inner marker must not trigger (the machine publishes the same bytes as
+// content). Regression: the old reset rule retriggered on the inner '<'.
+void test_second_angle_flushes_candidate_without_restarting() {
+    Harness h;
+    h.allowed("<function<", "flush: the second '<' breaks the held function prefix");
+    check(h.constraint.active() == false, "flush: the inner marker must not trigger");
+    h.allowed("tool_call>", "flush: the inner wrapper literal is ordinary prose");
+    check(h.constraint.active() == false, "flush: still inactive after the inner literal");
+}
+
+// Review (M1): a '<' inside a quoted header value keeps the marker candidate open (the old
+// reset rule discarded it and treated the whole header as prose). At the header close the
+// constraint triggers at the machine's latch byte and rejects there: the name 'a<b' violates
+// the tool-name grammar — a definitive structural break the final parser also rejects.
+void test_quoted_angle_bracket_in_header_keeps_candidate() {
+    Harness h;
+    h.need_more("<function name=\"a<b\"", "quoted '<': the closed value keeps the candidate");
+    h.rejected(">", "quoted '<': the latch byte breaks the region definitively");
+}
+
 } // namespace
 
 int main() {
@@ -317,6 +339,8 @@ int main() {
     test_rejected_draft_rollback();
     test_accepted_draft_prefix();
     test_all_byte_splits_of_valid_region();
+    test_second_angle_flushes_candidate_without_restarting();
+    test_quoted_angle_bracket_in_header_keeps_candidate();
     if (failures == 0) { std::puts("tool_call_grammar_state tests: all passed"); }
     return failures == 0 ? 0 : 1;
 }

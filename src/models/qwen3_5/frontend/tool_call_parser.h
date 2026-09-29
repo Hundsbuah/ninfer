@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ninfer/types.h"
+#include "models/qwen3_5/frontend/tool_call_stream.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -92,12 +93,12 @@ public:
 
 private:
     std::shared_ptr<const ToolCallOutputContract> contract_;
-    std::string trailing_whitespace_;
-    std::string tool_region_;
-    std::string pending_tag_;
+    // Pre-marker scan and region buffering delegate to the incremental machine (one feed
+    // rule, no duplicated marker-scan state). The machine's policy is unused here: the
+    // finish path re-parses the latched region with the contract-aware policy.
+    ToolCallStreamParser machine_{ToolCallParsePolicy{}};
     std::size_t max_tool_name_length_ = 0;
     bool tolerant_                    = false;
-    bool saw_tool_marker_             = false;
     bool finished_                    = false;
 };
 

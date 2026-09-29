@@ -97,7 +97,7 @@ and the acceptance gate for that change are documented in
   `TruncatedTail`. The parse entry maps these 1:1 onto the fallback reason recorded on the
   demoted text.
 - `truncated_tail`: set on a tolerant truncation that retained complete-enough calls.
-- `duplicate_parameters_repaired`: counts repeated parameter names in one call (the first
-  value wins); the count is exposed for diagnostics.
+- `duplicate_parameters_repaired`: counts repeated parameter names in one call (the last
+  value wins, as in JSON object syntax); the count is exposed for diagnostics.
 - Tolerant truncations are logged at Info severity with the finish reason that cut the stream
   (`OutputLimit`, `ContextCapacity`, ...). A budget cut never makes an open value committable.

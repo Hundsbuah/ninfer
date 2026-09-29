@@ -8,9 +8,10 @@ namespace ninfer::models::qwen3_5::frontend {
 namespace {
 
 // The marker-trigger candidate held by the inactive state: the suffix of the observed
-// bytes starting at the last '<' (empty while no marker candidate is accumulating). This
-// mirrors the parser machine's feed rule: a '<' starts a candidate, a byte that makes the
-// candidate NotMarker discards it, a byte that keeps it NeedMore extends it.
+// bytes starting at the last '<' (empty while no marker candidate is accumulating). The
+// candidate can only still grow into a later wrapper trigger: the parser's retry re-reads
+// a failed region at a later <tool_call> wrapper, and the suffix from the last '<' is the
+// longest still-open marker candidate.
 std::string marker_suffix(const std::string& text) {
     const std::size_t pos = text.rfind('<');
     return pos == std::string::npos ? std::string{} : std::string(text.substr(pos));
@@ -74,16 +75,20 @@ ToolCallGrammarConstraint::advance(std::string_view decoded_bytes, ToolCallGramm
             break;
         }
         // Inactive: ordinary prose is always legal; only a complete marker trigger
-        // constrains. Track the marker candidate with the machine's own feed rule.
+        // constrains. The marker candidate follows the machine's own feed rule
+        // (ToolCallStreamParser::feed): a '<' starts a candidate only when none is held;
+        // every further byte — including '<' — is appended and classified; a NotMarker
+        // classification flushes the whole candidate as prose and the breaking byte is
+        // consumed (it never starts a new candidate). The first trigger is therefore
+        // exactly the parser's latch.
         std::size_t i = offset;
         while (i < decoded_bytes.size()) {
             const char byte = decoded_bytes[i];
-            if (byte == '<') {
-                state.marker_prefix_ = "<";
+            if (state.marker_prefix_.empty()) {
+                if (byte == '<') { state.marker_prefix_.push_back(byte); }
                 ++i;
                 continue;
             }
-            if (state.marker_prefix_.empty()) { ++i; continue; }
             state.marker_prefix_.push_back(byte);
             ToolOpenTag marker = {};
             const ToolMarkerStatus status = classify_tool_marker_prefix(state.marker_prefix_, marker);

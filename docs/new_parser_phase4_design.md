@@ -101,12 +101,21 @@ directly, so parser and constraint cannot drift.
 ### D2 — lazy trigger
 
 No restriction before a complete marker trigger (ordinary prose and reasoning blocks stay
-free, matching the Qwen3-Coder reference's trigger choice). The trigger set is exactly the
-parser's latch set: `<tool_call>`, `<function_calls>`, or a complete function/invoke opener
-(`classify_tool_marker_prefix == Complete`). A candidate ending inside a marker trigger
-reports `NeedMore` (legal so far; the state stays pending) — this mirrors the grammar's own
-`NeedMore` for partial markers and is what keeps a partial `<tool` in prose from being
-rejected.
+free, matching the Qwen3-Coder reference's trigger choice). The inactive scan mirrors the
+parser machine's feed rule byte for byte for the marker candidate: a `<` starts a candidate
+only when none is held; every further byte — including `<` — is appended and classified; a
+`NotMarker` classification flushes the whole candidate as prose and the breaking byte is
+consumed (it never starts a new candidate). The first trigger is therefore exactly the
+parser's latch: `<tool_call>`, `<function_calls>`, or a complete function/invoke opener
+(`classify_tool_marker_prefix == Complete`). After a region closes, a later complete marker
+retriggers (the parser's region parse accepts a flat call sequence; its retry re-reads a
+failed slice at a later `<tool_call>` wrapper). The rescan after a close is a deliberate
+superset of that wrapper-only retry on the narrow degenerate case of prose between complete
+calls followed by a bare function/invoke opener; the parser remains the final authority, so
+the difference affects masking guidance only, never the accepted output. A candidate ending
+inside a marker trigger reports `NeedMore` (legal so far; the state stays pending) — this
+mirrors the grammar's own `NeedMore` for partial markers and is what keeps a partial
+`<tool` in prose from being rejected.
 
 ### D3 — token/byte semantics
 
@@ -229,7 +238,7 @@ defaulted off).
 | CPU grammar-state core (`ToolCallGrammarConstraint`) | implemented, pure CPU, deterministic |
 | CPU grammar logic (P4.12 matrix) | verified by `ninfer_tool_call_grammar_state_test` (16 test groups incl. every-byte-split property, checkpoint/restore, draft accept/rollback/correction) |
 | Parser grammar as source of truth | verified: the constraint consumes `classify_tool_marker_prefix` + `parse_tool_call_region` directly; no second wire grammar |
-| Lazy trigger | tested (partial marker → `NeedMore`; prose never rejects; trigger on the complete marker set only) |
+| Lazy trigger | tested (partial marker → `NeedMore`; prose never rejects; the inactive scan mirrors the machine's feed rule byte for byte — second-`<` flush and a quoted `<` in a header included) |
 | Checkpoint/rollback (P4.8) | tested (value semantics; restore reproduces fresh-state behavior) |
 | Speculative semantics | documented (D7); CPU state semantics tested; GPU runtime flow build-verified only, **not verified** |
 | CUDA integration compiles | the flag, the option, and the constraint core compile into the CUDA build (`ninfer_model_runtime`); the sampling pipeline is unchanged when the flag is off |

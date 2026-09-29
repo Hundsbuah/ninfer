@@ -107,8 +107,9 @@ struct ToolCallRecoveryResult {
 
 struct ToolCallRecoveryPolicy {
     bool tolerant = false;
-    // FinishReason::OutputLimit / ContextCapacity is available to the decision as a signal,
-    // but a budget cut does not make an open parameter value safe.
+    // Informational only: decide_tool_call_recovery deliberately does not consume the
+    // finish reason — a budget cut never makes an open parameter value safe (pinned by
+    // test).
     FinishReason finish_reason = FinishReason::None;
 };
 
@@ -201,12 +202,21 @@ public:
 
     [[nodiscard]] bool marker_seen() const { return marker_seen_; }
 
+    // True once the feed latched a top-level marker; afterwards every fed byte extends
+    // the region. The decoder reads the latched region and its pre-marker held bytes
+    // through these accessors (it owns no separate marker scan).
+    [[nodiscard]] bool latched() const noexcept { return latched_; }
+    [[nodiscard]] std::string_view latched_region() const noexcept { return region_; }
+    // The bytes held back after the published content: the whitespace prefix plus the
+    // pending marker candidate (both empty after a latch).
+    [[nodiscard]] std::string held_tail() const { return pending_ws_ + marker_prefix_; }
+
+private:
     void publish(std::string_view bytes, std::string& visible);
     void latch(std::string_view marker);
 
     ToolCallParsePolicy policy_;
     std::string content_;       // all bytes determined to be ordinary content
-    std::string published_;     // the subset of content_ already returned by feed()
     std::string pending_ws_;    // whitespace since the last published byte (held: may precede a marker)
     std::string marker_prefix_; // held bytes that may become a top-level marker
     bool latched_    = false;

@@ -513,47 +513,7 @@ std::string ToolCallOutputDecoder::feed(std::string_view text) {
     if (finished_) { throw std::logic_error("tool-call output decoder is already finished"); }
     if (text.empty()) { return {}; }
     if (!contract_) { return std::string(text); }
-    if (saw_tool_marker_) {
-        tool_region_.append(text);
-        return {};
-    }
-
-    std::string visible;
-    for (std::size_t index = 0; index < text.size(); ++index) {
-        const char byte = text[index];
-        if (!pending_tag_.empty()) {
-            pending_tag_.push_back(byte);
-            ToolOpenTag marker = {};
-            const ToolMarkerStatus state = classify_tool_marker_prefix(pending_tag_, marker);
-            if (state == ToolMarkerStatus::Complete) {
-                tool_region_ = std::move(trailing_whitespace_);
-                trailing_whitespace_.clear();
-                tool_region_.append(pending_tag_);
-                pending_tag_.clear();
-                tool_region_.append(text.substr(index + 1));
-                saw_tool_marker_ = true;
-                break;
-            }
-            if (state == ToolMarkerStatus::NotMarker) {
-                visible.append(trailing_whitespace_);
-                trailing_whitespace_.clear();
-                visible.append(pending_tag_);
-                pending_tag_.clear();
-            }
-            continue;
-        }
-
-        if (byte == '<') {
-            pending_tag_.push_back(byte);
-        } else if (is_format_whitespace(byte)) {
-            trailing_whitespace_.push_back(byte);
-        } else {
-            visible.append(trailing_whitespace_);
-            trailing_whitespace_.clear();
-            visible.push_back(byte);
-        }
-    }
-    return visible;
+    return machine_.feed(text);
 }
 
 ToolCallOutputDecoder::Terminal ToolCallOutputDecoder::finish(FinishReason finish_reason) {
@@ -561,25 +521,20 @@ ToolCallOutputDecoder::Terminal ToolCallOutputDecoder::finish(FinishReason finis
     finished_ = true;
     if (!contract_) { return {}; }
 
-    ParsedToolCallOutput parsed = parse_qwen_tool_call_output(tool_region_, max_tool_name_length_,
+    std::string region;
+    if (machine_.latched()) { region.assign(machine_.latched_region()); }
+    ParsedToolCallOutput parsed = parse_qwen_tool_call_output(region, max_tool_name_length_,
                                                               *contract_, tolerant_, finish_reason);
-    if (saw_tool_marker_ && parsed.is_tool_call_response) {
-        // The parser reports the held bytes before the accepted structured region, which are the
-        // bytes after an earlier quoted marker that this decoder has not published yet.
+    if (machine_.latched() && parsed.is_tool_call_response) {
+        // The parser reports the held bytes before the accepted structured region, which are
+        // the bytes after an earlier quoted marker that this decoder has not published yet.
         std::string content = std::move(parsed.content);
-        trailing_whitespace_.clear();
-        tool_region_.clear();
-        pending_tag_.clear();
         return Terminal{.content     = std::move(content),
                         .tool_calls  = std::move(parsed.tool_calls),
                         .diagnostics = parsed.diagnostics};
     }
 
-    std::string tail = std::move(trailing_whitespace_);
-    tail.append(pending_tag_);
-    pending_tag_.clear();
-    tail += tool_region_;
-    tool_region_.clear();
+    std::string tail = machine_.latched() ? std::move(region) : machine_.held_tail();
     return Terminal{
         .content = std::move(tail), .tool_calls = {}, .diagnostics = parsed.diagnostics};
 }
