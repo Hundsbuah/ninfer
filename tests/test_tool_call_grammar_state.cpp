@@ -2,6 +2,7 @@
 #include <cstdio>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "models/qwen3_5/frontend/tool_call_grammar_state.h"
 
@@ -168,6 +169,26 @@ void test_multiple_tool_calls() {
               "multi: second region");
     check(h.constraint.finished(), "multi: finished after the second region");
 }
+// F5: <function_calls> contains a sequence of calls: after a function close the constraint
+// accepts the next call (the strict region parse, its shared legality source, completes the
+// sequence) and finishes at the wrapper close.
+void test_function_calls_call_sequence_accepted() {
+    Harness h;
+    h.allowed("<function_calls>", "F5 sequence: wrapper trigger");
+    h.allowed("<function=read>", "F5 sequence: first call open");
+    h.allowed("<parameter=path>", "F5 sequence: first parameter open");
+    h.allowed("a", "F5 sequence: first value");
+    h.allowed("</parameter>", "F5 sequence: first parameter close");
+    h.allowed("</function>", "F5 sequence: first function close");
+    h.allowed("<function=read>", "F5 sequence: second call open after the function close");
+    h.allowed("<parameter=path>", "F5 sequence: second parameter open");
+    h.allowed("b", "F5 sequence: second value");
+    h.allowed("</parameter>", "F5 sequence: second parameter close");
+    h.allowed("</function>", "F5 sequence: second function close");
+    h.allowed("</function_calls>", "F5 sequence: wrapper close completes the region");
+    check(h.constraint.finished(), "F5 sequence: the region completed");
+}
+
 
 // P4.12: reasoning and prose before the trigger are never constrained.
 void test_reasoning_before_trigger() {
@@ -298,16 +319,22 @@ void test_all_byte_splits_of_valid_region() {
     check(whole.finished(), "all byte splits: the whole region completes");
 }
 
-// Review (M1): the inactive scan mirrors the parser machine's feed rule byte for byte.
-// A marker prefix broken by a second '<' is flushed as prose and the breaking byte is
-// consumed: the inner marker must not trigger (the machine publishes the same bytes as
-// content). Regression: the old reset rule retriggered on the inner '<'.
-void test_second_angle_flushes_candidate_without_restarting() {
+// F8: a marker candidate broken by a second '<' publishes the failed candidate bytes and
+// retains the breaking '<' as a fresh marker candidate: the inner <tool_call> triggers at
+// the machine's latch byte (shared marker transition rule).
+void test_marker_breaking_angle_restarts_candidate() {
     Harness h;
-    h.allowed("<function<", "flush: the second '<' breaks the held function prefix");
-    check(h.constraint.active() == false, "flush: the inner marker must not trigger");
-    h.allowed("tool_call>", "flush: the inner wrapper literal is ordinary prose");
-    check(h.constraint.active() == false, "flush: still inactive after the inner literal");
+    h.need_more("<function<", "F8 restart: the failing function prefix publishes, '<' restarts");
+    check(h.constraint.active() == false, "F8 restart: no region before the inner marker");
+    h.allowed("tool_call>", "F8 restart: the inner wrapper completes the fresh candidate");
+    check(h.constraint.active(), "F8 restart: the inner wrapper triggered the region");
+    h.allowed("<function=read>", "F8 restart: function open inside the region");
+    h.allowed("<parameter=path>", "F8 restart: parameter open");
+    h.allowed("/x", "F8 restart: value");
+    h.allowed("</parameter>", "F8 restart: parameter close");
+    h.allowed("</function>", "F8 restart: function close");
+    h.allowed("</tool_call>", "F8 restart: wrapper close completes the region");
+    check(h.constraint.finished(), "F8 restart: the region completed");
 }
 
 // Review (M1): a '<' inside a quoted header value keeps the marker candidate open (the old
@@ -318,6 +345,44 @@ void test_quoted_angle_bracket_in_header_keeps_candidate() {
     Harness h;
     h.need_more("<function name=\"a<b\"", "quoted '<': the closed value keeps the candidate");
     h.rejected(">", "quoted '<': the latch byte breaks the region definitively");
+}
+
+// F7/F8/I5: the stream parser latch and the grammar-constraint lazy trigger agree on the
+// trigger byte for every corpus line (both consumers step the same marker transition rule).
+void test_marker_stream_and_constraint_latch_equivalence() {
+    // The quoted-angle line ("<function name=\"a<b\">") is excluded: its marker is
+    // syntactically complete at the latch byte, but the region breaks there (invalid name),
+    // so the constraint rejects the latch byte while the stream latches syntactically — a
+    // different predicate, pinned by test_quoted_angle_bracket_in_header_keeps_candidate.
+    const std::vector<std::string> corpus = {{"<function<tool_call>"},
+                                              {"abc <tool_"},
+                                              {"abc <tool_call>"},
+                                              {"abc <<tool_call>"},
+                                              {"prose <function= x\n<tool_call>"},
+                                              {"<tool"},
+                                              {"<function"},
+                                              {"x <parameter=content> y"}};
+    for (const std::string& text : corpus) {
+        int stream_latch = -1;
+        ninfer::models::qwen3_5::frontend::ToolCallStreamParser machine(
+            ninfer::models::qwen3_5::frontend::ToolCallParsePolicy{});
+        for (std::size_t i = 0; i < text.size(); ++i) {
+            machine.feed(text.substr(i, 1));
+            if (stream_latch < 0 && machine.latched()) { stream_latch = static_cast<int>(i); }
+        }
+        int constraint_trigger = -1;
+        ToolCallGrammarConstraint constraint;
+        for (std::size_t i = 0; i < text.size(); ++i) {
+            const std::string_view byte = text.substr(i, 1);
+            const ToolCallConstraintVerdict verdict = constraint.check(byte);
+            if (verdict != ToolCallConstraintVerdict::Rejected) { constraint.commit(byte); }
+            if (constraint_trigger < 0 && constraint.active()) {
+                constraint_trigger = static_cast<int>(i);
+            }
+        }
+        check(stream_latch == constraint_trigger,
+              ("latch equivalence diverged for \"" + text + "\"").c_str());
+    }
 }
 
 } // namespace
@@ -332,6 +397,7 @@ int main() {
     test_non_string_json_arguments();
     test_string_argument_handling();
     test_multiple_tool_calls();
+    test_function_calls_call_sequence_accepted();
     test_reasoning_before_trigger();
     test_grammar_completes_at_correct_boundary();
     test_utf8_split_across_tokens();
@@ -339,7 +405,8 @@ int main() {
     test_rejected_draft_rollback();
     test_accepted_draft_prefix();
     test_all_byte_splits_of_valid_region();
-    test_second_angle_flushes_candidate_without_restarting();
+    test_marker_breaking_angle_restarts_candidate();
+    test_marker_stream_and_constraint_latch_equivalence();
     test_quoted_angle_bracket_in_header_keeps_candidate();
     if (failures == 0) { std::puts("tool_call_grammar_state tests: all passed"); }
     return failures == 0 ? 0 : 1;

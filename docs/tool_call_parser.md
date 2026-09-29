@@ -10,8 +10,10 @@ size, and the result is independent of the chunk partition.
 The wire grammar is the single source of truth for tag literals, header syntax and marker
 recognition. Accepted forms:
 
-- Wrapper: `<tool_call> ... </tool_call>` around one or more calls. A region may also start
-  directly with a function or invoke opener (no wrapper).
+- Wrapper: `<tool_call> ... </tool_call>` (zero or more calls) and
+  `<function_calls> ... </function_calls>` (one or more calls; the wrapper close is
+  optional at the region end). A region may also start directly with a function or invoke
+  opener (no wrapper).
 - Function openers, per family:
   - `<function=NAME>` / `<invoke=NAME>` (short form; `NAME` is the first `name` attribute or
     the short value),
@@ -43,7 +45,31 @@ never silently truncated.
   split point of a region.
 - The region parse produces an objective parse progress (what was recognized, where the input
   ended, whether a structural break occurred). A separate, pure recovery policy decides what
-  may be committed; the parser does not decide policy.
+may be committed; the parser does not decide policy.
+
+## Marker entry and recovery
+
+The top-level entry-marker set is one grammar decision shared by the streaming latch,
+one-shot discovery, the recovery retries and the grammar-constraint lazy trigger: a
+complete wrapper literal (`<tool_call>`, `<function_calls>`) or a syntactically complete
+bare function/invoke opener. The bare form is a compatibility entry at the stream's top
+level.
+
+A region that breaks is re-read at the break (a definite structural break) or after the
+accepted prefix (a cut at the input end); the bytes before the accepted region remain
+verbatim content. A failed region that broke with a wrapper still open owns the bytes up
+to its break as the failed structure: a later wrapper literal opens a fresh top-level
+region there, but a bare function/invoke opener in that scope is never a recovery entry
+(it would reinterpret nested payload as a new call), and a wrapper that opened inside the
+failed wrapper (a nesting break) is skipped. Wrapper nesting — a second wrapper open
+before the first one closed — is a structural break in both modes.
+
+While scanning for the first marker, a candidate broken by a byte the grammar classifies
+as NotMarker is published up to that byte; when the breaking byte itself is `<`, it is
+retained as the start of a fresh candidate, so a real marker inside a failed prefix
+(`prefix <function<tool_call>...`) still latches at the machine's latch byte. A `<` the
+header grammar still accepts (a quoted attribute value) keeps the candidate open instead
+of breaking it.
 
 ## Strict vs. tolerant
 
@@ -54,24 +80,29 @@ Strict (default): all-or-nothing. A region that does not end cleanly falls back 
 content with the precise reason (`MalformedStructure` for a cut or broken region, `TrailingContent`
 for content after complete calls, `UndeclaredTool` for a name outside the declared tools).
 
-Tolerant (`--tolerant-tool-calls`): retains complete calls that appear before a later broken
-call, and for a single final call cut by the output budget commits the call when every
-committed parameter value is unambiguously closed (a call with at least one closed parameter
-and no still-open value). The recovered call is reported structurally with a `truncated_tail`
-diagnostic. A name-only truncation (no closed parameter) still falls back to text: recovery
-never commits an argument whose bytes are not unambiguously closed, because every shipped
-tool takes its payload from a string value. The empty `<function_calls>` wrapper is
-unrecoverable in both modes.
+Tolerant (`--tolerant-tool-calls`): commits only calls whose function close has been
+consumed. A call whose function close was not consumed is never executable, whatever its
+parameter values show: the function close is the executability boundary, not the value
+close. Complete calls before a later broken call, and a function-closed final call cut
+before its wrapper close, are retained with a `truncated_tail` diagnostic. A name-only
+truncation (no closed parameter and no function close) still falls back to text: recovery
+- The empty `<function_calls>`
+  wrapper is unrecoverable in both modes; a `<function_calls>` region holds a sequence of
+  calls (another call may follow any function close) and may end at the region end after
+  its last invoke close (the wrapper close is optional there, a clean completion).
 
 ## Fundamental delimiter ambiguity
 
 The wire format has no delimiter escape. A `</parameter>` inside a value is a real closer
-only when whitespace and then another parameter opener, the function's closer, or the end of
-the output follow it; any other occurrence is value text (a shell command that echoes the
-markup). Inside a `<tool_call>` wrapper the rule is stricter: a `</parameter>` followed by
+only when the bytes after it form a legal continuation, classified by the same wire
+grammar: another parameter opener, the function's closer followed by the wrapper close or
+the region end, or the end of the input. A closer at the input end is a provisional
+boundary: the parameter commits, but a function that never closes stays non-executable.
+Any other continuation (immediate markup that is not a structural token, a quoted closer
+immediately followed by the next token) is value text — a shell command that echoes the
+markup. Inside a `<tool_call>` wrapper the rule is stricter: a `</parameter>` followed by
 `</function>`/`</invoke>` is a real closer only when the wrapper close or the region end
-follows the function close. A quoted closer that is immediately followed by the next token is
-ambiguous and makes the region ordinary content rather than a tool call.
+follows the function close.
 
 Because of this boundary, the parser does not claim that arbitrary strings are safe values:
 a value containing a markup sequence that matches the closer rule at its end is ambiguous by
@@ -79,16 +110,20 @@ construction, and such a region degrades to content instead of guessing.
 
 ## Constrained tool decoding
 
-`--constrained-tool-decoding off|tool-calls-only` (default `off`) reserves grammar-constrained
-decoding of the tool wire syntax: while a tool region is being generated, the token support is
-restricted to the wire grammar so the model cannot leave it. With `off` (the default) the
-sampling path is unchanged.
+`--constrained-tool-decoding off|tool-calls-only` (default `off`) reserves
+grammar-constrained decoding of the tool wire syntax: while a tool region is being
+generated, the token support is restricted to the wire grammar so the model cannot leave
+it.
 
-Status: the CPU grammar-state core is implemented and tested (it tracks the marker trigger,
-advances on decoded bytes, and re-validates the open region with the same strict parser in
-prefix mode, where a structure cut at the input end is a legal partial prefix). The sampling
-integration and its GPU runtime verification are not part of the delivered scope; the design
-and the acceptance gate for that change are documented in
+Status in this build: `tool-calls-only` is not implemented. The CPU grammar-state core is
+implemented and tested (it tracks the marker trigger, advances on decoded bytes, and
+re-validates the open region with the same strict parser in prefix mode), but the sampling
+integration and its GPU verification are not part of the delivered scope. Selecting
+`tool-calls-only` therefore fails at engine startup — before any device work, on the CLI
+and the server alike — with
+`--constrained-tool-decoding=tool-calls-only is not implemented in this build; use off`;
+`off` is accepted and leaves the sampling path bit-identical. The design and the
+acceptance gate for the sampling integration are documented in
 [new_parser_phase4_design.md](new_parser_phase4_design.md).
 
 ## Diagnostics

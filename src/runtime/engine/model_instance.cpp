@@ -16,10 +16,7 @@
 #include <utility>
 
 namespace ninfer::runtime {
-namespace {
-using Clock = std::chrono::steady_clock;
-
-void validate_options(const EngineOptions& options) {
+void validate_engine_options(const EngineOptions& options) {
     if (options.artifact_path.empty()) {
         throw std::invalid_argument("Engine artifact_path must not be empty");
     }
@@ -76,7 +73,19 @@ void validate_options(const EngineOptions& options) {
         throw std::invalid_argument(
             "the original NVFP4 prefill kernel requires the NVFP4 KV cache (--kv-dtype nvfp4)");
     }
+    // F10: tool-calls-only grammar-constrained decoding is not integrated in this build.
+    // Accepting it silently would leave sampling unchanged while claiming a constraint, so
+    // the mode fails at startup with an explicit error instead (off is the only accepted
+    // value; the CLI/server parse the mode, the engine refuses non-off).
+    if (options.constrained_tool_decoding != ConstrainedToolDecoding::Off) {
+        throw std::invalid_argument(
+            "--constrained-tool-decoding=tool-calls-only is not implemented in this build; "
+            "use off");
+    }
 }
+
+namespace {
+using Clock = std::chrono::steady_clock;
 
 // The hybrid index ranks admission sources and values snapshots with the same calibrated
 // prefill and Host-to-Device coefficients the Legacy ResourceManager prices materialization with.
@@ -297,7 +306,7 @@ ModelInstance::ModelInstance(std::unique_ptr<models::qwen3_5::Model> source,
 ModelInstance::~ModelInstance() = default;
 
 ConstructedModel construct_model(const EngineOptions& options, DeviceContext& device) {
-    validate_options(options);
+    validate_engine_options(options);
     const auto start = Clock::now();
     StartupPhaseScope inspect(options.startup_observer, StartupPhase::ArtifactInspect);
     artifact::Reader reader(options.artifact_path);

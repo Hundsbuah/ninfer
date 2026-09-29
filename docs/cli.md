@@ -239,7 +239,7 @@ The table lists executable defaults. The examples above select FP8 KV and MTP3.
 | `--presence-penalty F` | presence-penalty override | registered model/mode default |
 | `--frequency-penalty F` | frequency-penalty override | registered model/mode default (`0`) |
 | `--seed N` | sampling seed | `0` |
-| `--constrained-tool-decoding M` | grammar-constrained decoding of the tool wire syntax (`off` or `tool-calls-only`); reserved feature, the sampling path is unchanged until the integration lands | `off` |
+| `--constrained-tool-decoding M` | grammar-constrained decoding of the tool wire syntax (`off` or `tool-calls-only`); `tool-calls-only` is not implemented in this build and fails at engine startup with an explicit error; use `off` | `off` |
 | `--log-colours on\|off` | colour the statistics output on stderr | on when stderr is a terminal |
 
 When a sampling flag is omitted, Engine selects the general-task preset for the loaded architecture

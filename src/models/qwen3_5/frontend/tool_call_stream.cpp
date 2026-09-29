@@ -29,18 +29,22 @@ struct RegionState {
         FunctionHeader,    // scanning the function/invoke opener
         FunctionBody,      // between parameters; expecting a parameter or the function close
         ParameterHeader,   // scanning the parameter opener
-        ParameterValue,    // inside the parameter value (nested-opener depth scan)
+        ParameterValue,    // inside the parameter value (opaque byte range)
         ExpectWrapperClose,// after a function close inside a <tool_call> wrapper
         Top,               // top level of the region: next call, wrapper close, end, trailing
     };
 
     Mode mode = Mode::ExpectFunction;
     std::size_t pos = 0;
-    ToolTagKind fn_family = ToolTagKind::Function;
+    ToolTagKind fn_family  = ToolTagKind::Function;
     ToolTagKind param_family = ToolTagKind::Parameter;
-    bool wrapper_close_expected = false;
-    bool inside_function_calls = false;
-    bool had_calls = false;
+    // The outer wrapper state (F5): None at the top level, one kind while inside a wrapper.
+    // A second wrapper open before the first closed is a definitive structural break; the
+    // wrapper's close returns the state to None.
+    ToolWrapperKind wrapper = ToolWrapperKind::None;
+    // A call completed inside a <function_calls> wrapper: the wire format requires the
+    // wrapper to contain at least one call (an empty wrapper fails the whole region).
+    bool function_calls_had_call = false;
     ParsedFunctionCall current;
     ParsedToolRegion region;
     // A definitive invalid that must not be retained even in tolerant mode (an empty
@@ -48,36 +52,88 @@ struct RegionState {
     // to contain at least one call).
     bool no_retain = false;
     std::string param_name; // the current parameter's name (set in ParameterHeader)
-    // Parameter value scan
+    // Parameter value scan: the value is an opaque byte range (F1/I1); only the matching
+    // outer close is a candidate boundary, decided by its continuation (no nesting depth).
     std::size_t value_begin = 0;
-    std::uint8_t depth = 1;
-    std::size_t next_close = std::string::npos;
 };
 
 
-// After a candidate closer the grammar continues with another parameter, the current
-// function's closer, or (for an output cut short) the region end. A closer followed by
-// anything else is text the value quotes, such as a command that echoes tool markup.
-// Inside a <tool_call> wrapper the function close must itself be followed by the wrapper
-// close (or the region end): a new function/invoke opener there is structurally impossible,
-// so the candidate was a quoted closer and the value keeps scanning (P3.10: a string value
-// must never be committed at a quoted boundary).
-bool is_close_continuation(std::string_view text, std::size_t after, ToolTagKind fn_family,
-                           bool wrapper_close_expected) noexcept {
+// What may legally follow a consumed function/invoke close, per the surrounding wrapper
+// state (F4). The answer decides whether the close was a structural boundary or quoted
+// payload: inside <tool_call> only the wrapper close (or its in-progress prefix at the
+// generation end) may follow; at the top level and inside <function_calls> the next call,
+// the wrapper close, or the end of generation continues the region. Anything else proves
+// the close was part of the payload.
+enum class FunctionCloseContinuation : std::uint8_t {
+    Legal,    // the close is a structural boundary
+    Payload,  // the following bytes prove the close is quoted payload
+};
+
+FunctionCloseContinuation classify_function_close_continuation(std::string_view text,
+                                                               std::size_t after,
+                                                               ToolWrapperKind wrapper) noexcept {
     const std::size_t at = skip_ws(text, after);
-    if (at >= text.size()) { return true; }
+    if (at >= text.size()) { return FunctionCloseContinuation::Legal; }
+    if (wrapper == ToolWrapperKind::ToolCall) {
+        if (starts_with_at(text, at, tool_close_literal(ToolTagKind::ToolCall))) {
+            return FunctionCloseContinuation::Legal;
+        }
+        return is_strict_prefix_of(tool_close_literal(ToolTagKind::ToolCall), text, at)
+                   ? FunctionCloseContinuation::Legal
+                   : FunctionCloseContinuation::Payload;
+    }
+    if (wrapper == ToolWrapperKind::FunctionCalls &&
+        starts_with_at(text, at, tool_close_literal(ToolTagKind::FunctionCalls))) {
+        return FunctionCloseContinuation::Legal;
+    }
     ToolOpenTag opener = {};
-    if (parse_tool_parameter_open(text.substr(at), opener) == ToolHeaderStatus::Complete) {
-        return true;
+    const ToolHeaderStatus opener_status = parse_tool_function_open(text.substr(at), opener);
+    if (opener_status == ToolHeaderStatus::Complete || opener_status == ToolHeaderStatus::NeedMore) {
+        return FunctionCloseContinuation::Legal;
+    }
+    if (is_strict_prefix_of(tool_close_literal(ToolTagKind::FunctionCalls), text, at) ||
+        is_strict_prefix_of(tool_open_literal(ToolTagKind::ToolCall), text, at)) {
+        return FunctionCloseContinuation::Legal;
+    }
+    return FunctionCloseContinuation::Payload;
+}
+
+// The tri-state continuation classification of a candidate outer parameter close (F1/F3/F4).
+// A candidate closer is a structural boundary when the following bytes are the grammar's
+// next structural token; anything else keeps the closer inside the payload. End of input
+// right after the closer keeps the boundary provisional: the parameter may be provisionally
+// closed, but the function remains open and therefore non-executable.
+enum class CloseContinuation : std::uint8_t {
+    Invalid,   // the following bytes prove the closer is payload
+    Complete,  // the following bytes prove a structural boundary
+    NeedMore,  // the input ends right after the closer: provisional boundary
+};
+
+CloseContinuation classify_close_continuation(std::string_view text, std::size_t after,
+                                              ToolTagKind fn_family,
+                                              ToolWrapperKind wrapper) noexcept {
+    const std::size_t at = skip_ws(text, after);
+    if (at >= text.size()) { return CloseContinuation::NeedMore; }
+    ToolOpenTag opener = {};
+    const ToolHeaderStatus opener_status = parse_tool_parameter_open(text.substr(at), opener);
+    if (opener_status == ToolHeaderStatus::Complete) { return CloseContinuation::Complete; }
+    if (opener_status == ToolHeaderStatus::NeedMore) {
+        // A cut-off parameter opener at the generation end (F4/I3): the preceding close stays
+        // closed; the incomplete next token is a truncation, not payload.
+        return CloseContinuation::Complete;
     }
     if (starts_with_at(text, at, tool_close_literal(fn_family))) {
-        if (!wrapper_close_expected) { return true; }
-        const std::size_t after_fn =
-            skip_ws(text, at + tool_close_literal(fn_family).size());
-        if (after_fn >= text.size()) { return true; }
-        return starts_with_at(text, after_fn, tool_close_literal(ToolTagKind::ToolCall));
+        return classify_function_close_continuation(
+                   text, at + tool_close_literal(fn_family).size(), wrapper) ==
+                   FunctionCloseContinuation::Legal
+                   ? CloseContinuation::Complete
+                   : CloseContinuation::Invalid;
     }
-    return false;
+    if (is_strict_prefix_of(tool_close_literal(fn_family), text, at)) {
+        // A cut-off function close at the generation end (F4/I3).
+        return CloseContinuation::Complete;
+    }
+    return CloseContinuation::Invalid;
 }
 
 // Deterministic parse of a complete tool-region slice. The slice always starts at a marker
@@ -87,23 +143,28 @@ ToolCallParseProgress parse_region(std::string_view text, const ToolCallParsePol
     RegionState s;
     ToolCallParseProgress out;
 
-    auto invalid = [&](ToolCallParseFailure f) {
+    auto invalid = [&](ToolCallParseFailure f, std::size_t break_at) {
         // A definitive structural break (or trailing content after complete calls). The
         // progress records the complete calls and the open call; the recovery policy decides
-        // retention, never the parse.
+        // retention, never the parse. `break_at` is the first byte that proved the break: a
+        // recovery retry may re-read at or after it, but never inside the failed structure.
         out.termination                   = ToolCallRegionTermination::Definitive;
         out.failure                       = f;
+        out.break_offset                  = break_at;
+        out.wrapper_at_break              = s.wrapper;
         out.open_call                     = std::move(s.current);
         out.unrecoverable_break           = s.no_retain;
         out.calls                         = std::move(s.region.calls);
         out.duplicate_parameters_repaired = s.region.duplicate_parameters_repaired;
     };
 
-    auto truncated = [&](bool value_open) {
+    auto truncated = [&](bool value_open, std::size_t end_at) {
         // The input ended mid-region. Strict mode maps this to a structural failure; tolerant
-        // recovery may commit complete calls, and the open call only when no value of it is
-        // still open.
+        // recovery may commit complete calls. An open call is never committed (F2/I2): its
+        // function close was not consumed.
         out.termination                   = ToolCallRegionTermination::EndOfInput;
+        out.break_offset                  = end_at;
+        out.wrapper_at_break              = s.wrapper;
         out.open_call                     = std::move(s.current);
         out.open_value_open               = value_open;
         out.calls                         = std::move(s.region.calls);
@@ -119,7 +180,7 @@ ToolCallParseProgress parse_region(std::string_view text, const ToolCallParsePol
     auto complete_call = [&]() {
         s.region.calls.push_back(std::move(s.current));
         s.current = {};
-        if (s.inside_function_calls) { s.had_calls = true; }
+        if (s.wrapper == ToolWrapperKind::FunctionCalls) { s.function_calls_had_call = true; }
     };
 
     for (;;) {
@@ -135,41 +196,64 @@ ToolCallParseProgress parse_region(std::string_view text, const ToolCallParsePol
                     return out;
                 }
                 // A wrapper literal was consumed but no function followed.
-                truncated(false);
+                truncated(false, i);
                 return out;
             }
-            if (s.inside_function_calls &&
+            if (s.wrapper == ToolWrapperKind::FunctionCalls &&
                 starts_with_at(text, i, tool_close_literal(ToolTagKind::FunctionCalls))) {
                 s.pos = i + tool_close_literal(ToolTagKind::FunctionCalls).size();
-                if (!s.had_calls) {
+                if (!s.function_calls_had_call) {
+                    // An empty <function_calls> wrapper is a wire violation that fails the
+                    // whole region (no recovery commits anything from it).
                     s.no_retain = true;
-                    invalid(ToolCallParseFailure::MalformedStructure);
+                    invalid(ToolCallParseFailure::MalformedStructure, i);
                     return out;
                 }
-                s.inside_function_calls = false;
+                s.wrapper = ToolWrapperKind::None;
                 complete();
                 return out;
             }
-            if (policy.prefix && s.inside_function_calls &&
+            if (s.wrapper == ToolWrapperKind::FunctionCalls &&
                 is_strict_prefix_of(tool_close_literal(ToolTagKind::FunctionCalls), text, i)) {
-                // An in-progress </function_calls> close at the slice end.
-                truncated(false);
+                // An in-progress </function_calls> close at the slice end: the generated
+                // prefix may still complete (F4: an objective truncation fact).
+                truncated(false, i);
+                return out;
+            }
+            if (is_strict_prefix_of(tool_open_literal(ToolTagKind::ToolCall), text, i) ||
+                is_strict_prefix_of(tool_open_literal(ToolTagKind::FunctionCalls), text, i)) {
+                // An in-progress wrapper literal at the slice end (F4).
+                truncated(false, i);
                 return out;
             }
             if (starts_with_at(text, i, tool_open_literal(ToolTagKind::ToolCall))) {
-                s.pos                  = i + tool_open_literal(ToolTagKind::ToolCall).size();
-                s.wrapper_close_expected = true;
-                s.mode = RegionState::Mode::ExpectFunction;
+                if (s.wrapper != ToolWrapperKind::None) {
+                    // A second wrapper open before the first closed: unbalanced nesting is a
+                    // definitive structural break (F5/I4). The nested wrapper never parses and
+                    // its calls are never re-read as recovery entries (wrapper-only search
+                    // after it); the recovery policy still decides about complete calls the
+                    // outer region already committed (F2 retention).
+                    invalid(ToolCallParseFailure::MalformedStructure, i);
+                    return out;
+                }
+                s.pos     = i + tool_open_literal(ToolTagKind::ToolCall).size();
+                s.wrapper = ToolWrapperKind::ToolCall;
+                s.mode    = RegionState::Mode::ExpectFunction;
                 continue;
             }
             if (starts_with_at(text, i, tool_open_literal(ToolTagKind::FunctionCalls))) {
-                s.pos                 = i + tool_open_literal(ToolTagKind::FunctionCalls).size();
-                s.inside_function_calls = true;
-                s.mode = RegionState::Mode::ExpectFunction;
+                if (s.wrapper != ToolWrapperKind::None) {
+                    invalid(ToolCallParseFailure::MalformedStructure, i);
+                    return out;
+                }
+                s.pos     = i + tool_open_literal(ToolTagKind::FunctionCalls).size();
+                s.wrapper = ToolWrapperKind::FunctionCalls;
+                s.mode    = RegionState::Mode::ExpectFunction;
                 continue;
             }
             ToolOpenTag opener_probe = {};
-            const ToolHeaderStatus opener_status = parse_tool_function_open(text.substr(i), opener_probe);
+            const ToolHeaderStatus opener_status =
+                parse_tool_function_open(text.substr(i), opener_probe);
             // A complete opener is a function. Under tolerant mode a broken opener
             // ("<function=memory\n...", a dropped '<' or keyword) also enters the header state,
             // where the recovery rules run; strict mode invalidates it below with the same
@@ -180,20 +264,16 @@ ToolCallParseProgress parse_region(std::string_view text, const ToolCallParsePol
                 s.mode = RegionState::Mode::FunctionHeader;
                 continue;
             }
-            if (policy.prefix &&
-                (opener_status == ToolHeaderStatus::NeedMore ||
-                 is_strict_prefix_of(tool_open_literal(ToolTagKind::ToolCall), text, i) ||
-                 is_strict_prefix_of(tool_open_literal(ToolTagKind::FunctionCalls), text, i))) {
-                // An in-progress opener or wrapper literal at the slice end: the generated
-                // prefix may still complete into a valid structure.
-                truncated(false);
+            if (opener_status == ToolHeaderStatus::NeedMore) {
+                // An in-progress function/invoke opener at the slice end (F4).
+                truncated(false, i);
                 return out;
             }
             // A byte that is not a marker: trailing text after complete calls, or a broken
             // region start. A definitive structural outcome: tolerant recovery commits the
             // complete calls (recording the truncation); strict mode rejects with the reason.
-            if (s.region.calls.empty()) { invalid(ToolCallParseFailure::MalformedStructure); }
-            else { invalid(ToolCallParseFailure::TrailingContent); }
+            if (s.region.calls.empty()) { invalid(ToolCallParseFailure::MalformedStructure, i); }
+            else { invalid(ToolCallParseFailure::TrailingContent, i); }
             return out;
         }
         case RegionState::Mode::FunctionHeader: {
@@ -214,7 +294,7 @@ ToolCallParseProgress parse_region(std::string_view text, const ToolCallParsePol
                 } else if (starts_with_at(text, scan, "invoke")) {
                     opener.kind = ToolTagKind::Invoke;
                 } else {
-                    invalid(ToolCallParseFailure::MalformedStructure);
+                    invalid(ToolCallParseFailure::MalformedStructure, i);
                     return out;
                 }
                 scan += (opener.kind == ToolTagKind::Function ? 8 : 6);
@@ -223,7 +303,7 @@ ToolCallParseProgress parse_region(std::string_view text, const ToolCallParsePol
                     from_boundary = true;
                     st      = parse_tool_header_after_keyword(text.substr(scan), opener.kind, opener);
                 } else {
-                    invalid(ToolCallParseFailure::MalformedStructure);
+                    invalid(ToolCallParseFailure::MalformedStructure, i);
                     return out;
                 }
             }
@@ -264,14 +344,14 @@ ToolCallParseProgress parse_region(std::string_view text, const ToolCallParsePol
                 // NeedMore at the slice end is a cut-off header (more bytes could complete it);
                 // Invalid or a failed recovery is a definitive break.
                 if (st == ToolHeaderStatus::NeedMore) {
-                    truncated(false);
+                    truncated(false, i);
                 } else {
-                    invalid(ToolCallParseFailure::MalformedStructure);
+                    invalid(ToolCallParseFailure::MalformedStructure, i);
                 }
                 return out;
             }
             if (!is_valid_tool_name(name, policy.max_name_length)) {
-                invalid(ToolCallParseFailure::InvalidToolName);
+                invalid(ToolCallParseFailure::InvalidToolName, i);
                 return out;
             }
             // Strict mode rejects a name outside the declared tool set. Tolerant mode keeps an
@@ -280,7 +360,7 @@ ToolCallParseProgress parse_region(std::string_view text, const ToolCallParsePol
             if (!policy.tolerant && policy.enforce_declared_names &&
                 (policy.declared_check == nullptr ||
                  !policy.declared_check(policy.contract, name))) {
-                invalid(ToolCallParseFailure::UndeclaredTool);
+                invalid(ToolCallParseFailure::UndeclaredTool, i);
                 return out;
             }
             s.current.name  = std::string(name);
@@ -292,18 +372,26 @@ ToolCallParseProgress parse_region(std::string_view text, const ToolCallParsePol
             const std::size_t i = skip_ws(text, s.pos);
             if (i == text.size()) {
                 // The region ends after the last parameter (or the name): a missing function
-                // close is a truncation, not a malformed structure.
-                truncated(false);
+                // close is a truncation, not a malformed structure. The function stays open
+                // and therefore non-executable (F2/I2); the recovery policy commits only the
+                // complete calls.
+                truncated(false, i);
                 return out;
             }
             if (starts_with_at(text, i, tool_close_literal(s.fn_family))) {
+                // The matching function close is consumed here: the call is structurally
+                // complete from this byte on (F2/I2). The wrapper close, when present, only
+                // closes the wrapper; it completes no call.
                 s.pos = i + tool_close_literal(s.fn_family).size();
-                if (s.wrapper_close_expected) {
-                    s.mode = RegionState::Mode::ExpectWrapperClose;
-                } else {
-                    complete_call();
-                    s.mode = RegionState::Mode::Top;
-                }
+                complete_call();
+                // A <tool_call> wrapper must close next (ExpectWrapperClose). A
+                // <function_calls> wrapper holds a sequence of calls (F5): the next token
+                // may be another call, the wrapper close, or the region end — Top handles
+                // all three and rejects a nested wrapper open.
+                s.mode = (s.wrapper == ToolWrapperKind::None ||
+                          s.wrapper == ToolWrapperKind::FunctionCalls)
+                            ? RegionState::Mode::Top
+                            : RegionState::Mode::ExpectWrapperClose;
                 continue;
             }
             ToolOpenTag opener = {};
@@ -313,14 +401,13 @@ ToolCallParseProgress parse_region(std::string_view text, const ToolCallParsePol
                 s.mode = RegionState::Mode::ParameterHeader;
                 continue;
             }
-            if (policy.prefix &&
-                (param_status == ToolHeaderStatus::NeedMore ||
-                 is_strict_prefix_of(tool_close_literal(s.fn_family), text, i))) {
-                // An in-progress parameter opener or function close at the slice end.
-                truncated(false);
+            if (param_status == ToolHeaderStatus::NeedMore ||
+                is_strict_prefix_of(tool_close_literal(s.fn_family), text, i)) {
+                // An in-progress parameter opener or function close at the slice end (F4).
+                truncated(false, i);
                 return out;
             }
-            invalid(ToolCallParseFailure::MalformedStructure);
+            invalid(ToolCallParseFailure::MalformedStructure, i);
             return out;
         }
         case RegionState::Mode::ParameterHeader: {
@@ -330,109 +417,97 @@ ToolCallParseProgress parse_region(std::string_view text, const ToolCallParsePol
             if (st != ToolHeaderStatus::Complete || opener.name.empty()) {
                 // A broken or cut-off parameter header fails the call even in tolerant mode:
                 // there is no value to retain, and the current call is dropped with it.
-                invalid(ToolCallParseFailure::MalformedStructure);
+                invalid(ToolCallParseFailure::MalformedStructure, i);
                 return out;
             }
             s.param_family = opener.kind;
             s.param_name   = std::string(opener.name);
             s.value_begin  = i + opener.consumed;
-            s.depth        = 1;
-            s.next_close   = text.find(tool_close_literal(opener.kind), s.value_begin);
             s.pos          = s.value_begin;
             s.mode         = RegionState::Mode::ParameterValue;
             continue;
         }
         case RegionState::Mode::ParameterValue: {
+            // A parameter value is an opaque byte range (I1/F1): literal openers inside the
+            // payload are ordinary bytes, and only the matching outer close is a candidate
+            // boundary. No nesting depth is tracked: a candidate is a boundary exactly when
+            // its continuation is the grammar's next structural token.
             const std::string_view required_close = tool_close_literal(s.param_family);
-            std::size_t scan       = s.value_begin;
-            std::size_t next_close = s.next_close;
-            std::size_t value_end  = 0;
-            std::size_t close_len  = 0;
-            bool found             = false;
-            while (scan < text.size()) {
-                if (scan == next_close) {
-                    // Closers of parameters the value quotes whole always balance their
-                    // openers; only the outermost one must be followed by the grammar's next
-                    // token.
-                    if (s.depth != 1 ||
-                        is_close_continuation(text, scan + required_close.size(), s.fn_family,
-                                               s.wrapper_close_expected)) {
-                        --s.depth;
-                    }
-                    if (s.depth == 0) {
-                        value_end = scan;
-                        close_len = required_close.size();
-                        found     = true;
-                        break;
-                    }
-                    scan       += required_close.size();
-                    next_close  = text.find(required_close, scan);
+            std::size_t scan = s.value_begin;
+            for (;;) {
+                const std::size_t candidate = text.find(required_close, scan);
+                if (candidate == std::string_view::npos) {
+                    // The region ends inside the value: a cut parameter value is never
+                    // committed — its bytes may still grow into a different value. The
+                    // progress records the open value; the recovery policy decides (it never
+                    // commits a call whose value is still open, whatever the finish reason).
+                    truncated(true, s.value_begin);
+                    return out;
+                }
+                const CloseContinuation continuation = classify_close_continuation(
+                    text, candidate + required_close.size(), s.fn_family, s.wrapper);
+                if (continuation == CloseContinuation::Invalid) {
+                    // A quoted closer (echoed markup, command text): keep scanning.
+                    scan = candidate + required_close.size();
                     continue;
                 }
-                if (text[scan] == '<') {
-                    ToolOpenTag nested = {};
-                    if (parse_tool_parameter_open(text.substr(scan), nested) ==
-                        ToolHeaderStatus::Complete) {
-                        ++s.depth;
-                        scan = scan + nested.consumed;
-                        continue;
-                    }
-                }
-                ++scan;
-            }
-            auto commit_parameter = [&](std::string_view value) {
-                // Last occurrence wins, as it would in JSON object syntax, rather than
-                // discarding an otherwise well-formed call.
-                const auto existing = std::find_if(s.current.parameters.begin(),
-                                                   s.current.parameters.end(),
+                // Complete or NeedMore: the parameter boundary is retained (I3). A NeedMore
+                // boundary leaves the function open, so the call stays non-executable (F3).
+                auto& current = s.current;
+                const auto existing = std::find_if(current.parameters.begin(),
+                                                   current.parameters.end(),
                                                    [&](const ParsedParameter& candidate) {
                                                        return candidate.name == s.param_name;
                                                    });
-                if (existing != s.current.parameters.end()) {
-                    existing->value = std::string(value);
+                if (existing != current.parameters.end()) {
+                    // Last occurrence wins, as it would in JSON object syntax, rather than
+                    // discarding an otherwise well-formed call.
+                    existing->value = std::string(text.substr(s.value_begin, candidate - s.value_begin));
                     ++s.region.duplicate_parameters_repaired;
                 } else {
-                    s.current.parameters.push_back(
-                        ParsedParameter{.name = s.param_name, .value = std::string(value)});
+                    current.parameters.push_back(
+                        ParsedParameter{.name = s.param_name,
+                                        .value = std::string(text.substr(s.value_begin, candidate - s.value_begin))});
                 }
-            };
-            if (!found) {
-                // The region ends inside the value: a cut parameter value is never committed —
-                // its bytes may still grow into a different value. The progress records the
-                // open value; the recovery policy decides (it never commits a call whose value
-                // is still open, whatever the finish reason was).
-                truncated(true);
-                return out;
+                s.pos  = candidate + required_close.size();
+                s.mode = RegionState::Mode::FunctionBody;
+                break;
             }
-            commit_parameter(text.substr(s.value_begin, value_end - s.value_begin));
-            s.pos  = value_end + close_len;
-            s.mode = RegionState::Mode::FunctionBody;
+            // The parameter closed: re-dispatch the region state machine at the new mode
+            // (the inner scan loop is done; the outer loop re-enters the switch).
             continue;
         }
         case RegionState::Mode::ExpectWrapperClose: {
+            // Only the <tool_call> wrapper reaches this state: after a function close
+            // inside <function_calls> the machine returns to Top, where the call sequence
+            // may continue (F5).
+            const std::string_view close_literal = tool_close_literal(ToolTagKind::ToolCall);
             const std::size_t i = skip_ws(text, s.pos);
             if (i == text.size()) {
-                // A complete call may be followed by the end of its budget before the closing
-                // wrapper tag.
-                truncated(false);
+                // A function-closed call may be followed by the end of its budget before the
+                // closing wrapper tag: a truncated tail. The complete call was committed at
+                // the function close; tolerant recovery may retain it (F2).
+                truncated(false, i);
                 return out;
             }
-            if (starts_with_at(text, i, tool_close_literal(ToolTagKind::ToolCall))) {
-                s.pos = i + tool_close_literal(ToolTagKind::ToolCall).size();
-                complete_call();
-                s.wrapper_close_expected = false;
-                s.mode = RegionState::Mode::Top;
+            if (starts_with_at(text, i, close_literal)) {
+                // The wrapper close closes the wrapper only: the call was already committed
+                // at its function close (F2). A second complete_call() here is exactly the
+                // bug the recovery integrity fix removes.
+                s.pos     = i + close_literal.size();
+                s.wrapper = ToolWrapperKind::None;
+                s.mode    = RegionState::Mode::Top;
                 continue;
             }
-            if (policy.prefix && is_strict_prefix_of(tool_close_literal(ToolTagKind::ToolCall), text, i)) {
-                // An in-progress </tool_call> close at the slice end.
-                truncated(false);
+            if (is_strict_prefix_of(close_literal, text, i)) {
+                // An in-progress wrapper close at the slice end: a truncated tail (F4).
+                truncated(false, i);
                 return out;
             }
-            invalid(ToolCallParseFailure::MalformedStructure);
+            invalid(ToolCallParseFailure::MalformedStructure, i);
             return out;
         }
-        }
+    }
     }
 }
 
@@ -478,10 +553,13 @@ std::string ToolCallStreamParser::feed(std::string_view chunk) {
                 return visible;
             }
             if (state == ToolMarkerStatus::NotMarker) {
+                // F8: a breaking '<' starts a fresh candidate; the failed bytes before it
+                // are published as ordinary content, the '<' itself is retained.
+                const std::size_t retained = failed_marker_candidate_retained(marker_prefix_);
                 publish(pending_ws_, visible);
-                publish(marker_prefix_, visible);
+                publish(marker_prefix_.substr(0, marker_prefix_.size() - retained), visible);
                 pending_ws_.clear();
-                marker_prefix_.clear();
+                marker_prefix_.resize(retained);
             }
             continue;
         }
@@ -508,8 +586,12 @@ ToolCallStreamResult ToolCallStreamParser::finish(FinishReason finish_reason) co
         result.tail    = content_ + pending_ws_ + marker_prefix_;
         return result;
     }
-    // Retries move only to a later <tool_call> wrapper: the markup nested inside a failed
-    // region (its <function=...> or <invoke>) must not re-read a truncated call.
+    // complete marker (wrapper literal or complete function/invoke opener) at or after the
+    // failed structure's break. A retry never re-enters inside the failed region: a
+    // definitive break re-enters at the break byte (the bytes before it were consumed as the
+    // failed structure), an EndOfInput re-enters after the region start as before — and no
+    // re-entry happens while a wrapper was open, because an open wrapper owns the region
+    // tail as payload (F7 test: a nested fake call inside a failed wrapper never executes).
     std::size_t base = 0;
     ToolCallParseFailure first_failure = ToolCallParseFailure::MalformedStructure;
     const ToolCallRecoveryPolicy recovery_policy{policy_.tolerant, finish_reason};
@@ -522,17 +604,42 @@ ToolCallStreamResult ToolCallStreamParser::finish(FinishReason finish_reason) co
             result.failure = recovery.diagnostic;
             result.region.calls = std::move(progress.calls);
             result.region.duplicate_parameters_repaired = progress.duplicate_parameters_repaired;
-            if (recovery.decision == ToolCallRecoveryDecision::CommitCallsAndOpenCall) {
-                result.region.calls.push_back(std::move(progress.open_call));
-            }
             result.truncated_tail =
                 progress.termination != ToolCallRegionTermination::Complete;
             result.tail = region_.substr(0, base);
             return result;
         }
         if (base == 0) { first_failure = recovery.diagnostic; }
-        const std::size_t next = region_.find(tool_open_literal(ToolTagKind::ToolCall), base + 1);
-        if (next == std::string::npos) {
+        const bool wrapper_open = progress.wrapper_at_break != ToolWrapperKind::None;
+        // The break offset is relative to the retried slice: the next search starts at the
+        // absolute break position, never before the accepted prefix.
+        std::size_t search_from =
+            progress.termination == ToolCallRegionTermination::Definitive
+                ? base + progress.break_offset
+                : base + 1;
+        if (wrapper_open && progress.termination == ToolCallRegionTermination::Definitive) {
+            // A definitive nesting break occurs at the failed wrapper's own open: that
+            // wrapper literal cannot open a new top-level region (it is the nested open that
+            // failed the structure). The recovery search starts after it; a later wrapper is
+            // still a legitimate entry (F7 test 1).
+            if (starts_with_at(region_, search_from, tool_open_literal(ToolTagKind::ToolCall))) {
+                search_from += tool_open_literal(ToolTagKind::ToolCall).size();
+            } else if (starts_with_at(region_, search_from,
+                                      tool_open_literal(ToolTagKind::FunctionCalls))) {
+                search_from += tool_open_literal(ToolTagKind::FunctionCalls).size();
+            }
+        }
+        // Recovery entry policy (F7): a failed region that broke with a wrapper still open
+        // owns the bytes before its break as the failed structure; only a later wrapper
+        // literal may open a fresh top-level region there. A bare function/invoke opener is
+        // a compatibility entry at the stream's top level, but never a recovery entry inside
+        // a failed wrapper's scope (it would reinterpret nested payload as a new call).
+        const std::size_t next = wrapper_open
+            ? find_tool_marker(region_, search_from, /*wrapper_only=*/true)
+            : find_tool_marker(region_, search_from);
+        if (next == std::string_view::npos || next == base) {
+            // No later recovery entry. `next == base` guards a header that fails at its own
+            // start: re-reading the same marker cannot change the outcome.
             result.status  = ToolCallStreamStatus::Invalid;
             result.failure = first_failure;
             result.tail    = region_;

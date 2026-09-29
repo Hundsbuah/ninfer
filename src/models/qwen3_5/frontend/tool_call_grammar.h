@@ -107,6 +107,17 @@ struct ToolOpenTag {
     return kind == ToolTagKind::Parameter || kind == ToolTagKind::Param;
 }
 
+// F8 marker progression: a held marker candidate that the grammar classified as
+// definitively NotMarker is split at its breaking (last) byte. A breaking '<' becomes the
+// start of a fresh candidate; the failed bytes before it are ordinary content. Any other
+// breaking byte flushes the whole candidate. The grammar decision is final: a '<' that the
+// header grammar still accepts (a quoted value) keeps the candidate NeedMore and never
+// reaches this split.
+[[nodiscard]] constexpr std::size_t
+failed_marker_candidate_retained(std::string_view candidate) noexcept {
+    return candidate.size() >= 2 && candidate.back() == '<' ? 1 : 0;
+}
+
 // Parse the opener at `text[0] == '<'` for one family. Wrapper families match the exact literal
 // (a strict prefix is NeedMore). Tag families parse the header; a quoted value may contain '>'
 // and any other byte, an unterminated quote at the end of the input is NeedMore, and an empty
@@ -136,8 +147,10 @@ parse_tool_header_after_keyword(std::string_view text, ToolTagKind kind, ToolOpe
 classify_tool_marker_prefix(std::string_view text, ToolOpenTag& out) noexcept;
 
 // First position at or after `search_from` at which a complete top-level marker starts,
-// or npos.
-[[nodiscard]] std::size_t find_tool_marker(std::string_view text, std::size_t search_from = 0)
+// or npos. With `wrapper_only`, only the wrapper literals qualify: recovery entries after
+// a failed region that broke with a wrapper open (F7 entry-marker policy).
+[[nodiscard]] std::size_t find_tool_marker(std::string_view text, std::size_t search_from = 0,
+                                           bool wrapper_only = false)
     noexcept;
 
 } // namespace ninfer::models::qwen3_5::frontend

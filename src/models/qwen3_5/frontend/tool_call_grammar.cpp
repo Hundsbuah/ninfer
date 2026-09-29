@@ -212,16 +212,25 @@ ToolMarkerStatus classify_tool_marker_prefix(std::string_view text, ToolOpenTag&
     return ToolMarkerStatus::NotMarker;
 }
 
-std::size_t find_tool_marker(std::string_view text, std::size_t search_from) noexcept {
+std::size_t find_tool_marker(std::string_view text, std::size_t search_from,
+                              bool wrapper_only) noexcept {
     for (std::size_t index = search_from; index < text.size(); ++index) {
         if (text[index] != '<') { continue; }
         if (index + 1 < text.size()) {
             const char next = text[index + 1];
-            if (next != 't' && next != 'f' && next != 'i') { continue; }
+            if (wrapper_only) {
+                if (next != 't' && next != 'f') { continue; }
+            } else if (next != 't' && next != 'f' && next != 'i') {
+                continue;
+            }
         }
         ToolOpenTag marker = {};
         if (classify_tool_marker_prefix(text.substr(index), marker) ==
             ToolMarkerStatus::Complete) {
+            if (wrapper_only &&
+                (marker.kind != ToolTagKind::ToolCall && marker.kind != ToolTagKind::FunctionCalls)) {
+                continue;
+            }
             return index;
         }
     }

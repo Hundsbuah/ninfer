@@ -257,9 +257,9 @@ int test_parameter_delimiters_in_values() {
                           "a quoted closer pair was not preserved in the value");
     }
 
-    // Tolerant truncation: a value closed at the region end is committed as a truncated tail;
-    // a value the budget cut before its closer is never committed (integrity over
-    // availability), so the region falls back to text with the truncated-tail reason.
+    // Tolerant truncation: a value the budget cut before its closer is never committed, and
+    // a value closed without the function close is not executable (F2/I2): the open
+    // function is never committed, whatever its argument bytes show.
     const std::string open  = std::string("<") + "parameter=command>\n";
     const std::string close = std::string("</") + "parameter>";
     const std::string head  = "<tool_call>\n<function=bash>\n" + open;
@@ -267,14 +267,9 @@ int test_parameter_delimiters_in_values() {
         fi::parse_qwen_tool_call_output(head + "ls\n" + close + "\n", 64, contract, true);
     const auto quoted_cut =
         fi::parse_qwen_tool_call_output(head + "echo '" + close + "' more", 64, contract, true);
-    failures += check(closed_cut.is_tool_call_response && closed_cut.tool_calls.size() == 1 &&
+    failures += check(!closed_cut.is_tool_call_response && closed_cut.tool_calls.empty() &&
                           closed_cut.diagnostics.fallback_reason == Reason::TruncatedTail,
-                      "a tolerant cut call with a closed value was not kept as a truncated tail");
-    if (closed_cut.tool_calls.size() == 1) {
-        const Json closed_args = Json::parse(closed_cut.tool_calls.front().arguments_json);
-        failures += check(closed_args.at("command") == "ls",
-                          "a tolerant cut call ended its value at the wrong closer");
-    }
+                      "a tolerant cut call with a closed value was executed without its function close");
     failures += check(!quoted_cut.is_tool_call_response && quoted_cut.tool_calls.empty() &&
                           quoted_cut.diagnostics.fallback_reason == Reason::TruncatedTail,
                       "a tolerant cut value was committed instead of falling back to text");
@@ -1048,6 +1043,570 @@ int test_claude_code_plan_and_task_create_exact_repro() {
     return failures;
 }
 
+// ---------------------------------------------------------------------------
+// Regression tests for the bugfix specification
+// (NInfer_new_parser_design_bugfix_implementation.md, findings F1-F8). These pin the safety
+// invariants: opaque parameter payload (I1), non-execution of open functions (I2), boundary
+// retention across partial next tokens (I3), explicit wrapper balance (I4), shared marker
+// progression (I5), and non-permissive recovery (I6).
+// ---------------------------------------------------------------------------
+
+// Exact round trip of `payload` as the declared string value of `parameter` in one complete
+// well-formed call: strict and tolerant one-shot plus fixed-size chunked streaming must all
+// produce the identical structured result with the value bytes unchanged.
+int check_payload_round_trip(const fi::ToolCallOutputContract& contract, std::string_view tool_name,
+                             std::string_view parameter, std::string_view payload,
+                             std::string_view what) {
+    int failures = 0;
+    const std::string text = tool_call(tool_name, {{parameter, payload}});
+    for (const bool tolerant : {false, true}) {
+        const auto parsed = fi::parse_qwen_tool_call_output(text, 64, contract, tolerant);
+        failures += check(parsed.is_tool_call_response && parsed.tool_calls.size() == 1 &&
+                              parsed.content.empty(),
+                          std::string("payload round trip lost the call: ") + std::string(what));
+        if (parsed.tool_calls.size() == 1) {
+            const Json args = Json::parse(parsed.tool_calls.front().arguments_json);
+            failures += check(args.at(std::string(parameter)).get<std::string>() == std::string(payload),
+                              std::string("payload round trip changed the value: ") +
+                                  std::string(what));
+        }
+    }
+    auto contract_ptr = std::make_shared<fi::ToolCallOutputContract>(contract);
+    for (const std::size_t chunk : {1, 2, 3, 5, 7}) {
+        fi::ToolCallOutputDecoder decoder(contract_ptr, 64);
+        std::string visible;
+        for (std::size_t offset = 0; offset < text.size(); offset += chunk) {
+            visible += decoder.feed(std::string_view(text).substr(offset, chunk));
+        }
+        auto terminal = decoder.finish();
+        failures += check(visible.empty() && terminal.content.empty() &&
+                              terminal.tool_calls.size() == 1 &&
+                              Json::parse(terminal.tool_calls.front().arguments_json)
+                                      .at(std::string(parameter)).get<std::string>() == std::string(payload),
+                          std::string("chunked payload round trip diverged: ") + std::string(what));
+    }
+    return failures;
+}
+
+// F1: a literal parameter opener inside a value must not change nesting; the value is an
+// opaque byte range.
+int test_literal_parameter_opener_in_payload_does_not_nest() {
+    const auto contract = contract_for("write", Json{{"content", Json{{"type", "string"}}}});
+    int failures = 0;
+    failures += check_payload_round_trip(
+        contract, "write", "content", "const x = \"<parameter=fake>\";",
+        "C literal <parameter=...> in payload");
+    failures += check_payload_round_trip(contract, "write", "content", "A <parameter=fake> B",
+                                         "literal <parameter=...> in payload");
+    return failures;
+}
+
+int test_literal_param_opener_in_payload_does_not_nest() {
+    const auto contract = contract_for("write", Json{{"content", Json{{"type", "string"}}}});
+    return check_payload_round_trip(contract, "write", "content", "A <param=fake> B",
+                                    "literal <param=...> in payload");
+}
+
+// F1: real coding payloads carrying tool-like markup must round-trip byte for byte.
+int test_coding_payloads_round_trip() {
+    const auto contract = contract_for("write", Json{{"content", Json{{"type", "string"}}}});
+    int failures = 0;
+    const std::vector<std::pair<const char*, std::string>> payloads = {{
+        {"C/C++ source string",
+         "const char* s = \"<parameter=edits>\";\nprintf(\"%s</parameter>\", s);\n"},
+        {"TypeScript template",
+         "const tpl = `<parameter=inner>${x}</parameter>`;\nconst close = '</parameter>';"},
+        {"XML/HTML snippet", "<root>\n  <parameter name=\"x\">v</parameter>\n  <tool_call/>\n</root>"},
+        {"shell here-doc", "cat <<'EOF'\n<parameter=edits>\nline\n</parameter>\nEOF\necho done"},
+        {"JSON string with markup", "{\"pattern\": \"<parameter=x>\", \"close\": \"</parameter>\"}"},
+        {"multi-line patch",
+         "--- a/f.c\n+++ b/f.c\n@@ -1,3 +1,3 @@\n-<parameter=old>\n+<parameter=new>\n</parameter>\n context line"},
+    }};
+    for (const auto& [label, payload] : payloads) {
+        failures += check_payload_round_trip(contract, "write", "content", payload, label);
+    }
+    return failures;
+}
+// 18.4: the spec's deterministic adversarial payload corpus embedded into a declared string
+// argument. Ordinary prefix/suffix text keeps every entry an unambiguous payload (I1): the
+// exact value round-trips in both modes and in streaming. Entries that are (or end with) the
+// outer closer literal are fundamentally ambiguous at the value end and stay out of this
+// matrix; that boundary is pinned by the closer-continuation tests.
+int test_payload_adversarial_corpus_round_trip() {
+    const auto contract = output_contract_for("write", Json{{"content", Json{{"type", "string"}}}});
+    int failures = 0;
+    const std::vector<std::string> corpus = {{"<"}, {">"}, {"</parameter>"}, {"<parameter=x>"},
+                                             {"<param=x>"},   {"</param>"},     {"</function>"},
+                                             {"</invoke>"},  {"<tool_call>"},   {"</tool_call>"},
+                                             {"<function_calls>"}, {"</function_calls>"},
+                                             {"<function=fake>"},  {"<invoke=fake>"},
+                                             {"<function name=\"fake\">"},
+                                             {"<parameter name=\"x\">"}};
+    for (const std::string& entry : corpus) {
+        for (const char* suffix : {"x", "x\n"}) {
+            failures += check_payload_round_trip(
+                contract, "write", "content", std::string_view{"x " + entry + suffix},
+                ("corpus entry as payload: " + entry).c_str());
+        }
+        // The entry leads the value (no prefix): the continuation after a candidate closer is
+        // still ordinary text, so the closer stays payload and the value round-trips.
+        failures += check_payload_round_trip(
+            contract, "write", "content", std::string_view{entry + " x"},
+            ("entry at payload start: " + entry).c_str());
+        // CRLF/tab around a repeated sequence keeps the boundary decision deterministic.
+        failures += check_payload_round_trip(
+            contract, "write", "content", std::string_view{"\r\n" + entry + "\t" + entry + " x"},
+            ("CRLF/tab repeated entry: " + entry).c_str());
+    }
+    return failures;
+}
+
+
+// F1: an inner opener without an inner closer; the final closer is the outer close.
+int test_parameter_value_with_inner_opener_only_closes_at_outer() {
+    const auto contract = contract_for("write", Json{{"content", Json{{"type", "string"}}}});
+    return check_payload_round_trip(contract, "write", "content",
+                                    "<parameter=inner>\nliteral without inner closer",
+                                    "inner opener without inner closer");
+}
+
+// F6: mixed parameter families inside a value stay opaque (both directions).
+int test_mixed_parameter_families_inside_payload_are_opaque() {
+    const auto contract = contract_for("write", Json{{"content", Json{{"type", "string"}}}});
+    int failures = 0;
+    failures += check_payload_round_trip(contract, "write", "content", "A <param=x>B</param> C",
+                                         "param family inside a parameter value");
+    const std::string text = "<tool_call>\n<function=write>\n<param=content>\n"
+                             "A <parameter=x>B</parameter> C\n</param>\n</function>\n</tool_call>";
+    for (const bool tolerant : {false, true}) {
+        const auto parsed = fi::parse_qwen_tool_call_output(text, 64, contract, tolerant);
+        failures += check(parsed.is_tool_call_response && parsed.tool_calls.size() == 1,
+                          "parameter family inside a param value broke the call");
+        if (parsed.tool_calls.size() == 1) {
+            const Json args = Json::parse(parsed.tool_calls.front().arguments_json);
+            failures += check(args.at("content") == "A <parameter=x>B</parameter> C",
+                              "parameter family inside a param value changed the bytes");
+        }
+    }
+    return failures;
+}
+
+// F2: a function whose closing tag was never observed is never executed, whatever the finish
+// reason (StopToken / StopString / OutputLimit / ContextCapacity / Cancelled) and whatever the wrapper form.
+int test_tolerant_never_commits_open_function() {
+    using FinishReason = ninfer::FinishReason;
+    using Reason       = ninfer::ToolCallParseFallbackReason;
+    const auto contract = output_contract_for("bash", Json{{"command", Json{{"type", "string"}}}});
+    int failures        = 0;
+    const std::string cut_tool_call =
+        "<tool_call>\n<function=bash>\n<parameter=command>\nls\n</parameter>";
+    const std::string cut_invoke =
+        "<tool_call>\n<invoke=bash>\n<parameter=command>\nls\n</parameter>";
+    const std::string cut_bare   = "<function=bash>\n<parameter=command>\nls\n</parameter>";
+    for (const std::string& region : {cut_tool_call, cut_invoke, cut_bare}) {
+        for (const FinishReason reason : {FinishReason::StopToken, FinishReason::StopString,
+                                          FinishReason::OutputLimit,
+                                          FinishReason::ContextCapacity,
+                                          FinishReason::Cancelled}) {
+            const auto tolerant =
+                fi::parse_qwen_tool_call_output(region, 64, *contract, true, reason);
+            failures += check(!tolerant.is_tool_call_response && tolerant.tool_calls.empty(),
+                              "tolerant executed a function whose close was never observed");
+            failures += check(tolerant.diagnostics.fallback_reason == Reason::TruncatedTail,
+                              "open-function truncation lost the truncated-tail diagnostic");
+            const auto strict = fi::parse_qwen_tool_call_output(region, 64, *contract, false, reason);
+            failures += check(!strict.is_tool_call_response && strict.tool_calls.empty(),
+                              "strict executed a function whose close was never observed");
+            failures += check(strict.diagnostics.fallback_reason == Reason::MalformedStructure,
+                              "strict open-function truncation lost the structural diagnostic");
+        }
+    }
+    return failures;
+}
+
+// F2: a function-closed call whose wrapper close is missing remains recoverable in tolerant
+// mode (TruncatedTail); strict still rejects. All three wrapper forms.
+int test_tolerant_commits_function_closed_missing_wrapper() {
+    using Reason = ninfer::ToolCallParseFallbackReason;
+    const auto contract = output_contract_for("bash", Json{{"command", Json{{"type", "string"}}}});
+    int failures = 0;
+    const std::string tool_call_cut =
+        "<tool_call>\n<function=bash>\n<parameter=command>\nls\n</parameter>\n</function>";
+    const std::string function_calls_cut =
+        "<function_calls>\n<invoke=bash>\n<parameter=command>\nls\n</parameter>\n</invoke>";
+    const std::string bare_complete =
+        "<function=bash>\n<parameter=command>\nls\n</parameter>\n</function>";
+    // The tool_call wrapper: a missing close at the region end is a truncated tail — tolerant
+    // retains the function-closed call with a diagnostic, strict rejects.
+    const auto tool_tolerant =
+        fi::parse_qwen_tool_call_output(tool_call_cut, 64, *contract, true);
+    failures += check(
+        tool_tolerant.is_tool_call_response && tool_tolerant.tool_calls.size() == 1 &&
+            tool_tolerant.tool_calls.front().name == "bash" &&
+            Json::parse(tool_tolerant.tool_calls.front().arguments_json).at("command") == "ls",
+        "tolerant did not retain the function-closed call with a missing tool_call wrapper");
+    failures += check(tool_tolerant.diagnostics.fallback_reason == Reason::TruncatedTail,
+                      "missing tool_call wrapper close was not flagged");
+    const auto tool_strict = fi::parse_qwen_tool_call_output(tool_call_cut, 64, *contract);
+    failures += check(!tool_strict.is_tool_call_response && tool_strict.tool_calls.empty(),
+                      "strict retained a call with a missing tool_call wrapper close");
+    // The function_calls wrapper ends cleanly at the region end after the last invoke close:
+    // committed without a diagnostic in both modes (pre-existing contract, unchanged).
+    for (const bool tolerant : {true, false}) {
+        const auto parsed = fi::parse_qwen_tool_call_output(function_calls_cut, 64, *contract,
+                                                            tolerant);
+        failures += check(
+            parsed.is_tool_call_response && parsed.tool_calls.size() == 1 &&
+                parsed.tool_calls.front().name == "bash" &&
+                Json::parse(parsed.tool_calls.front().arguments_json).at("command") == "ls" &&
+                parsed.diagnostics.fallback_reason == Reason::None,
+            "function_calls region at the region end was not a clean completion");
+    }
+    // A bare function close at the region end is a clean end: committed without a diagnostic.
+    const auto bare = fi::parse_qwen_tool_call_output(bare_complete, 64, *contract, true);
+    failures += check(bare.is_tool_call_response && bare.tool_calls.size() == 1 &&
+                          bare.diagnostics.fallback_reason == Reason::None,
+                      "bare function close at region end was not a clean completion");
+    return failures;
+}
+
+// F3: an EOF </parameter> that may be literal payload never executes the open function; the
+// region falls back to verbatim content.
+int test_eof_parameter_closer_never_executes_open_function() {
+    using FinishReason = ninfer::FinishReason;
+    int failures       = 0;
+    const std::vector<std::pair<const char*, const char*>> fixtures = {{
+        {"bash.command", "<tool_call>\n<function=bash>\n<parameter=command>\necho 'literal </parameter>"},
+        {"write.content", "<tool_call>\n<function=write>\n<parameter=content>\necho 'literal </parameter>"},
+        {"edit.new_string", "<tool_call>\n<function=edit>\n<parameter=new_string>\necho 'literal </parameter>"},
+    }};
+    for (const auto& [label, text] : fixtures) {
+        for (const FinishReason reason : {FinishReason::StopToken, FinishReason::StopString,
+                                          FinishReason::OutputLimit,
+                                          FinishReason::ContextCapacity,
+                                          FinishReason::Cancelled}) {
+            const auto strict =
+                fi::parse_qwen_tool_call_output(text, 64, kLegacyContract, false, reason);
+            failures += check(
+                !strict.is_tool_call_response && strict.tool_calls.empty() && strict.content == text,
+                std::string("strict executed the EOF parameter-closer call: ") + std::string(label));
+            const auto tolerant = fi::parse_qwen_tool_call_output(text, 64, kLegacyContract, true, reason);
+            failures += check(
+                !tolerant.is_tool_call_response && tolerant.tool_calls.empty() &&
+                    tolerant.content == text,
+                std::string("tolerant executed the EOF parameter-closer call: ") + std::string(label));
+        }
+    }
+    return failures;
+}
+
+// F4: a partial next structural token after a complete parameter close must not reopen the
+// previous value: the close is retained and the truncated token is an objective EndOfInput.
+int test_partial_next_parameter_does_not_reopen_previous_value() {
+    int failures = 0;
+    const std::vector<std::pair<const char*, std::string>> fixtures = {{
+        {"partial parameter opener",
+         "<tool_call>\n<function=read>\n<parameter=path>\nfoo\n</parameter>\n<paramet"},
+        {"partial function close",
+         "<tool_call>\n<function=read>\n<parameter=path>\nfoo\n</parameter>\n</funct"},
+        {"partial wrapper close",
+         "<tool_call>\n<function=read>\n<parameter=path>\nfoo\n</parameter>\n</function>\n</tool_"},
+    }};
+    for (const auto& [label, text] : fixtures) {
+        fi::ToolCallParsePolicy policy;
+        const auto progress = fi::parse_tool_call_region(text, policy);
+        failures += check(
+            progress.termination == fi::ToolCallRegionTermination::EndOfInput,
+            std::string("partial next token was not an objective truncation: ") +
+                std::string(label));
+        failures += check(
+            !progress.open_value_open,
+            std::string("partial next token reopened the previous value: ") + std::string(label));
+        // The "partial wrapper close" fixture consumed the function close: the call is
+        // committed there (F2) and no longer open. The other two fixtures leave the
+        // function open with its closed parameter retained.
+        if (label == "partial wrapper close") {
+            failures += check(
+                progress.calls.size() == 1 && progress.calls.front().name == "read" &&
+                    progress.calls.front().parameters.size() == 1 &&
+                    progress.calls.front().parameters.front().name == "path" &&
+                    progress.calls.front().parameters.front().value == "\nfoo\n",
+                std::string("committed call lost its closed parameter: ") + std::string(label));
+        } else {
+            failures += check(
+                progress.open_call.name == "read" && progress.open_call.parameters.size() == 1 &&
+                    progress.open_call.parameters.front().name == "path" &&
+                    progress.open_call.parameters.front().value == "\nfoo\n",
+                std::string("closed previous parameter was not retained: ") + std::string(label));
+        }
+    }
+    return failures;
+}
+
+// F2/F4/I3/I5: the canonical call cut at every byte. Safety: no cut before the complete
+// matching function close executes the current function in tolerant mode. Recovery: a cut
+// after the function close may retain the complete call. One-shot and streaming (every chunk
+// size) agree at every cut.
+int test_all_delimiter_byte_cuts_preserve_previous_boundary() {
+    using FinishReason = ninfer::FinishReason;
+    using Reason       = ninfer::ToolCallParseFallbackReason;
+    const auto contract =
+        output_contract_for("write", Json{{"path", Json{{"type", "string"}}},
+                                          {"content", Json{{"type", "string"}}}});
+    const std::string text = "<tool_call>\n<function=write>\n"
+                             "<parameter=path>\na.txt\n</parameter>\n"
+                             "<parameter=content>\nhello\n</parameter>\n"
+                             "</function>\n</tool_call>";
+    const std::size_t fn_close_end   = text.find("</function>") + 11;
+    const std::size_t first_close_end = text.find("</parameter>") + 12;
+    const std::string expected_args  = R"({"path":"a.txt","content":"hello"})";
+    int failures                     = 0;
+    for (std::size_t cut = 0; cut <= text.size(); ++cut) {
+        const std::string cut_text(text.substr(0, cut));
+        // Strict: only the complete region commits.
+        const auto strict = fi::parse_qwen_tool_call_output(cut_text, 64, *contract);
+        if (cut < text.size()) {
+            failures += check(!strict.is_tool_call_response && strict.tool_calls.empty(),
+                              "strict executed a truncated canonical call");
+        } else {
+            failures += check(
+                strict.is_tool_call_response && strict.tool_calls.size() == 1 &&
+                    strict.tool_calls.front().arguments_json == expected_args,
+                "strict did not commit the complete canonical call");
+        }
+        // Tolerant, every finish reason.
+        for (const FinishReason reason : {FinishReason::StopToken, FinishReason::StopString,
+                                          FinishReason::OutputLimit,
+                                          FinishReason::ContextCapacity,
+                                          FinishReason::Cancelled}) {
+            const auto tolerant =
+                fi::parse_qwen_tool_call_output(cut_text, 64, *contract, true, reason);
+            if (cut < fn_close_end) {
+                failures += check(!tolerant.is_tool_call_response && tolerant.tool_calls.empty(),
+                                  "tolerant executed the current function before its complete close");
+            } else if (cut < text.size()) {
+                failures += check(
+                    tolerant.is_tool_call_response && tolerant.tool_calls.size() == 1 &&
+                        tolerant.tool_calls.front().name == "write" &&
+                        tolerant.tool_calls.front().arguments_json == expected_args &&
+                        tolerant.diagnostics.fallback_reason == Reason::TruncatedTail,
+                    "tolerant did not retain the function-closed canonical call");
+            } else {
+                failures += check(
+                    tolerant.is_tool_call_response && tolerant.tool_calls.size() == 1 &&
+                        tolerant.tool_calls.front().arguments_json == expected_args &&
+                        tolerant.diagnostics.fallback_reason == Reason::None,
+                    "tolerant lost the complete canonical call");
+            }
+        }
+        // The closed first value must never be reopened or truncated, at any cut after it
+        // closed: wherever it is recorded (open call or committed call) it keeps its bytes.
+        fi::ToolCallParsePolicy policy;
+        const auto progress = fi::parse_tool_call_region(cut_text, policy);
+        if (cut > first_close_end) {
+            const fi::ParsedFunctionCall* call = nullptr;
+            if (!progress.open_call.name.empty() && progress.open_call.name == "write") {
+                call = &progress.open_call;
+            } else if (!progress.calls.empty()) {
+                call = &progress.calls.front();
+            }
+            if (call != nullptr) {
+                failures += check(
+                    call->parameters.size() >= 1 && call->parameters.front().name == "path" &&
+                        call->parameters.front().value == "\na.txt\n",
+                    "the closed previous value was reopened or truncated at a later cut");
+            }
+        }
+        // Streaming (every chunk size) must reproduce the one-shot tolerant result exactly.
+        auto contract_ptr = std::make_shared<fi::ToolCallOutputContract>(*contract);
+        for (const std::size_t chunk : {1, 2, 3, 5, 7}) {
+            fi::ToolCallOutputDecoder decoder(contract_ptr, 64, true);
+            std::string streamed;
+            for (std::size_t offset = 0; offset < cut_text.size(); offset += chunk) {
+                streamed += decoder.feed(std::string_view(cut_text).substr(offset, chunk));
+            }
+            auto terminal = decoder.finish(FinishReason::StopToken);
+            const auto one_shot = fi::parse_qwen_tool_call_output(
+                cut_text, 64, *contract, true, FinishReason::StopToken);
+            failures += check(
+                terminal.tool_calls.size() == one_shot.tool_calls.size() &&
+                    terminal.content == one_shot.content &&
+                    terminal.diagnostics == one_shot.diagnostics &&
+                    std::equal(
+                        one_shot.tool_calls.begin(), one_shot.tool_calls.end(),
+                        terminal.tool_calls.begin(),
+                        [](const auto& a, const auto& b) {
+                            return a.name == b.name && a.arguments_json == b.arguments_json;
+                        }),
+                "streaming byte-split diverged from one-shot at a cut");
+        }
+    }
+    return failures;
+}
+
+// F4: the same every-byte property on the other wire families (param/invoke/function_calls).
+int test_all_delimiter_byte_cuts_other_families() {
+    using FinishReason = ninfer::FinishReason;
+    using Reason       = ninfer::ToolCallParseFallbackReason;
+    const auto contract = output_contract_for("read", Json{{"path", Json{{"type", "string"}}}});
+    const std::string text = "<function_calls>\n<invoke=read>\n"
+                             "<param=path>\nfoo\n</param>\n"
+                             "</invoke>\n</function_calls>";
+    const std::size_t fn_close_end  = text.find("</invoke>") + 9;
+    const std::size_t wrapper_start = text.find("</function_calls>");
+    int failures = 0;
+    for (std::size_t cut = 0; cut <= text.size(); ++cut) {
+        const std::string cut_text(text.substr(0, cut));
+        const auto tolerant = fi::parse_qwen_tool_call_output(
+            cut_text, 64, *contract, true, FinishReason::OutputLimit);
+        if (cut < fn_close_end) {
+            failures += check(!tolerant.is_tool_call_response && tolerant.tool_calls.empty(),
+                              "tolerant executed an invoke before its complete close");
+        } else if (cut <= wrapper_start) {
+            // The region ends after the last invoke close: the function_calls close is
+            // optional at the region end (pre-existing contract), a clean completion.
+            failures += check(
+                tolerant.is_tool_call_response && tolerant.tool_calls.size() == 1 &&
+                    tolerant.tool_calls.front().name == "read" &&
+                    tolerant.diagnostics.fallback_reason == Reason::None,
+                "tolerant did not complete the invoke-closed region at the region end");
+        } else if (cut < text.size()) {
+            // A cut inside the wrapper close literal: a truncated tail.
+            failures += check(
+                tolerant.is_tool_call_response && tolerant.tool_calls.size() == 1 &&
+                    tolerant.tool_calls.front().name == "read" &&
+                    tolerant.diagnostics.fallback_reason == Reason::TruncatedTail,
+                "tolerant did not retain the invoke-closed call");
+        } else {
+            failures += check(tolerant.is_tool_call_response && tolerant.tool_calls.size() == 1,
+                              "the complete function_calls region was not committed");
+        }
+    }
+    return failures;
+}
+
+// F5: wrapper nesting and balance are explicit; more opens than closes never completes, in
+// strict or tolerant. Sequential balanced wrappers still complete.
+int test_nested_and_cross_nested_wrappers_rejected() {
+    using Reason = ninfer::ToolCallParseFallbackReason;
+    const auto contract = output_contract_for("read", Json{{"path", Json{{"type", "string"}}}});
+    int failures = 0;
+    const std::string nested_tool_call = "<tool_call>\n<tool_call>\n"
+                                         "<function=read>\n<parameter=path>x</parameter>\n"
+                                         "</function>\n</tool_call>";
+    const std::string nested_function_calls = "<function_calls>\n<function_calls>\n"
+                                              "<function=read>\n<parameter=path>x</parameter>\n"
+                                              "</function>\n</function_calls>";
+    const std::string cross_tool_to_calls = "<tool_call>\n<function_calls>\n"
+                                            "<function=read>\n<parameter=path>x</parameter>\n"
+                                            "</function>\n</function_calls>";
+    const std::string cross_calls_to_tool = "<function_calls>\n<tool_call>\n"
+                                            "<function=read>\n<parameter=path>x</parameter>\n"
+                                            "</function>\n</tool_call>";
+    for (const std::string& text : {nested_tool_call, nested_function_calls,
+                                    cross_tool_to_calls, cross_calls_to_tool}) {
+        const auto strict = fi::parse_qwen_tool_call_output(text, 64, *contract);
+        failures += check(
+            !strict.is_tool_call_response && strict.tool_calls.empty() &&
+                strict.diagnostics.fallback_reason == Reason::MalformedStructure,
+            "unsupported wrapper nesting completed strict");
+        const auto tolerant = fi::parse_qwen_tool_call_output(text, 64, *contract, true);
+        failures += check(!tolerant.is_tool_call_response && tolerant.tool_calls.empty(),
+                          "unsupported wrapper nesting was committed tolerant");
+    }
+    // Stray wrapper closer after a complete region: unbalanced, never silently absorbed.
+    const std::string stray = tool_call("read", {{"path", "x"}}) + "\n</tool_call>";
+    const auto stray_strict = fi::parse_qwen_tool_call_output(stray, 64, *contract);
+    failures += check(
+        !stray_strict.is_tool_call_response &&
+            stray_strict.diagnostics.fallback_reason == Reason::TrailingContent,
+        "stray wrapper closer was balanced against nothing (strict)");
+    const auto stray_tolerant = fi::parse_qwen_tool_call_output(stray, 64, *contract, true);
+    failures += check(
+        stray_tolerant.is_tool_call_response && stray_tolerant.tool_calls.size() == 1 &&
+            stray_tolerant.diagnostics.fallback_reason == Reason::TruncatedTail,
+        "stray wrapper closer dropped the complete call (tolerant)");
+    // Too many wrapper closers.
+    const std::string many = tool_call("read", {{"path", "x"}}) + "\n</tool_call>\n</tool_call>";
+    failures += check(
+        !fi::parse_qwen_tool_call_output(many, 64, *contract).is_tool_call_response,
+        "too many wrapper closers were accepted");
+    // Missing outer close after a complete inner structure: F2 semantics (see the F2 tests).
+    const std::string missing_close =
+        "<tool_call>\n<function=read>\n<parameter=path>x</parameter>\n</function>";
+    failures += check(
+        !fi::parse_qwen_tool_call_output(missing_close, 64, *contract).is_tool_call_response,
+        "missing outer close completed strict");
+    // Multiple sequential valid wrappers at top level still complete.
+    const std::string two =
+        tool_call("read", {{"path", "x"}}) + "\n" + tool_call("read", {{"path", "y"}});
+    const auto two_parsed = fi::parse_qwen_tool_call_output(two, 64, *contract);
+    failures += check(two_parsed.is_tool_call_response && two_parsed.tool_calls.size() == 2,
+                      "sequential balanced wrappers did not complete");
+    return failures;
+}
+
+// F7: the recovery retry enters only at a later top-level wrapper. A function nested inside a
+// failed region never becomes a new executable call, and a compatibility bare marker after a
+// failed region is not re-read (it stays content).
+int test_recovery_retry_entry_policy() {
+    const auto contract = output_contract_for(
+        "bash", Json{{"command", Json{{"type", "string"}}}, {"x", Json{{"type", "string"}}}});
+    int failures = 0;
+    // A malformed wrapper containing a nested function: never recover the nested call.
+    const std::string nested_fake = "<tool_call>\n<function=broken\n"
+                                    "<function=fake>\n<parameter=x>\n1\n</parameter>\n</function>";
+    const auto nested = fi::parse_qwen_tool_call_output(nested_fake, 64, *contract, true);
+    failures += check(!nested.is_tool_call_response && nested.tool_calls.empty(),
+                      "a function nested inside a failed region became executable");
+    // A compatibility bare function before a real wrapper: the turn recovers at the wrapper.
+    const std::string bare_before = "<function=read>\n<parameter=path>\ncut\n" +
+                                    tool_call("bash", {{"command", "echo ok"}});
+    const auto bare = fi::parse_qwen_tool_call_output(bare_before, 64, *contract, true);
+    failures += check(bare.is_tool_call_response && bare.tool_calls.size() == 1 &&
+                          bare.tool_calls.front().name == "bash",
+                      "a failed bare region before a real wrapper was not recovered at the wrapper");
+    failures += check(bare.content == "<function=read>\n<parameter=path>\ncut",
+                      "the failed bare region was not retained as content");
+    // A failed region followed by a supported compatibility (bare) marker: the bare marker is
+    // not a recovery entry; the region stays content.
+    const std::string compat_after = "<tool_call>\n<function=broken\n"
+                                     "<function=bash>\n<parameter=command>\necho ok\n</parameter>\n</function>";
+    const auto compat = fi::parse_qwen_tool_call_output(compat_after, 64, *contract, true);
+    failures += check(!compat.is_tool_call_response && compat.tool_calls.empty() &&
+                          compat.content == compat_after,
+                      "a compatibility marker after a failed region was re-read by the retry");
+    // Multiple false markers before the terminal real call.
+    const std::string false_markers = "<function=false1>\n<function=false2>\n" +
+                                      tool_call("bash", {{"command", "echo real"}});
+    const auto false_parsed = fi::parse_qwen_tool_call_output(false_markers, 64, *contract, true);
+    failures += check(false_parsed.is_tool_call_response && false_parsed.tool_calls.size() == 1 &&
+                          false_parsed.tool_calls.front().name == "bash",
+                      "multiple false markers before the real call were not recovered");
+    return failures;
+}
+
+// F8: a marker candidate broken by a second '<' publishes the failed candidate bytes and
+// retains the breaking '<' as a fresh candidate: the inner <tool_call> latches.
+int test_marker_breaking_angle_restarts_candidate() {
+    auto contract = output_contract_for("read", Json{{"path", Json{{"type", "string"}}}});
+    fi::ToolCallOutputDecoder decoder(std::move(contract), 64);
+    std::string visible = decoder.feed("prefix <function<");
+    visible += decoder.feed(
+        "tool_call>\n<function=read>\n<parameter=path>x</parameter>\n</function>\n</tool_call>");
+    auto terminal = decoder.finish();
+    int failures = 0;
+    failures += check(visible == "prefix <function",
+                      "the failed marker candidate was not published without the breaking '<'");
+    failures += check(terminal.tool_calls.size() == 1 && terminal.tool_calls.front().name == "read",
+                      "the marker after a breaking '<' was not latched");
+    if (terminal.tool_calls.size() == 1) {
+        failures += check(terminal.tool_calls.front().arguments_json == R"({"path":"x"})",
+                          "the latched region after a breaking '<' lost its arguments");
+    }
+    return failures;
+}
+
 } // namespace
 
 int test_duplicate_parameter_keeps_last_value() {
@@ -1138,24 +1697,28 @@ int test_tolerant_truncated_final_call() {
     int failures = 0;
     for (const auto& [label, text] : cases) {
         const auto parsed = fi::parse_qwen_tool_call_output(text, 64, *contract, /*tolerant*/ true);
-        failures += check(parsed.is_tool_call_response,
-                          std::string("tolerant did not recover ") + label);
-        failures += check(parsed.tool_calls.size() == 1,
-                          std::string("tolerant recovered wrong call count for ") + label);
-        if (parsed.tool_calls.size() == 1) {
-            failures += check(parsed.tool_calls.front().name == "delete_file",
-                              std::string("tolerant lost call name for ") + label);
-            const Json arguments = Json::parse(parsed.tool_calls.front().arguments_json);
-            failures += check(arguments == Json{{"filePath", "/tmp/out.js"}},
-                              std::string("tolerant lost arguments for ") + label);
+        if (label == "missing tool close") {
+            // A function-closed call is committed at its function close; a cut wrapper close
+            // is a truncated tail that tolerant recovery retains (F2).
+            failures += check(parsed.is_tool_call_response && parsed.tool_calls.size() == 1 &&
+                                  parsed.tool_calls.front().name == "delete_file",
+                              std::string("tolerant did not recover ") + label);
+            if (parsed.tool_calls.size() == 1) {
+                const Json arguments = Json::parse(parsed.tool_calls.front().arguments_json);
+                failures += check(arguments == Json{{"filePath", "/tmp/out.js"}},
+                                  std::string("tolerant lost arguments for ") + label);
+            }
+        } else {
+            // The function close was not consumed: the call is not executable (F2/I2) and
+            // tolerant recovery commits nothing from the open function.
+            failures += check(!parsed.is_tool_call_response && parsed.tool_calls.empty(),
+                              std::string("tolerant executed a call for ") + label);
         }
         failures += check(parsed.diagnostics.fallback_reason == Reason::TruncatedTail,
                           std::string("tolerant did not flag ") + label + " as truncated tail");
         const auto strict = fi::parse_qwen_tool_call_output(text, 64, *contract);
-        failures += check(!strict.is_tool_call_response,
+        failures += check(!strict.is_tool_call_response && strict.tool_calls.empty(),
                           std::string("strict recovered a truncated final call: ") + label);
-        failures += check(strict.tool_calls.empty(),
-                          std::string("strict retained a truncated final call: ") + label);
     }
     return failures;
 }
@@ -1356,8 +1919,9 @@ int test_recovery_policy_phase3() {
                           "complete progress recorded a diagnostic");
 
         // Input ended after a complete call whose closing tags were cut: strict maps it to a
-        // structural failure; tolerant commits the open call because every argument byte is
-        // closed.
+        // structural failure. Tolerant recovery also never commits the open call (F2/I2): its
+        // function close was not consumed, so its arguments are not executable, whatever the
+        // argument bytes show.
         ToolCallParseProgress cut   = progress;
         cut.termination             = ToolCallRegionTermination::EndOfInput;
         cut.calls                  = {};
@@ -1371,16 +1935,18 @@ int test_recovery_policy_phase3() {
                               ToolCallParseFailure::MalformedStructure,
                           "strict truncation lost the structural failure class");
         failures += check(fi::decide_tool_call_recovery(cut, tolerant).decision ==
-                              ToolCallRecoveryDecision::CommitCallsAndOpenCall,
-                          "tolerant did not commit a call whose argument bytes are closed");
+                              ToolCallRecoveryDecision::Reject,
+                          "tolerant committed a call whose function close was not consumed");
         failures += check(fi::decide_tool_call_recovery(cut, tolerant).diagnostic ==
                               ToolCallParseFailure::TruncatedTail,
                           "tolerant truncation lost the truncated-tail diagnostic");
 
         // An open value is never committable, whatever the finish reason was.
         cut.open_value_open = true;
-        for (const FinishReason reason : {FinishReason::StopToken, FinishReason::OutputLimit,
-                                          FinishReason::ContextCapacity}) {
+        for (const FinishReason reason : {FinishReason::StopToken, FinishReason::StopString,
+                                          FinishReason::OutputLimit,
+                                          FinishReason::ContextCapacity,
+                                          FinishReason::Cancelled}) {
             const ToolCallRecoveryPolicy budget{.tolerant = true, .finish_reason = reason};
             failures += check(fi::decide_tool_call_recovery(cut, budget).decision ==
                                   ToolCallRecoveryDecision::Reject,
@@ -1458,8 +2024,10 @@ int test_recovery_policy_phase3() {
         terminal = decoder.finish(reason);
         return visible;
     };
-    for (const FinishReason reason : {FinishReason::StopToken, FinishReason::OutputLimit,
-                                      FinishReason::ContextCapacity}) {
+    for (const FinishReason reason : {FinishReason::StopToken, FinishReason::StopString,
+                                      FinishReason::OutputLimit,
+                                      FinishReason::ContextCapacity,
+                                      FinishReason::Cancelled}) {
         const auto one_shot = fi::parse_qwen_tool_call_output(missing_wrapper, 64, *contract,
                                                               true, reason);
         failures += check(one_shot.is_tool_call_response && one_shot.tool_calls.size() == 1 &&
@@ -1479,9 +2047,9 @@ int test_recovery_policy_phase3() {
 
         const auto closed = fi::parse_qwen_tool_call_output(missing_function, 64, *contract,
                                                             true, reason);
-        failures += check(closed.is_tool_call_response && closed.tool_calls.size() == 1 &&
+        failures += check(!closed.is_tool_call_response && closed.tool_calls.empty() &&
                               closed.diagnostics.fallback_reason == Reason::TruncatedTail,
-                          "missing function close was not recovered");
+                          "an open function was committed without its function close");
 
         const auto cut = fi::parse_qwen_tool_call_output(value_cut, 64, *contract, true, reason);
         failures += check(!cut.is_tool_call_response && cut.tool_calls.empty() &&
@@ -1535,6 +2103,110 @@ int test_recovery_policy_phase3() {
     return failures;
 }
 
+// F5: <function_calls> contains a sequence of calls (legacy wire contract): after each
+// function close the region may continue with another call, the wrapper close, or the region
+// end. A nested wrapper open remains a definitive break.
+int test_function_calls_holds_call_sequence() {
+    using Reason = ninfer::ToolCallParseFallbackReason;
+    const auto contract = output_contract_for("read", Json{{"path", Json{{"type", "string"}}}});
+    int failures = 0;
+    const std::string two_calls =
+        "<function_calls>\n<function=read>\n<parameter=path>a</parameter>\n"
+        "</function>\n<function=read>\n<parameter=path>b</parameter>\n"
+        "</function>\n</function_calls>";
+    // The complete sequence with the wrapper close: both calls commit without a diagnostic.
+    for (const bool tolerant : {true, false}) {
+        const auto parsed = fi::parse_qwen_tool_call_output(two_calls, 64, *contract, tolerant);
+        failures += check(parsed.is_tool_call_response && parsed.tool_calls.size() == 2 &&
+                              parsed.tool_calls.front().name == "read" &&
+                              parsed.tool_calls.back().name == "read" &&
+                              parsed.diagnostics.fallback_reason == Reason::None,
+                          "a complete <function_calls> call sequence was not committed");
+    }
+    // The wrapper close is optional at the region end (pre-existing contract).
+    const std::string two_calls_open =
+        "<function_calls>\n<function=read>\n<parameter=path>a</parameter>\n"
+        "</function>\n<function=read>\n<parameter=path>b</parameter>\n"
+        "</function>";
+    for (const bool tolerant : {true, false}) {
+        const auto parsed = fi::parse_qwen_tool_call_output(two_calls_open, 64, *contract, tolerant);
+        failures += check(parsed.is_tool_call_response && parsed.tool_calls.size() == 2 &&
+                              parsed.diagnostics.fallback_reason == Reason::None,
+                          "a <function_calls> sequence at the region end was not a clean "
+                          "completion");
+    }
+    // The first call is complete, the second is cut inside its value: tolerant retains the
+    // first call with a truncation diagnostic; strict rejects the region.
+    const std::string second_cut =
+        "<function_calls>\n<function=read>\n<parameter=path>a</parameter>\n"
+        "</function>\n<function=read>\n<parameter=path=c";
+    const auto strict_cut = fi::parse_qwen_tool_call_output(second_cut, 64, *contract);
+    failures +=
+        check(!strict_cut.is_tool_call_response &&
+                  strict_cut.diagnostics.fallback_reason == Reason::MalformedStructure,
+              "strict retained a call inside a broken <function_calls> sequence");
+    const auto tolerant_cut = fi::parse_qwen_tool_call_output(second_cut, 64, *contract, true);
+    failures += check(tolerant_cut.is_tool_call_response && tolerant_cut.tool_calls.size() == 1 &&
+                          tolerant_cut.diagnostics.fallback_reason == Reason::TruncatedTail,
+                      "tolerant did not retain the complete first call of a cut sequence");
+    // A nested wrapper open at the top level of <function_calls> (after a committed function
+    // close with no open value) is a definitive break: strict rejects the region; tolerant
+    // applies the general retention rule to the complete pre-break call.
+    const std::string nested =
+        "<function_calls>\n<function=read>\n</function>\n"
+        "<tool_call>\n<function=read>\n<parameter=path=b</parameter>\n"
+        "</function>\n</tool_call>";
+    const auto nested_strict = fi::parse_qwen_tool_call_output(nested, 64, *contract);
+    failures += check(
+        !nested_strict.is_tool_call_response &&
+            nested_strict.diagnostics.fallback_reason == Reason::MalformedStructure,
+        "a nested wrapper inside <function_calls> was not rejected (strict)");
+    const auto nested_tolerant = fi::parse_qwen_tool_call_output(nested, 64, *contract, true);
+    failures += check(
+        nested_tolerant.is_tool_call_response && nested_tolerant.tool_calls.size() == 1 &&
+            nested_tolerant.tool_calls.front().name == "read" &&
+            nested_tolerant.diagnostics.fallback_reason == Reason::TruncatedTail,
+        "the pre-break call was lost by tolerant nesting recovery");
+    if (nested_tolerant.tool_calls.size() == 1) {
+        failures += check(nested_tolerant.tool_calls.front().arguments_json.find("b") ==
+                              std::string::npos,
+                          "the nested wrapper's call was committed instead of the pre-break "
+                          "call");
+    }
+    // A pre-break call whose parameter close is followed by the nested open is never a
+    // boundary (the function_calls continuation after a function close allows only the
+    // wrapper close or the region end): the value swallows the nested structure, the call
+    // stays open, and both modes reject the region verbatim.
+    const std::string nested_value =
+        "<function_calls>\n<function=read>\n<parameter=path>a</parameter>\n"
+        "</function>\n<tool_call>\n<function=read>\n<parameter=path=b</parameter>\n"
+        "</function>\n</tool_call>";
+    for (const bool tolerant : {true, false}) {
+        const auto parsed = fi::parse_qwen_tool_call_output(nested_value, 64, *contract, tolerant);
+        failures += check(
+            !parsed.is_tool_call_response && parsed.tool_calls.empty() &&
+                parsed.content == nested_value,
+            "a value-swallowed nested region was not rejected verbatim");
+    }
+    // The streaming machine agrees with the one-shot parse on the complete sequence.
+    for (const std::size_t chunk : {std::size_t{1}, std::size_t{3}, std::size_t{7}}) {
+        fi::ToolCallOutputDecoder decoder(contract, 64);
+        std::string visible;
+        for (std::size_t at = 0; at < two_calls.size();) {
+            const std::size_t take = std::min(chunk, two_calls.size() - at);
+            visible += decoder.feed(two_calls.substr(at, take));
+            at += take;
+        }
+        const auto terminal = decoder.finish();
+        failures += check(terminal.tool_calls.size() == 2 && visible.empty() &&
+                              terminal.content.empty() &&
+                              terminal.diagnostics.fallback_reason == Reason::None,
+                          "the streaming <function_calls> sequence diverged from the one-shot "
+                          "parse");
+    }
+    return failures;
+}
+
 int main() {
     int failures = 0;
     failures += test_duplicate_parameter_keeps_last_value();
@@ -1572,6 +2244,22 @@ int main() {
     failures += test_grammar_header_forms_one_shot();
     failures += test_streaming_recognizes_grammar_markers();
     failures += test_recovery_policy_phase3();
+    failures += test_literal_parameter_opener_in_payload_does_not_nest();
+    failures += test_literal_param_opener_in_payload_does_not_nest();
+    failures += test_coding_payloads_round_trip();
+    failures += test_payload_adversarial_corpus_round_trip();
+    failures += test_parameter_value_with_inner_opener_only_closes_at_outer();
+    failures += test_mixed_parameter_families_inside_payload_are_opaque();
+    failures += test_tolerant_never_commits_open_function();
+    failures += test_tolerant_commits_function_closed_missing_wrapper();
+    failures += test_eof_parameter_closer_never_executes_open_function();
+    failures += test_partial_next_parameter_does_not_reopen_previous_value();
+    failures += test_all_delimiter_byte_cuts_preserve_previous_boundary();
+    failures += test_all_delimiter_byte_cuts_other_families();
+    failures += test_nested_and_cross_nested_wrappers_rejected();
+    failures += test_recovery_retry_entry_policy();
+    failures += test_marker_breaking_angle_restarts_candidate();
+    failures += test_function_calls_holds_call_sequence();
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }

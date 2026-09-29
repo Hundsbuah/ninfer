@@ -462,3 +462,91 @@ at the machine's latch byte, not at the inner marker) and on
 `<function name="a<b">` (both trigger at the header close, byte 20: machine
 Invalid/InvalidToolName, constraint rejects there as a definitive break).
 Commit: (this commit)
+## Second Review Round — <function_calls> Call Sequence (2026-09-29)
+
+F1, F2, F3, F5 (single call), F8, F9, I1, I5 were already implemented by the earlier
+rounds. A second pass over the state machine against the legacy wire contract found one
+remaining gap in the F5 scope:
+
+- F5 (sequence, fixed): <function_calls> contains a sequence of calls in the legacy wire
+  contract (the legacy parser committed every function-closed call inside the wrapper). The
+  rewritten machine returned to Top after every function close and dropped the wrapper
+  context, so a second call inside <function_calls> was parsed as a second top-level
+  region: the strict region parse rejected the whole region (definitive
+  MalformedStructure at the second function open) and tolerant retained only the first
+  call. The legacy contract also allows the region to end after the last function close
+  (wrapper close optional there — already implemented) — and a second call was the missing
+  case. Fix (tool_call_stream.cpp, FunctionBody): the function-close transition targets
+  FunctionBody again for a FunctionCalls wrapper (the call may continue) and Top for a
+  tool_call wrapper (unchanged). The nested-wrapper break inside <function_calls> is
+  unchanged (probe: the second wrapper open still breaks definitively, tolerant included).
+  Regression tests: test_function_calls_holds_call_sequence (two_calls / two_calls_open /
+  second_cut / nested, both modes, streaming equality at chunk 1/3/7) and
+  test_function_calls_call_sequence_accepted (constraint). docs/tool_call_parser.md:
+  the wrapper wording now states both wrappers accurately (tool_call: zero or more calls;
+  function_calls: one or more, close optional at the region end).
+
+Verification (Windows, cl /std:c++latest /EHsc /MD /O2, CPU): dedicated probe on the
+stream + grammar + parser (build-new-parser/probe/debug_p6.cpp): P14 two complete calls
+inside <function_calls> — strict: Complete, 2 calls, reason None; tolerant: same; region
+strict direct call: term Complete, 2 calls; every byte cut of the region: monotone,
+EndOfInput inside the second call, Complete only at the full bytes. P7 (second call cut in
+its value): strict MalformedStructure, tolerant 1 call + TruncatedTail. P11 (trailing
+|im_start| after a complete wrapper): strict TrailingContent, tolerant commit +
+TruncatedTail. P12a/P12b (missing '>' in the second header): no latch / tolerant commit
+via the FunctionHeader repair. P13 (F8 chain a<function<b<tool_call>): strict region
+commits 1 call, content a<function<b verbatim; stream latches at the machine's latch byte.
+All four CPU test suites green (ninfer_tool_call_parser_test, ninfer_tool_call_grammar_test,
+ninfer_tool_call_grammar_state_test, ninfer_qwen3_5_frontend_test).
+
+No product behavior change outside the F5 gap: the single-call <function_calls> regions
+(the entire existing test corpus) parse byte-identically; the tool_call wrapper path is
+untouched; one-shot and streaming stay equal by construction.
+## Third Review Round — Spec Full Audit, I2 Matrix, Adversarial Corpus (2026-09-29)
+
+Re-review items completed this round:
+
+- I2 finish-reason matrix (verified, no code change): the requirement "never execute an
+  open function for every finish reason" is pinned for all five terminal reasons
+  (StopToken, StopString, OutputLimit, ContextCapacity, Cancelled) in four permanent
+  matrices in test_tool_call_parser.cpp (tolerant cut regions, strict every-reason,
+  tolerant per-cut, and the open-value recovery decision), plus the one-shot entry's
+  finish_reason passthrough. No extension was needed; the matrix was already complete.
+- Full spec audit against code and tests (verified): every Definition-of-Done item maps to
+  code and named tests — F1 (opaque payload, I1 tests), F2 (executability boundary,
+  test_tolerant_never_commits_open_function), F3 (EOF-open non-execution), F4 (partial
+  next token), F5 (explicit ToolWrapperKind state + call sequence + nesting/balance,
+  test_nested_and_cross_nested_wrappers_rejected, test_function_calls_holds_call_sequence),
+  F6 (mixed-family opacity), F7 (documented entry/retry policy,
+  test_recovery_retry_entry_policy), F8 (shared marker progression,
+  test_marker_breaking_angle_restarts_candidate in parser and constraint suites), F9
+  (no nesting-depth counter remains in the stream: only explanatory comments), F10
+  (fail-fast at validate_options in model_instance.cpp + CPU test
+  ninfer_engine_options_validation_test, green). The spec's 18.2 test names are present
+  (nested/cross-nested cases consolidated into one named test pinning both directions);
+  the 18.5 marker corpus is pinned by test_marker_stream_and_constraint_latch_equivalence.
+- New permanent test (18.4 corpus): test_payload_adversarial_corpus_round_trip embeds the
+  spec's deterministic payload corpus (16 entries: '<', '>', '</parameter>',
+  '<parameter=x>', '<param=x>', '</param>', '</function>', '</invoke>', '<tool_call>',
+  '</tool_call>', '<function_calls>', '</function_calls>', '<function=fake>',
+  '<invoke=fake>', '<function name="fake">', '<parameter name="x">') into a declared string
+  argument with ordinary prefix/suffix text, at the payload start, and around a CRLF/tab
+  repeated sequence: the exact value round-trips in both modes and in 1/2/3/5/7 chunked
+  streaming. Entries that are (or end with) the outer closer literal stay out of the
+  matrix (fundamentally ambiguous at the value end, documented in tool_call_parser.md);
+  the prefix/suffix combination is the spec's own unambiguity rule.
+- Fresh adversarial probe round (build-new-parser/probe/adversarial_p7.cpp, all OK):
+  A1 multi-call sequence with CRLF separators (2 calls, both modes); A2 second call as a
+  bare <function name="read"> opener (2 calls); A3 two declared tools with the third call
+  cut inside its value (strict rejects MalformedStructure, tolerant retains the two
+  complete calls + TruncatedTail); B1 '<' immediately before <function_calls> (verbatim);
+  B2 quoted name containing <tool_call> (verbatim, InvalidToolName class); B3 CRLF inside
+  the wrapper literal (verbatim); C1/C2 decoder.finish(StopString/Cancelled) on an open
+  function (0 calls — the I2 boundary on the streaming route).
+
+Verification: targeted suites rebuilt and green (ninfer_tool_call_parser_test incl. the new
+corpus test, ninfer_engine_options_validation_test); adversarial probe ALL OK; full CPU
+CTest suite (ctest -j 8, 23 min): 161/162 executed tests passed, 13 _real skipped (no free
+GPU). The single failure is outside this task's scope: ninfer_kv_capacity_test fails
+because the local working tree comments out the explicit kv_capacity throw
+(kv_capacity.cpp); the parser/grammar/frontend/tool-call suites are all green.

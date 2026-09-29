@@ -12,6 +12,11 @@ namespace ninfer::runtime {
 
 [[nodiscard]] EngineOptions normalize_engine_options(EngineOptions options);
 
+// CPU-pure startup validation for EngineOptions. The Engine runs this before any device
+// work so an invalid combination fails before CUDA initialization; construct_model keeps
+// calling it as the single source of truth for option legality.
+void validate_engine_options(const EngineOptions& options);
+
 struct ModelInstance {
     using ModelContract = models::qwen3_5::RuntimeTypes;
 

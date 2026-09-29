@@ -66,9 +66,10 @@ build_tool_call_output_contract(std::span<const std::string> tool_jsons, bool en
 // Parse Qwen's XML-like tool-call format. The parse itself is policy-free: it reports the
 // complete calls, the state of the open call, and where the input ended. The recovery policy
 // (decide_tool_call_recovery) then decides what may be committed: tolerant mode commits a
-// call only when all of its argument bytes are unambiguously closed — a cut string value is
-// never committed, whatever the finish reason was — while strict mode keeps its
-// all-or-nothing behavior.
+// call only when its function close has been consumed (the function close is the
+// executability boundary: a missing function close never makes the call executable, whatever
+// its parameter values show; a cut parameter value of an open call is never committed), while
+// strict mode keeps its all-or-nothing behavior.
 [[nodiscard]] ParsedToolCallOutput
 parse_qwen_tool_call_output(const std::string& text, std::size_t max_tool_name_length,
                             const ToolCallOutputContract& contract, bool tolerant = false,

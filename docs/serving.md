@@ -975,7 +975,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--no-thinking` | disable thinking by default | thinking on |
 | `--preserve-thinking` | preserve closed-turn assistant reasoning by default | off |
 | `--tolerant-tool-calls` | recover complete tool calls cut by a malformed wrapper, a trailing suffix or the output budget instead of demoting them to text | off |
-| `--constrained-tool-decoding M` | grammar-constrained decoding of the tool wire syntax (`off` or `tool-calls-only`); reserved feature, the sampling path is unchanged until the integration lands | off |
+| `--constrained-tool-decoding M` | grammar-constrained decoding of the tool wire syntax (`off` or `tool-calls-only`); `tool-calls-only` is not implemented in this build and fails at engine startup with an explicit error; use `off` | off |
 | `--cors` | permissive browser CORS headers | off |
 | `--usage-chunk-choice` | give the streamed usage chunk a zero-delta choice, for strict client parsers that reject the OpenAI-conformant empty `choices` array | off |
 | `--temperature F` | process-level temperature override | unset |

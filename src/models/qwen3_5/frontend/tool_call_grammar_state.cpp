@@ -31,7 +31,6 @@ ToolCallParsePolicy ToolCallGrammarConstraint::parse_policy() const {
     // constrained to the canonical wire syntax, and the declared-name check is a contract
     // concern, not wire syntax.
     policy.tolerant = false;
-    policy.prefix   = true;
     policy.enforce_declared_names = false;
     return policy;
 }
@@ -76,11 +75,11 @@ ToolCallGrammarConstraint::advance(std::string_view decoded_bytes, ToolCallGramm
         }
         // Inactive: ordinary prose is always legal; only a complete marker trigger
         // constrains. The marker candidate follows the machine's own feed rule
-        // (ToolCallStreamParser::feed): a '<' starts a candidate only when none is held;
-        // every further byte — including '<' — is appended and classified; a NotMarker
-        // classification flushes the whole candidate as prose and the breaking byte is
-        // consumed (it never starts a new candidate). The first trigger is therefore
-        // exactly the parser's latch.
+        // (ToolCallStreamParser::feed) via the shared transition (F8): a '<' starts a
+        // candidate only when none is held; every further byte is appended and classified
+        // by the grammar; a NotMarker classification flushes the failed bytes as prose and
+        // a breaking '<' is retained as a fresh candidate start. The first trigger is
+        // therefore exactly the parser's latch.
         std::size_t i = offset;
         while (i < decoded_bytes.size()) {
             const char byte = decoded_bytes[i];
@@ -99,7 +98,10 @@ ToolCallGrammarConstraint::advance(std::string_view decoded_bytes, ToolCallGramm
                 offset = decoded_bytes.size();
                 break;  // re-enter: the full candidate is now region text
             }
-            if (status == ToolMarkerStatus::NotMarker) { state.marker_prefix_.clear(); }
+            if (status == ToolMarkerStatus::NotMarker) {
+                // F8: a breaking '<' starts a fresh candidate (shared split rule).
+                state.marker_prefix_.resize(failed_marker_candidate_retained(state.marker_prefix_));
+            }
             ++i;
         }
         if (!state.triggered_) { break; }

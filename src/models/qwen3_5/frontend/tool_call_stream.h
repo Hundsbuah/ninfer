@@ -50,16 +50,19 @@ struct ParsedToolRegion {
     std::uint32_t duplicate_parameters_repaired = 0;
 };
 
+// The region's outer wrapper (F5): an explicit kind instead of the old ambiguous boolean
+// pair. A wrapper open is legal only from None; the matching close returns to None. A second
+// wrapper open before the first closed is a definitive structural break.
+enum class ToolWrapperKind : std::uint8_t {
+    None,
+    ToolCall,
+    FunctionCalls,
+};
 // Policy inputs for name handling. The structure grammar itself stays policy-free; this is
 // where declared-tool identity and the tolerant mode enter.
 struct ToolCallParsePolicy {
     std::size_t max_name_length = 64;
     bool tolerant               = false;
-    // Evaluate `text` as a generated prefix instead of a complete region: a structure cut
-    // off at the slice end (an in-progress opener, wrapper, or close literal) reports
-    // EndOfInput rather than a definitive break. A byte that is not a prefix of any valid
-    // continuation is still definitive. The Phase-4 grammar-constraint core uses this mode.
-    bool prefix = false;
     bool enforce_declared_names = false;
     bool (*declared_check)(const void* contract, std::string_view name) = nullptr;
     const void* contract = nullptr;
@@ -69,8 +72,8 @@ struct ToolCallParsePolicy {
 // decision; strict and tolerant both consume the same progress, and a separate recovery
 // policy decides what may be committed.
 enum class ToolCallRegionTermination : std::uint8_t {
-    Complete,     // clean end: wrapper closed, function_calls closed, or top-level EOF after a
-                  // complete call
+    Complete,     // clean end: wrapper closed, function_calls closed or ended at the region
+                  // end after its last invoke close, or top-level EOF after complete calls
     EndOfInput,   // the input ended mid-region (open value, open function, open wrapper, ...)
     Definitive,   // a structural break, or trailing content after complete calls
 };
@@ -88,14 +91,22 @@ struct ToolCallParseProgress {
     // A break the wire format does not forgive (an empty <function_calls> wrapper): no call
     // may be committed, even by tolerant recovery.
     bool unrecoverable_break = false;
+    // A definitive break: the region-relative offset of the first byte that proved the break.
+    // The recovery retry may re-enter at or after this byte (the bytes before it were consumed
+    // as the failed region's structure or payload). Zero for a non-definitive outcome.
+    std::size_t break_offset = 0;
+    // The wrapper state at the break (or at the input end for EndOfInput). A recovery retry
+    // may re-enter only when no wrapper was open: an open wrapper owns the region tail.
+    ToolWrapperKind wrapper_at_break = ToolWrapperKind::None;
 };
 
 // P3.5: the explicit, pure recovery decision. Integrity over availability: a call is
-// committed only when all of its argument bytes are unambiguously closed.
+// committed only when its function close has been consumed (it is then already a complete
+// call in `calls`): a missing function close never makes the call executable, whatever the
+// finish reason (F2/I2).
 enum class ToolCallRecoveryDecision : std::uint8_t {
-    Reject,                 // the region falls back to text
-    CommitCalls,            // commit the complete calls only
-    CommitCallsAndOpenCall, // complete calls plus the open call: its argument bytes are closed
+    Reject,      // the region falls back to text
+    CommitCalls, // commit the complete calls only
 };
 
 struct ToolCallRecoveryResult {
@@ -131,19 +142,18 @@ decide_tool_call_recovery(const ToolCallParseProgress& progress,
         result.diagnostic = progress.failure;
         return result;
     }
-    // The open call is committable exactly when it kept at least one closed parameter and no
-    // value is still open: a name-only truncation carries no arguments, and a cut value must
-    // never execute (write/edit/bash/delete all take their payload from a string value).
-    const bool open_commit = !progress.open_value_open && !progress.open_call.parameters.empty();
-    if (progress.calls.empty() && !open_commit) {
-        result.diagnostic = progress.termination == ToolCallRegionTermination::EndOfInput
-                                ? ToolCallParseFailure::TruncatedTail
-                                : progress.failure;
+    // Tolerant recovery commits the structurally complete calls. An open call is never
+    // committed (F2/I2): its function close was not consumed, so its arguments are not
+    // executable. A missing value close alone is not a truncation of the call list.
+    if (!progress.calls.empty()) {
+        result.decision   = ToolCallRecoveryDecision::CommitCalls;
+        result.diagnostic = ToolCallParseFailure::TruncatedTail;
         return result;
     }
-    result.decision = open_commit ? ToolCallRecoveryDecision::CommitCallsAndOpenCall
-                                  : ToolCallRecoveryDecision::CommitCalls;
-    result.diagnostic = ToolCallParseFailure::TruncatedTail;
+    result.decision = ToolCallRecoveryDecision::Reject;
+    result.diagnostic = progress.termination == ToolCallRegionTermination::EndOfInput
+                           ? ToolCallParseFailure::TruncatedTail
+                           : progress.failure;
     return result;
 }
 
@@ -171,8 +181,8 @@ struct ToolCallStreamResult {
 //   marker latch: wrapper literal or complete function/invoke opener
 //   ExpectFunction -> FunctionHeader (grammar; tolerant recovery for malformed openers and for
 //                     a dropped '>' after the name)
-//   FunctionBody -> ParameterHeader -> ParameterValue (nested-opener depth scan with the
-//                   grammar's next-token lookahead after a quoted closer) -> FunctionBody
+//   FunctionBody -> ParameterHeader -> ParameterValue (opaque byte range; the matching
+//   outer close is a candidate boundary, classified by its continuation) -> FunctionBody
 //   function close -> ExpectWrapperClose (tool_call wrapper) | Top (bare / function_calls)
 //   Top -> next call | wrapper close | end | trailing
 

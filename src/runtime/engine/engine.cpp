@@ -26,6 +26,9 @@ namespace ninfer {
 namespace {
 
 DeviceContext initialize_device(const EngineOptions& options) {
+    // F10 fail-fast: an invalid option combination must not pay the CUDA initialization cost
+    // to discover it; validation is pure and runs before any device work.
+    runtime::validate_engine_options(options);
     StartupPhaseScope phase(options.startup_observer, StartupPhase::CudaInitialize);
     DeviceContext device(options.device);
     phase.complete();
