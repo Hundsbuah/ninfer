@@ -129,6 +129,9 @@ Implementation decision: removed the second marker grammar (`kToolMarkers`, `mat
    longer counts as a nested opener (grammar-consistent, stricter in the data-swallowing direction);
 6. strict mode maps a broken function header to MalformedStructure where the old broken-name
    fallback produced InvalidToolName (reason change only; no test pinned the old reason).
+7. a quoted short-form header without '=' (`<function"write">`) is now a definite NoMatch
+   (region rejected, text fallback) where the old name-extraction fallback accepted it as a
+   name (grammar-conformant: the short form requires '='); no test pinned the old acceptance.
 Tests added: none (existing matrix carries the semantics; new cases in P1.5)
 Tests executed: none yet (build in progress)
 Result: (see P1.5)
@@ -444,6 +447,9 @@ afterwards). Findings and fixes:
   and finish() reads the latched region. Behavior preserved byte for byte (the decoder's
   is_format_whitespace is the machine's is_tool_format_whitespace; the non-latched finish
   path still parses the empty region as before, keeping its diagnostics).
+- L7 (fixed): the P1.4 behavior-change notes did not list the `<function"write">` delta
+  (quoted short-form header without '=': the old parser accepted it via name-extraction
+  fallback; the new grammar rejects it as a definite NoMatch). Note 7 added to P1.4.
 - L8 (fixed): ToolCallStreamParser data members and publish()/latch() made private (no
   external users); the redundant parse_tool_call_region redeclaration in
   tool_call_grammar_state.h removed (declared in tool_call_stream.h, which it includes).
