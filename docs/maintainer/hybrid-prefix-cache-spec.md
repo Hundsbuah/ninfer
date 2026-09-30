@@ -650,9 +650,13 @@ Candidates, in priority order:
   `tap_min_gap` (default `max(1024, chunk)`) on both sides instead. The opener therefore absorbs
   the prompt tail in chat traffic, leaving one split per request.
 - Only markers with explicit evidence (a client-named breakpoint) are priority 1. Protocol-automatic
-  markers (OpenAI default caching, Anthropic automatic `cache_control`) are structural boundaries.
-- Explicit and structural taps are published as `Boundary` snapshots: conversations share them,
-  so a lineage moving past them never supersedes them (§9.3).
+  markers (OpenAI default caching, Anthropic automatic `cache_control`) are planned as structural
+  boundaries, but they mark the conversation's latest turn rather than a prefix conversations
+  share.
+- Explicit and structural taps (not protocol-automatic ones) are published as `Boundary`
+  snapshots: conversations may share them, so a lineage moving past one supersedes it only while
+  no other conversation has continued from it (§9.3). A cluster keeps this from any member it
+  drops.
 - A request that resumed from an endpoint snapshot proves its client echoes generated turns token
   for token (agent loops, preserved reasoning), so its own endpoint serves the next turn and the
   generation opener is not tapped. Measured on a tool-calling agent trace (27B NVFP4, INT8 KV,
@@ -858,7 +862,7 @@ while retention policy lives in the Program's index.
   opportunities, and `PromptIdentity` rewrite fields; Legacy ignores the new fields.
 - `ContextCacheHints` is unchanged. In Hybrid mode:
   - explicit-evidence markers map to priority-1 tap hints, automatic protocol markers to
-    structural hints;
+    `Automatic` hints (planned as structural, published as ordinary taps);
   - `session_key`, `retention`, `allow_engine_automatic_shared_prefixes` and
     `update_session_index` are ignored. Content addressing finds session chains without them.
 - External protocol behaviour is identical in both modes:
@@ -889,21 +893,37 @@ Two lists are kept, *backed* and *unbacked*, and backed entries are always consu
 
 ### 9.2 Device snapshot slots
 
-Slots hold at most `D` images. A slot owned by a superseded snapshot (§9.3) is taken first, oldest
-supersession first; the snapshot keeps its host copy or, without one, is deleted. Otherwise a slot
-is reusable when its snapshot is host-backed; the victim is the least recently hit such slot. A
-slot whose snapshot is not backed is evicted only when no backed slot exists and a tap or endpoint
-needs it. The snapshot then loses its image and is deleted, unless it is host-backed.
+Slots hold at most `D` images. A sequence about to snapshot past its previous snapshot (the one
+it resumed from, or its previous tap in the same prompt) supersedes it first (§9.3), so the slot
+comes from its own lineage when it can. A tap or endpoint takes a slot in this order:
+
+1. a free slot;
+2. a slot owned by a superseded snapshot, oldest supersession first; the snapshot keeps its Host
+   copy or, without one, is deleted;
+3. a slot owned by a Device-only snapshot (no Host copy: the Host tier is full, disabled or
+   evicted it): the one with the lowest GDSF priority (§9.3), and only when the new snapshot's
+   estimated priority (no hits, and the blocks since the sequence's previous snapshot its own) is
+   at least as high. The snapshot is lost, and `L` rises to its priority;
+4. the least recently hit Host-backed snapshot's slot, which loses only its Device copy.
+
+Otherwise the tap or endpoint is skipped. A Device-only owner's slot is its last copy, so value
+decides there rather than recency: least-recently-hit eviction let a short request's snapshots
+push out the snapshot a long conversation resumes from, and taking Host-backed slots first left
+owners that Host eviction had made Device-only in their slots for good (§16.5).
 
 ### 9.3 Host (superseded snapshots first, then GDSF; dead-KV first)
 
 **Supersession.** In a conversation the next request resumes from the newest snapshot of its
-lineage, not from the one the current request resumed from. When a sequence that resumed from
-snapshot `a` publishes a deeper snapshot on the same path (its endpoint or a tap), `a` becomes
-*superseded*: only a request diverging before the newer snapshot (a retry, an edit) can still use
-it. A hit on a superseded snapshot retains it again, until that lineage moves on. A `Boundary`
-snapshot (a tap at a client breakpoint or structural boundary, or at the divergence of coalesced
-requests, §12.2) is shared by conversations by design and is never superseded.
+lineage, not from the one the current request resumed from. When a sequence is about to publish a
+deeper snapshot on its path, the snapshot it resumed from becomes *superseded*, and so does the
+previous tap it captured in the same prompt when the new snapshot is a tap, before the new snapshot
+takes a Device slot or Host slabs: only a request diverging before the newer snapshot (a retry, an
+edit) can still use them. The endpoint leaves the prompt's last tap retained, since a next turn
+whose template re-renders the reply (stripped thinking) resumes from that tap. A hit on a superseded
+snapshot retains it again, until that lineage moves on. A `Boundary` snapshot (a tap at a client
+breakpoint or structural boundary, or at the divergence of coalesced requests, §12.2) may be shared
+by conversations, so it is superseded only while no other conversation has continued from it: while
+the tree below it is a single chain. Until then it is just its lineage's snapshot.
 
 Allocation of `k` slabs:
 
@@ -914,6 +934,10 @@ Allocation of `k` slabs:
 3. Otherwise evict the retained snapshot with minimum `H`, then repeat step 1 (its exclusive path
    has just become dead). Update `L := H(victim)`. A victim still complete on the Device (image in
    a device slot and tail resident) only gives up its host copy and stays restorable.
+
+A snapshot image write stops at step 3 when the victim is worth more than the new snapshot
+(`H(victim) > H(new)`): GDSF never inserts what it would evict next, and the new snapshot stays
+Device-only (§9.2). KV block writes (write-through at release) are not bounded this way.
 
 ```text
 H(s)  = L_s + F(s) · C(s) / Z(s)                // L_s: L when s was published or last hit
@@ -1103,6 +1127,12 @@ The test design follows. §13.1 and §13.3 are implemented (`ninfer_prefix_cache
   - dead KV is reclaimed before any snapshot;
   - the victim's exclusive path is freed;
   - `L` is monotonic.
+- **Supersession and admission**
+  - a lineage's previous snapshot is superseded, and a hit retains it again;
+  - a `Boundary` snapshot is superseded only while no other conversation continued below it;
+  - Device slots go to superseded owners, then to the least valuable Device-only owner for a new
+    snapshot worth as much, then to the least recently hit Host-backed owner;
+  - a Host image write displaces only snapshots worth no more than the new one.
 - **HostSlabPool**
   - exhaustion, reuse and chunked allocation;
   - a slab never crosses chunks.
@@ -1431,3 +1461,36 @@ None of these were A/B tested; each is a correctness, behavior or log fix.
 | The chunk function takes the restore's layer events itself (`PrefillContext::take_layer_ready`), so program code never holds the view | §6.5 | Hardening. A deterministic test of the fix above was asked for, but the retired-batch path is timing-dependent and a dangling view reading a recycled handle can pass a token-equality check, so a test would need a product seam or AddressSanitizer. Moving the lookup inside the chunk call instead leaves no place for program code to take the view early |
 | A stop fails running and queued requests and answers them before the save (`Engine::stop()`; `ninfer-serve` stops on Ctrl+C pressed twice within 5 s) | §5.5 | The production log's stops at 07:48 and 07:54 left 10 and 3 requests unfinished and wrote no file: Ctrl+C waited silently for them and a second Ctrl+C killed the process. Console test, one streaming and one queued request: before, generation ran on 68.6 s after Ctrl+C; after, one press only prompts, and a confirmed pair fails both with 503 within 0.2 s, saves 99 blocks (503 MiB) in 0.1–0.2 s and exits about 0.7 s later. Answering them only after the cleanup that saves made each 503 wait for the whole save (408 blocks and 4 snapshots, 1,438 MiB: both 503s 392 ms after the stop, as the 0.3 s save ended); they are now answered first (8 ms after the stop, 447 ms before the save ended), and the `persist` real test checks that the file is not yet saved when the running generation is answered |
 | One Ctrl+C during the stop exits without saving and deletes the unfinished file (`PrefixCacheSaveControl`); the line reads `Press Ctrl+C again to exit without saving` | §5.5 | Leaving during the save needed another confirmed pair of presses, and `_Exit` left a partial `.tmp` of up to the Host tier's size beside the previous file until the next save |
+
+### 16.5 Changes from upstream's TTFT campaign (2026-09-30)
+
+Upstream's public-HTTP TTFT campaign (`tools/bench/ttft`, its cache profiles translated to this
+cache's options at equal Device state slots and pinned Host bytes) ran against the upstream port of
+this cache in WSL2 on the same RTX 5090. Five of its cases resumed a conversation from the root, or
+far behind its newest snapshot, where upstream's checkpoint-catalog cache resumed from the conversation's own
+checkpoint. Measured with one sample per case on the upstream port; the eviction code is the same
+in both trees.
+
+| change | section | result | status |
+|---|---|---|---|
+| A sequence supersedes the snapshot it resumed from before its new snapshot takes a slot | §9.2, §9.3 | `session-alternating` (2 Device snapshot slots, no Host tier; two sessions sharing a 4K prefix): A2 and B2 TTFT 305 → 22 ms (upstream 49 ms). Before, each session's endpoint took the slot of the other session's endpoint, not of the shared tap it had resumed from | kept |
+| Device-only slots evicted by GDSF priority, only for a new snapshot worth as much, and before a Host-backed slot gives up its Device copy | §9.2 | `resume-after-interference-device` (same profile; two short requests between a 7.7K conversation's turns): resume 600 → 22 ms (upstream 78 ms); `resume-after-interference-catalog` 600 → 22 ms (632 ms) | kept |
+| A snapshot image goes to the Host only by displacing snapshots worth no more; protocol-automatic markers published as ordinary taps rather than `Boundary` snapshots | §7.1, §8.3, §9.3 | `private-state-working-set-shift` (2 Device slots, 384 MiB Host, DFlash2; four 2K conversations in two phases): the second phase's continuations 204–215 → 40–49 ms (upstream 48 ms). New images had displaced the snapshots the waiting conversations resume from | kept |
+| A `Boundary` snapshot is superseded like any other while no other conversation has continued from it | §9.3 | same case: B1 207 → 39 ms. Each conversation kept its system-block boundary beside its newer snapshot, so the other conversation's snapshot lost its slot. All eight continuations now take 20–40 ms (upstream 48–56 ms) | kept |
+| A deeper tap supersedes the sequence's previous tap of the same prompt (the endpoint does not supersede the prompt's last tap) | §9.3 | `session-alternating-64k-host-swap` (4.5 GiB Host for two 64K sessions whose KV takes 4 GiB): A2 2381 → 176 ms, B2 164 → 113 ms (upstream 242 and 171 ms). Valued against the tap below it, each ladder tap was worth more per byte than the prompt's last tap, so GDSF kept the four ladder taps and evicted the last tap until A resumed from 48K | kept |
+| Flexible taps (prompt tail, ladder) as a separate snapshot kind, evicted before every other retained snapshot | §9.3 | broke a regenerate-after-edit resume: with DFlash2 and a 1 GiB Host tier, the prompt-tail tap a request diverging late in the previous prompt needed went first (`restore-exact-dflash2` real test) | reverted |
+| The same kind starting from half a hit in its GDSF value | §9.3 | no change on the two cases it targeted | reverted |
+| Host admission by value (`F·C/Z`) instead of priority `H` | §9.3 | meant for small tiers, where `L` rises by a whole snapshot's value per eviction and almost any new image outranks the rest: stale snapshots worth more per byte then kept the tier from new ones, and the index test's Host backup found no slabs | reverted |
+
+The full campaign after these changes (3 samples per case) gives a geometric-mean TTFT ratio of
+0.658 against upstream's cache over 259 (case, role) observations: 172 faster by more than 10%, 18
+slower. The slower roles are not eviction. The 55K rotation (six sessions resumed round-robin with
+Device KV for about four) restores every session from Host, about 101 ms each, because Device KV is
+LRU over a cyclic working set larger than the Device; upstream's cache keeps three sessions resident
+(72 ms) and restores the other three in 125–245 ms, so its per-round mean is higher (128 against 99
+ms) while three roles are faster. A repeat of an identical prompt prefills its last few tokens
+(about 20 ms), where upstream's cache samples from the hidden state stored with its checkpoint (6
+ms): the prompt's last tap sits before the generation opener, and a snapshot at the prompt's exact
+end would cost a whole state image per request for byte-identical repeats only. The other slower
+roles are arrival races between concurrent requests and timing effects in profiles that run with the
+cache off.

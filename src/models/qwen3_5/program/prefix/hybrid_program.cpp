@@ -1225,6 +1225,13 @@ void ProgramImpl::hybrid_publish_pending(SequenceState& sequence, bool finishing
         hybrid_->attach_image(published.snapshot, tap.image);
         lane.deepest_snapshot = std::max(lane.deepest_snapshot, tap.frontier);
         ++counters.taps_created;
+        if (!tap.boundary) {
+            // A previous tap still pending when this one was captured is superseded here, before
+            // the Host write below can take its slabs.
+            hybrid_supersede_tap(lane, tap.frontier);
+            lane.tap_snapshot = published.snapshot;
+            lane.tap_frontier = tap.frontier;
+        }
         (void)hybrid_->start_snapshot_host_write(published.snapshot, device.stream,
                                                  device.transfer_stream);
     }
@@ -1239,7 +1246,10 @@ void ProgramImpl::hybrid_capture_tap(SequenceState& sequence, std::uint32_t fron
         ++counters.taps_skipped;
         return;
     }
-    const std::optional<std::uint32_t> slot = index.acquire_device_slot(!hybrid_->host_tier());
+    hybrid_supersede_resume(lane, frontier);
+    hybrid_supersede_tap(lane, frontier);
+    const std::optional<std::uint32_t> slot = index.acquire_device_slot(
+        index.estimate_priority(lane.last_capture, frontier, frontier % kBlock != 0));
     if (!slot) {
         ++counters.taps_skipped;
         return;
@@ -1297,14 +1307,24 @@ void ProgramImpl::hybrid_after_prefill_chunk(SequenceState& sequence, std::uint3
     hybrid_capture_tap(sequence, cursor, boundary);
 }
 
-void ProgramImpl::hybrid_supersede_resume(HybridLaneState& lane) {
+void ProgramImpl::hybrid_supersede_resume(HybridLaneState& lane, std::uint32_t frontier) {
     pc::PrefixCacheIndex& index = hybrid_->index();
-    if (!lane.resume_snapshot.valid() || lane.deepest_snapshot <= lane.resume_frontier ||
+    if (!lane.resume_snapshot.valid() || frontier <= lane.resume_frontier ||
         !index.valid(lane.resume_snapshot)) {
         return;
     }
     index.supersede(lane.resume_snapshot);
     lane.resume_snapshot = {};
+}
+
+void ProgramImpl::hybrid_supersede_tap(HybridLaneState& lane, std::uint32_t frontier) {
+    pc::PrefixCacheIndex& index = hybrid_->index();
+    if (!lane.tap_snapshot.valid() || frontier <= lane.tap_frontier ||
+        !index.valid(lane.tap_snapshot)) {
+        return;
+    }
+    index.supersede(lane.tap_snapshot);
+    lane.tap_snapshot = {};
 }
 
 std::span<const cudaEvent_t> ProgramImpl::hybrid_take_restore_layers(std::uint32_t lane) {
@@ -1370,8 +1390,12 @@ bool ProgramImpl::hybrid_finish_lane(SequenceState& sequence, RequestControl& re
                 !sequence.state.fork_pending && sequence.state.read == sequence.state.write &&
                 state_store->role(sequence.state.write) == StateImageRole::ActiveMutable) {
                 pc::PrefixCacheIndex& index = hybrid_->index();
+                // The lineage moves past its source here, so a slot it needs comes from its own
+                // lineage before another conversation's snapshot.
+                hybrid_supersede_resume(lane_state, frontier);
                 const std::optional<std::uint32_t> slot =
-                    index.acquire_device_slot(!hybrid_->host_tier());
+                    index.acquire_device_slot(index.estimate_priority(
+                        lane_state.deepest_snapshot, frontier, frontier % kBlock != 0));
                 if (slot) {
                     const std::uint32_t tail = frontier % kBlock;
                     std::optional<std::uint32_t> tail_id;
@@ -1413,7 +1437,7 @@ bool ProgramImpl::hybrid_finish_lane(SequenceState& sequence, RequestControl& re
                         sequence.state = {};
                         ++hybrid_->counters().endpoints_created;
                         // Superseded first, so the Host write below can take its slabs.
-                        hybrid_supersede_resume(lane_state);
+                        hybrid_supersede_resume(lane_state, lane_state.deepest_snapshot);
                         (void)hybrid_->start_snapshot_host_write(published.snapshot, device.stream,
                                                                  device.transfer_stream);
                     } else {
@@ -1421,7 +1445,7 @@ bool ProgramImpl::hybrid_finish_lane(SequenceState& sequence, RequestControl& re
                     }
                 }
             }
-            hybrid_supersede_resume(lane_state);
+            hybrid_supersede_resume(lane_state, lane_state.deepest_snapshot);
         }
     } catch (...) {
         // Terminal publication is optional; a failure keeps whatever was published and releases

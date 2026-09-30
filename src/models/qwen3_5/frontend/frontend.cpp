@@ -612,12 +612,12 @@ PreparedTapHints prepare_tap_hints(const ContextCacheHints& hints,
     for (std::size_t index = 0; index < hints.markers.size(); ++index) {
         const PromptCacheMarker& marker = hints.markers[index];
         // Only a client-named breakpoint is honored unconditionally; protocol-automatic markers
-        // (OpenAI default caching, Anthropic automatic cache_control) are ordinary structural
-        // boundaries that compete with the Engine's own.
+        // (OpenAI default caching, Anthropic automatic cache_control) compete with the Engine's
+        // structural boundaries and mark the conversation's latest turn.
         const TapHintKind kind = has_shared_candidate_evidence(
                                      marker.evidence, SharedCandidateEvidence::ExplicitBoundary)
                                      ? TapHintKind::Explicit
-                                     : TapHintKind::Structural;
+                                     : TapHintKind::Automatic;
         if (marker.location == PromptCacheMarkerLocation::MessageBoundary) {
             if (marker.after_message_count < message_boundaries.size()) {
                 add(message_boundaries[marker.after_message_count], kind);
