@@ -86,17 +86,32 @@ FunctionCloseContinuation classify_function_close_continuation(std::string_view 
         starts_with_at(text, at, tool_close_literal(ToolTagKind::FunctionCalls))) {
         return FunctionCloseContinuation::Legal;
     }
-    ToolOpenTag opener = {};
-    const ToolHeaderStatus opener_status = parse_tool_function_open(text.substr(at), opener);
-    if (opener_status == ToolHeaderStatus::Complete || opener_status == ToolHeaderStatus::NeedMore) {
+    // R2-I4 (CR4): the continuation after a function close at top level (or inside
+    // <function_calls>) is exactly the top-level entry the region's Top state accepts —
+    // classified by the shared classifier, so a complete next entry and its partial
+    // prefixes agree on the previous call's boundary. A wrapper open inside an open
+    // wrapper proves the close was payload (a nesting break, F5); only at top level
+    // (wrapper == None) is a complete wrapper open a legal next entry.
+    const TopLevelEntryInfo entry = classify_top_level_entry(text, at);
+    if (entry.kind == TopLevelEntry::NeedMore) {
+        // A next entry in progress at the slice end (F4/I3).
         return FunctionCloseContinuation::Legal;
     }
-    if (is_strict_prefix_of(tool_close_literal(ToolTagKind::FunctionCalls), text, at) ||
-        is_strict_prefix_of(tool_open_literal(ToolTagKind::ToolCall), text, at)) {
+    if (entry.kind == TopLevelEntry::Entry) {
+        if (is_tool_function_kind(entry.tag)) {
+            // The next call.
+            return FunctionCloseContinuation::Legal;
+        }
+        return wrapper == ToolWrapperKind::None ? FunctionCloseContinuation::Legal
+                                                : FunctionCloseContinuation::Payload;
+    }
+    if (is_strict_prefix_of(tool_close_literal(ToolTagKind::FunctionCalls), text, at)) {
+        // An in-progress </function_calls> close at the slice end (F4/I3).
         return FunctionCloseContinuation::Legal;
     }
     return FunctionCloseContinuation::Payload;
 }
+
 
 // The tri-state continuation classification of a candidate outer parameter close (F1/F3/F4).
 // A candidate closer is a structural boundary when the following bytes are the grammar's
@@ -187,11 +202,14 @@ ToolCallParseProgress parse_region(std::string_view text, const ToolCallParsePol
         switch (s.mode) {
         case RegionState::Mode::ExpectFunction:
         case RegionState::Mode::Top: {
-            const bool top = s.mode == RegionState::Mode::Top;
-            s.mode = RegionState::Mode::Top;
             const std::size_t i = skip_ws(text, s.pos);
             if (i == text.size()) {
-                if (top) {
+                // R2-I2 (CR2): Complete implies wrapper balance. A wrapper open at the input
+                // end is an objective truncation (a compatibility omission, not a clean
+                // completion): the recovery policy decides whether the function-closed calls
+                // are retained. ExpectFunction (a wrapper literal with no function yet) also
+                // stays a truncation.
+                if (s.mode == RegionState::Mode::Top && s.wrapper == ToolWrapperKind::None) {
                     complete();
                     return out;
                 }
@@ -209,9 +227,11 @@ ToolCallParseProgress parse_region(std::string_view text, const ToolCallParsePol
                     invalid(ToolCallParseFailure::MalformedStructure, i);
                     return out;
                 }
+                // R2-I3 (CR3): consuming the wrapper close does not consume the rest of the
+                // output: the wrapper closes and the state returns to Top, which validates the
+                // remainder (EOF, a next region, a partial marker, or trailing content).
                 s.wrapper = ToolWrapperKind::None;
-                complete();
-                return out;
+                continue;
             }
             if (s.wrapper == ToolWrapperKind::FunctionCalls &&
                 is_strict_prefix_of(tool_close_literal(ToolTagKind::FunctionCalls), text, i)) {
@@ -220,58 +240,51 @@ ToolCallParseProgress parse_region(std::string_view text, const ToolCallParsePol
                 truncated(false, i);
                 return out;
             }
-            if (is_strict_prefix_of(tool_open_literal(ToolTagKind::ToolCall), text, i) ||
-                is_strict_prefix_of(tool_open_literal(ToolTagKind::FunctionCalls), text, i)) {
-                // An in-progress wrapper literal at the slice end (F4).
-                truncated(false, i);
-                return out;
-            }
-            if (starts_with_at(text, i, tool_open_literal(ToolTagKind::ToolCall))) {
+            // R2-I4 (CR4): top-level entries are classified by the shared classifier, the
+            // same authority the function-close continuation lookahead consumes, so complete
+            // and partial next entries agree on the previous call's boundary.
+            const TopLevelEntryInfo entry = classify_top_level_entry(text, i);
+            if (entry.kind == TopLevelEntry::Entry &&
+                (entry.tag == ToolTagKind::ToolCall || entry.tag == ToolTagKind::FunctionCalls)) {
                 if (s.wrapper != ToolWrapperKind::None) {
                     // A second wrapper open before the first closed: unbalanced nesting is a
                     // definitive structural break (F5/I4). The nested wrapper never parses and
-                    // its calls are never re-read as recovery entries (wrapper-only search
-                    // after it); the recovery policy still decides about complete calls the
-                    // outer region already committed (F2 retention).
+                    // its calls are never re-read as recovery entries; the recovery policy
+                    // still decides about complete calls the outer region already committed
+                    // (F2 retention).
                     invalid(ToolCallParseFailure::MalformedStructure, i);
                     return out;
                 }
-                s.pos     = i + tool_open_literal(ToolTagKind::ToolCall).size();
-                s.wrapper = ToolWrapperKind::ToolCall;
+                s.pos     = i + entry.opener.consumed;
+                s.wrapper = (entry.tag == ToolTagKind::ToolCall) ? ToolWrapperKind::ToolCall
+                                                                 : ToolWrapperKind::FunctionCalls;
                 s.mode    = RegionState::Mode::ExpectFunction;
                 continue;
             }
-            if (starts_with_at(text, i, tool_open_literal(ToolTagKind::FunctionCalls))) {
-                if (s.wrapper != ToolWrapperKind::None) {
-                    invalid(ToolCallParseFailure::MalformedStructure, i);
-                    return out;
-                }
-                s.pos     = i + tool_open_literal(ToolTagKind::FunctionCalls).size();
-                s.wrapper = ToolWrapperKind::FunctionCalls;
-                s.mode    = RegionState::Mode::ExpectFunction;
-                continue;
-            }
-            ToolOpenTag opener_probe = {};
-            const ToolHeaderStatus opener_status =
-                parse_tool_function_open(text.substr(i), opener_probe);
-            // A complete opener is a function. Under tolerant mode a broken opener
-            // ("<function=memory\n...", a dropped '<' or keyword) also enters the header state,
-            // where the recovery rules run; strict mode invalidates it below with the same
-            // diagnostics the old batch parser produced.
-            if (opener_status == ToolHeaderStatus::Complete ||
-                (policy.tolerant && opener_status != ToolHeaderStatus::Complete)) {
+            if (entry.kind == TopLevelEntry::Entry) {
+                // A complete function/invoke opener.
                 s.pos  = i;
                 s.mode = RegionState::Mode::FunctionHeader;
                 continue;
             }
-            if (opener_status == ToolHeaderStatus::NeedMore) {
-                // An in-progress function/invoke opener at the slice end (F4).
+            if (entry.kind == TopLevelEntry::NeedMore) {
+                // An in-progress top-level entry (wrapper literal or opener) at the slice end
+                // (F4).
                 truncated(false, i);
                 return out;
             }
+            // NoEntry: a broken opener or a non-marker byte. Under tolerant mode a broken
+            // opener (a dropped '<' or keyword) also enters the header state, where the
+            // recovery rules run; strict mode invalidates below with the same diagnostics the
+            // old batch parser produced.
+            if (policy.tolerant) {
+                s.pos  = i;
+                s.mode = RegionState::Mode::FunctionHeader;
+                continue;
+            }
             // A byte that is not a marker: trailing text after complete calls, or a broken
-            // region start. A definitive structural outcome: tolerant recovery commits the
-            // complete calls (recording the truncation); strict mode rejects with the reason.
+            // region start. A definitive structural outcome: strict mode rejects with the
+            // reason.
             if (s.region.calls.empty()) { invalid(ToolCallParseFailure::MalformedStructure, i); }
             else { invalid(ToolCallParseFailure::TrailingContent, i); }
             return out;
@@ -354,10 +367,11 @@ ToolCallParseProgress parse_region(std::string_view text, const ToolCallParsePol
                 invalid(ToolCallParseFailure::InvalidToolName, i);
                 return out;
             }
-            // Strict mode rejects a name outside the declared tool set. Tolerant mode keeps an
-            // otherwise well-formed call structured and leaves the identity judgment to the
-            // consumer: leaking the raw region to content would turn a valid call into prose.
-            if (!policy.tolerant && policy.enforce_declared_names &&
+            // R2-I5 (CR5): the declared-tool identity policy is independent of syntax
+            // tolerance: tolerant mode repairs syntax damage, it does not let the model
+            // invent function identities. The identity check applies in strict and tolerant
+            // alike whenever the contract enforces declared names.
+            if (policy.enforce_declared_names &&
                 (policy.declared_check == nullptr ||
                  !policy.declared_check(policy.contract, name))) {
                 invalid(ToolCallParseFailure::UndeclaredTool, i);
@@ -517,6 +531,85 @@ ToolCallParseProgress parse_tool_call_region(std::string_view text, const ToolCa
 }
 
 ToolCallStreamParser::ToolCallStreamParser(ToolCallParsePolicy policy) : policy_(policy) {}
+ToolCallStreamParser::FenceTracker::Verdict
+ToolCallStreamParser::FenceTracker::consume(char byte) noexcept {
+    if (byte == '\n') {
+        if (in_fence_ && close_pending_ && !opener_line_) {
+            // A close line (run of the opener character of at least the opener length,
+            // followed only by whitespace) ends the fence at its newline.
+            in_fence_   = false;
+            fence_char_ = '\0';
+            fence_len_  = 0;
+        }
+        close_pending_ = false;
+        opener_line_   = false;
+        at_line_start_ = true;
+        run_char_      = '\0';
+        run_len_       = 0;
+        indent_        = 0;
+        return in_fence_ ? Verdict::Content : Verdict::Pass;
+    }
+    if (in_fence_) {
+        // Every byte inside a fence is ordinary content until a valid close line ends the
+        // fence. Track the close candidate at line start: up to 3 spaces, then a run of the
+        // opener character reaching the opener length; any other byte cancels it (the line
+        // is content, the fence stays open). The opener line itself never closes the fence.
+        if (at_line_start_) {
+            if (byte == ' ') {
+                if (indent_ < 3) { ++indent_; }
+                else { at_line_start_ = false; }
+            } else if (byte == fence_char_) {
+                ++run_len_;
+                if (opener_line_ && at_line_start_ && indent_ <= 3) {
+                    // The opener line's run is still growing: the fence length is the full
+                    // run (CommonMark), not the length at the opening threshold.
+                    fence_len_ = run_len_;
+                } else if (!opener_line_ && indent_ <= 3 && run_len_ >= fence_len_) {
+                    close_pending_ = true;
+                }
+            } else {
+                at_line_start_ = false;
+                close_pending_ = false;
+            }
+        } else if (!is_tool_format_whitespace(byte)) {
+            // A non-whitespace byte after the close run: the line is not a close; further
+            // fence characters on the line are not a new run.
+            at_line_start_  = false;
+            close_pending_ = false;
+        }
+        return Verdict::Content;
+    }
+    if (!at_line_start_) { return Verdict::Pass; }
+    if (byte == ' ') {
+        // Whitespace stays with the marker machine (a pre-latch whitespace run may still
+        // belong to the region's leading part); only the fence run is structural here.
+        if (indent_ < 3) { ++indent_; }
+        else { at_line_start_ = false; }
+        return Verdict::Pass;
+    }
+    if (byte == '`' || byte == '~') {
+        if (indent_ <= 3 && (run_char_ == '\0' || run_char_ == byte)) {
+            run_char_ = byte;
+            ++run_len_;
+            if (run_len_ >= 3) {
+                // The run opened the fence at its third character; the rest of the line is
+                // the info string.
+                in_fence_    = true;
+                fence_char_  = byte;
+                fence_len_   = run_len_;
+                opener_line_ = true;
+            }
+            return Verdict::Content;
+        }
+        run_char_      = '\0';
+        at_line_start_ = false;
+        return Verdict::Pass;
+    }
+    // A non-whitespace, non-fence byte at line start: the line is ordinary content.
+    at_line_start_ = false;
+    return Verdict::Pass;
+}
+
 
 void ToolCallStreamParser::publish(std::string_view bytes, std::string& visible) {
     content_.append(bytes);
@@ -543,6 +636,17 @@ std::string ToolCallStreamParser::feed(std::string_view chunk) {
     }
     for (std::size_t i = 0; i < chunk.size(); ++i) {
         const char byte = chunk[i];
+        if (fence_.consume(byte) == FenceTracker::Verdict::Content) {
+            // R2-I6 (CR6): a fence byte is ordinary content and cannot continue a top-level
+            // marker (a marker is single-line and the newline that bounds a fence line has
+            // already broken any held candidate). Publish the held bytes as content.
+            publish(pending_ws_, visible);
+            pending_ws_.clear();
+            publish(marker_prefix_, visible);
+            marker_prefix_.clear();
+            publish(std::string_view(&byte, 1), visible);
+            continue;
+        }
         if (!marker_prefix_.empty()) {
             marker_prefix_.push_back(byte);
             ToolOpenTag marker = {};
@@ -586,12 +690,12 @@ ToolCallStreamResult ToolCallStreamParser::finish(FinishReason finish_reason) co
         result.tail    = content_ + pending_ws_ + marker_prefix_;
         return result;
     }
-    // complete marker (wrapper literal or complete function/invoke opener) at or after the
-    // failed structure's break. A retry never re-enters inside the failed region: a
-    // definitive break re-enters at the break byte (the bytes before it were consumed as the
-    // failed structure), an EndOfInput re-enters after the region start as before — and no
-    // re-entry happens while a wrapper was open, because an open wrapper owns the region
-    // tail as payload (F7 test: a nested fake call inside a failed wrapper never executes).
+    // Recovery retry (R2-I1/CR1, F7): a rejected region may be re-read at a later top-level
+    // marker — but only from a proven top-level scope. A break that leaves a wrapper still
+    // open is never eligible for retry: the wire bytes cannot prove exit from the failed
+    // wrapper (the payload syntax has no escaping, and the break left the structure
+    // unbalanced), so the failed wrapper owns the remaining ambiguous bytes and the whole
+    // region falls back to content. Non-execution over recovery (R2-I7).
     std::size_t base = 0;
     ToolCallParseFailure first_failure = ToolCallParseFailure::MalformedStructure;
     const ToolCallRecoveryPolicy recovery_policy{policy_.tolerant, finish_reason};
@@ -610,33 +714,29 @@ ToolCallStreamResult ToolCallStreamParser::finish(FinishReason finish_reason) co
             return result;
         }
         if (base == 0) { first_failure = recovery.diagnostic; }
-        const bool wrapper_open = progress.wrapper_at_break != ToolWrapperKind::None;
-        // The break offset is relative to the retried slice: the next search starts at the
-        // absolute break position, never before the accepted prefix.
+        if (progress.wrapper_at_break != ToolWrapperKind::None) {
+            // R2-I1: a failed wrapper owns its still-unclosed scope. No marker located inside
+            // it (a nested wrapper, a quoted literal, or a truncation tail) may become a
+            // recovery entry; the entire latched region stays content.
+            result.status  = ToolCallStreamStatus::Invalid;
+            result.failure = first_failure;
+            result.tail    = region_;
+            return result;
+        }
+        // The retried slice starts with the entry marker (a latched or retry-found complete
+        // marker). A definitive break at the marker's own header must not re-read that same
+        // marker; the search starts strictly after the failed marker's opener bytes, or at
+        // the break byte when the break proved itself deeper in the structure.
+        ToolOpenTag entry_marker = {};
+        const ToolMarkerStatus entry_status =
+            classify_tool_marker_prefix(region_.substr(base), entry_marker);
+        const std::size_t entry_end =
+            base + (entry_status == ToolMarkerStatus::Complete ? entry_marker.consumed : 1);
         std::size_t search_from =
             progress.termination == ToolCallRegionTermination::Definitive
-                ? base + progress.break_offset
+                ? std::max(base + progress.break_offset, entry_end)
                 : base + 1;
-        if (wrapper_open && progress.termination == ToolCallRegionTermination::Definitive) {
-            // A definitive nesting break occurs at the failed wrapper's own open: that
-            // wrapper literal cannot open a new top-level region (it is the nested open that
-            // failed the structure). The recovery search starts after it; a later wrapper is
-            // still a legitimate entry (F7 test 1).
-            if (starts_with_at(region_, search_from, tool_open_literal(ToolTagKind::ToolCall))) {
-                search_from += tool_open_literal(ToolTagKind::ToolCall).size();
-            } else if (starts_with_at(region_, search_from,
-                                      tool_open_literal(ToolTagKind::FunctionCalls))) {
-                search_from += tool_open_literal(ToolTagKind::FunctionCalls).size();
-            }
-        }
-        // Recovery entry policy (F7): a failed region that broke with a wrapper still open
-        // owns the bytes before its break as the failed structure; only a later wrapper
-        // literal may open a fresh top-level region there. A bare function/invoke opener is
-        // a compatibility entry at the stream's top level, but never a recovery entry inside
-        // a failed wrapper's scope (it would reinterpret nested payload as a new call).
-        const std::size_t next = wrapper_open
-            ? find_tool_marker(region_, search_from, /*wrapper_only=*/true)
-            : find_tool_marker(region_, search_from);
+        const std::size_t next = find_tool_marker(region_, search_from);
         if (next == std::string_view::npos || next == base) {
             // No later recovery entry. `next == base` guards a header that fails at its own
             // start: re-reading the same marker cannot change the outcome.

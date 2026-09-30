@@ -485,6 +485,21 @@ ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text,
         diagnostics.fallback_reason = failure;
         return fallback(text, diagnostics);
     }
+    // R2-I5 (CR5) defense in depth: identity is a property of the output, not a side effect
+    // of one parse branch. When the contract enforces declared names, no call may leave the
+    // frontend with a name outside the declared set — the state-machine branch is the primary
+    // enforcement, this check is the output boundary (a graceful fallback, never a crash).
+    if (contract.enforce_declared_names) {
+        for (const ParsedFunctionCall& call : result.region.calls) {
+            if (find_tool_contract(contract, call.name) == nullptr) {
+                ToolCallParseDiagnostics diagnostics;
+                diagnostics.marker_seen     = true;
+                diagnostics.fallback_reason = ToolCallParseFallbackReason::UndeclaredTool;
+                return fallback(text, diagnostics);
+            }
+        }
+    }
+
     ParsedToolCallOutput out;
     out.diagnostics.marker_seen     = true;
     // A recovered truncated tail keeps its reason for transparency without demoting the output.

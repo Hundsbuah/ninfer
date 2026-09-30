@@ -237,4 +237,49 @@ std::size_t find_tool_marker(std::string_view text, std::size_t search_from,
     return std::string_view::npos;
 }
 
+TopLevelEntryInfo classify_top_level_entry(std::string_view text, std::size_t at) noexcept {
+    TopLevelEntryInfo info;
+    std::size_t i = at;
+    skip_ws(text, i);
+    if (i >= text.size()) {
+        info.kind = TopLevelEntry::End;
+        return info;
+    }
+    const std::string_view rest           = text.substr(i);
+    const std::string_view tool_call      = tool_open_literal(ToolTagKind::ToolCall);
+    const std::string_view function_calls = tool_open_literal(ToolTagKind::FunctionCalls);
+    if (rest.size() >= tool_call.size() && rest.substr(0, tool_call.size()) == tool_call) {
+        info.kind          = TopLevelEntry::Entry;
+        info.tag           = ToolTagKind::ToolCall;
+        info.opener.kind   = ToolTagKind::ToolCall;
+        info.opener.consumed = tool_call.size();
+        return info;
+    }
+    if (rest.size() >= function_calls.size() &&
+        rest.substr(0, function_calls.size()) == function_calls) {
+        info.kind          = TopLevelEntry::Entry;
+        info.tag           = ToolTagKind::FunctionCalls;
+        info.opener.kind   = ToolTagKind::FunctionCalls;
+        info.opener.consumed = function_calls.size();
+        return info;
+    }
+    ToolOpenTag opener = {};
+    const ToolHeaderStatus status = parse_tool_function_open(rest, opener);
+    if (status == ToolHeaderStatus::Complete) {
+        info.kind   = TopLevelEntry::Entry;
+        info.tag    = opener.kind;
+        info.opener = opener;
+        return info;
+    }
+    const bool strict_prefix =
+        (rest.size() < tool_call.size() && tool_call.compare(0, rest.size(), rest) == 0) ||
+        (rest.size() < function_calls.size() &&
+         function_calls.compare(0, rest.size(), rest) == 0);
+    if (status == ToolHeaderStatus::NeedMore || strict_prefix) {
+        info.kind = TopLevelEntry::NeedMore;
+        return info;
+    }
+    return info; // NoEntry
+}
+
 } // namespace ninfer::models::qwen3_5::frontend

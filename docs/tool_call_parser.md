@@ -11,9 +11,10 @@ The wire grammar is the single source of truth for tag literals, header syntax a
 recognition. Accepted forms:
 
 - Wrapper: `<tool_call> ... </tool_call>` (zero or more calls) and
-  `<function_calls> ... </function_calls>` (one or more calls; the wrapper close is
-  optional at the region end). A region may also start directly with a function or invoke
-  opener (no wrapper).
+  `<function_calls> ... </function_calls>` (one or more calls). A region may also start
+  directly with a function or invoke opener (no wrapper). A wrapper that is still open at
+  the end of the input is a truncation, never a clean completion: strict rejects the region
+  (`MalformedStructure`); tolerant retains the closed calls with `TruncatedTail`.
 - Function openers, per family:
   - `<function=NAME>` / `<invoke=NAME>` (short form; `NAME` is the first `name` attribute or
     the short value),
@@ -57,12 +58,14 @@ level.
 
 A region that breaks is re-read at the break (a definite structural break) or after the
 accepted prefix (a cut at the input end); the bytes before the accepted region remain
-verbatim content. A failed region that broke with a wrapper still open owns the bytes up
-to its break as the failed structure: a later wrapper literal opens a fresh top-level
-region there, but a bare function/invoke opener in that scope is never a recovery entry
-(it would reinterpret nested payload as a new call), and a wrapper that opened inside the
-failed wrapper (a nesting break) is skipped. Wrapper nesting — a second wrapper open
-before the first one closed — is a structural break in both modes.
+verbatim content. A break that leaves a wrapper open is never a recovery entry: the failed
+wrapper owns the remaining bytes of its still-unclosed scope, and the recovery search runs
+only from a proven top-level scope (a break at `wrapper = None`). Concretely: a later
+wrapper literal inside the failed wrapper's scope never opens a fresh region, a bare
+function/invoke opener there is never a recovery entry (it would reinterpret nested payload
+as a new call), and a wrapper that opened inside the failed wrapper (a nesting break) is
+skipped. Wrapper nesting — a second wrapper open before the first one closed — is a
+structural break in both modes.
 
 While scanning for the first marker, a candidate broken by a byte the grammar classifies
 as NotMarker is published up to that byte; when the breaking byte itself is `<`, it is
@@ -71,6 +74,18 @@ retained as the start of a fresh candidate, so a real marker inside a failed pre
 header grammar still accepts (a quoted attribute value) keeps the candidate open instead
 of breaking it.
 
+## Code fences
+
+Pre-latch content is scanned by a line-oriented fence tracker (a practical CommonMark
+subset): a run of at least three backticks or tildes at the start of a line (up to three
+spaces of indentation) opens a fence, and only a run of the same character of at least the
+opener's length, alone on its line, closes it. Inside a recognized fence the bytes are
+ordinary content and never enter the marker candidate machine, so a complete tool marker
+written inside a fenced code block of final content cannot latch as a structured call. An
+unclosed fence stays open to the end of the input (suppression is the safe direction). The
+tracker only sees the pre-latch content channel: once a region has latched, the region's own
+bytes are parsed by the wire grammar, which owns value bytes (a value may contain fence
+markup).
 ## Strict vs. tolerant
 
 Both modes parse with the same grammar and the same state machine; the policy changes only
@@ -85,19 +100,23 @@ consumed. A call whose function close was not consumed is never executable, what
 parameter values show: the function close is the executability boundary, not the value
 close. Complete calls before a later broken call, and a function-closed final call cut
 before its wrapper close, are retained with a `truncated_tail` diagnostic. A name-only
-truncation (no closed parameter and no function close) still falls back to text: recovery
-- The empty `<function_calls>`
-  wrapper is unrecoverable in both modes; a `<function_calls>` region holds a sequence of
-  calls (another call may follow any function close) and may end at the region end after
-  its last invoke close (the wrapper close is optional there, a clean completion).
+truncation (no closed parameter and no function close) still falls back to text. An
+undeclared name is a break in tolerant mode as in strict mode: identity is not a syntax
+issue that tolerance repairs, so an undeclared call is never emitted in either mode
+(`UndeclaredTool`). The empty `<function_calls>` wrapper is unrecoverable in both modes;
+a `<function_calls>` region holds a sequence of calls (another call may follow any function
+close), and an unclosed `<function_calls>` at the input end retains the closed calls with
+`TruncatedTail` — never a clean completion.
 
 ## Fundamental delimiter ambiguity
 
 The wire format has no delimiter escape. A `</parameter>` inside a value is a real closer
-only when the bytes after it form a legal continuation, classified by the same wire
-grammar: another parameter opener, the function's closer followed by the wrapper close or
-the region end, or the end of the input. A closer at the input end is a provisional
-boundary: the parameter commits, but a function that never closes stays non-executable.
+only when the bytes after it form a legal continuation, decided by one shared wire-grammar
+classification consumed by both the value scan and the function-close lookahead: another
+parameter opener, the function's closer followed by a legal top-level entry (the wrapper
+close, another function/invoke opener, or the end of input), or the end of the input. A
+closer at the input end is a provisional boundary: the parameter commits, but a function
+that never closes stays non-executable.
 Any other continuation (immediate markup that is not a structural token, a quoted closer
 immediately followed by the next token) is value text — a shell command that echoes the
 markup. Inside a `<tool_call>` wrapper the rule is stricter: a `</parameter>` followed by

@@ -72,8 +72,8 @@ struct ToolCallParsePolicy {
 // decision; strict and tolerant both consume the same progress, and a separate recovery
 // policy decides what may be committed.
 enum class ToolCallRegionTermination : std::uint8_t {
-    Complete,     // clean end: wrapper closed, function_calls closed or ended at the region
-                  // end after its last invoke close, or top-level EOF after complete calls
+    Complete,     // clean end: the top level reached the input end (after format whitespace)
+                  // with no wrapper open — wrapper balance is part of the outcome (R2-I2)
     EndOfInput,   // the input ended mid-region (open value, open function, open wrapper, ...)
     Definitive,   // a structural break, or trailing content after complete calls
 };
@@ -95,8 +95,10 @@ struct ToolCallParseProgress {
     // The recovery retry may re-enter at or after this byte (the bytes before it were consumed
     // as the failed region's structure or payload). Zero for a non-definitive outcome.
     std::size_t break_offset = 0;
-    // The wrapper state at the break (or at the input end for EndOfInput). A recovery retry
-    // may re-enter only when no wrapper was open: an open wrapper owns the region tail.
+    // The wrapper state at the break (or at the input end for EndOfInput). A break that
+    // leaves a wrapper open is never eligible for a recovery retry: the failed wrapper owns
+    // the remaining ambiguous bytes (R2-I1); the retry search runs only from a proven
+    // top-level scope.
     ToolWrapperKind wrapper_at_break = ToolWrapperKind::None;
 };
 
@@ -173,8 +175,11 @@ struct ToolCallStreamResult {
 // Stateful, incremental parser for the Qwen tool-call wire syntax. One instance parses one
 // output stream. feed() publishes ordinary content as soon as it can no longer become part of
 // a tool marker — the decision comes from the wire grammar (classify_tool_marker_prefix), not
-// from a separate marker list — and buffers the tool region. finish() runs the region state
-// machine over the complete region bytes and reports the parsed region or the precise failure.
+// from a separate marker list — and buffers the tool region. A line-oriented fence tracker
+// (R2-I6/CR6) keeps recognized final-content code fences out of the marker candidate machine:
+// fence bytes are ordinary content, and a tool marker inside a fence never latches.
+// finish() runs the region state machine over the complete region bytes and reports the parsed
+// region or the precise failure.
 //
 // Region states (byte-driven; the machine is deterministic on the complete bytes, so the
 // result is independent of any chunk partition):
@@ -202,8 +207,8 @@ public:
 
     // End the stream and report the parse of the tool region seen so far. `finish_reason`
     // signals why the stream ended: the recovery policy records it, but a budget cut never
-    // makes an open parameter value safe. Retries move only to a later <tool_call> wrapper:
-    // markup nested inside a failed region must not re-read a truncated call.
+    // makes an open parameter value safe. A rejected region may be re-read at a later
+    // top-level marker, but never inside a failed wrapper's still-unclosed scope (R2-I1).
     [[nodiscard]] ToolCallStreamResult finish(FinishReason finish_reason = FinishReason::None) const;
 
     // All bytes determined to be ordinary content so far (the published prefix of the accepted
@@ -221,11 +226,45 @@ public:
     // pending marker candidate (both empty after a latch).
     [[nodiscard]] std::string held_tail() const { return pending_ws_ + marker_prefix_; }
 
-private:
+    // R2-I6 (CR6): a line-oriented, streaming-safe fence tracker for the pre-latch content
+    // channel. It decides which bytes belong to a recognized fenced code block and therefore
+    // cannot start a top-level tool marker. Deterministic rules (a practical CommonMark
+    // subset, documented so the behavior is chunk- and line-oriented, not full Markdown):
+    //   * a line starts at the stream start or after a newline (CRLF or LF) and may carry up
+    //     to 3 spaces of indentation;
+    //   * outside a fence, a run of >= 3 '`' or '~' at line start opens a fence with that
+    //     character and run length; the rest of the line is the info string;
+    //   * inside a fence, a run of the same character of length >= the opener length at line
+    //     start, followed only by whitespace up to the line end, closes the fence;
+    //   * a different character, a shorter run, or a non-whitespace byte after a close run is
+    //     ordinary fence content (no nested fences);
+    //   * an unclosed fence stays open through EOF (suppression is the safe direction).
+    class FenceTracker {
+    public:
+        enum class Verdict : std::uint8_t {
+            Pass,    // the byte is not fence structure: the marker machine handles it
+            Content, // the byte is fence structure: publish as ordinary content, no candidate
+        };
+        [[nodiscard]] Verdict consume(char byte) noexcept;
+
+    private:
+        bool in_fence_ = false;
+        char fence_char_ = '\0';
+        std::size_t fence_len_ = 0;
+        bool at_line_start_ = true;
+        char run_char_ = '\0';
+        std::size_t run_len_ = 0;
+        std::size_t indent_ = 0;
+        bool close_pending_ = false;
+        bool opener_line_ = false;
+    };
+
     void publish(std::string_view bytes, std::string& visible);
     void latch(std::string_view marker);
 
     ToolCallParsePolicy policy_;
+    FenceTracker fence_;
+
     std::string content_;       // all bytes determined to be ordinary content
     std::string pending_ws_;    // whitespace since the last published byte (held: may precede a marker)
     std::string marker_prefix_; // held bytes that may become a top-level marker

@@ -153,4 +153,27 @@ classify_tool_marker_prefix(std::string_view text, ToolOpenTag& out) noexcept;
                                            bool wrapper_only = false)
     noexcept;
 
+// R2-I4 (CR4): the single top-level entry classification. The region parser's Top state and the
+// function-close continuation lookahead both consume this, so a complete next entry and its
+// partial prefixes agree on the previous call's structural boundary. Wrapper-aware legality (a
+// wrapper open inside an open wrapper is a nesting break, not an entry) is the caller's scope
+// rule, not the entry classification.
+enum class TopLevelEntry : std::uint8_t {
+    End,       // the input ends (after format whitespace)
+    NoEntry,   // a non-whitespace byte that is not a legal top-level entry
+    NeedMore,  // a strict prefix of a legal top-level entry at the input end
+    Entry,     // a complete legal top-level entry (the family in `out`)
+};
+
+struct TopLevelEntryInfo {
+    TopLevelEntry kind = TopLevelEntry::NoEntry;
+    ToolTagKind tag = ToolTagKind::Function;
+    ToolOpenTag opener; // the parsed entry (function/invoke: name and consumed bytes)
+};
+
+// What a byte sequence at a top-level position is: a wrapper literal, a complete function/
+// invoke opener, a strict prefix of either at the input end, the input end itself, or nothing.
+[[nodiscard]] TopLevelEntryInfo classify_top_level_entry(std::string_view text,
+                                                         std::size_t at) noexcept;
+
 } // namespace ninfer::models::qwen3_5::frontend

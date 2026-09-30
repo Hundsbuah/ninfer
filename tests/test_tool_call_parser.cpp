@@ -693,15 +693,15 @@ int test_quoted_marker_before_real_call() {
     const auto parsed = fi::parse_qwen_tool_call_output(text, 64, contract);
 
     int failures = 0;
-    failures += check(parsed.is_tool_call_response && parsed.tool_calls.size() == 1 &&
-                          parsed.tool_calls.front().name == "bash",
-                      "a quoted marker before the real call demoted the structured turn");
-    failures += check(parsed.content == "explaining " + quoted + " then the real turn",
-                      "quoted marker or intervening prose was not retained as content");
-    if (parsed.tool_calls.size() == 1) {
-        const Json args = Json::parse(parsed.tool_calls.front().arguments_json);
-        failures += check(args.at("command") == "echo ok", "recovered call arguments changed");
-    }
+    // R2-I1/CR1: the quoted broken wrapper is a failed open wrapper. Its scope cannot be
+    // proven exited from the wire bytes, so the failed wrapper owns the remaining ambiguous
+    // bytes and the whole region falls back to content — the real call after it stays
+    // non-executable (non-execution over recovery, R2-I7).
+    failures += check(!parsed.is_tool_call_response && parsed.tool_calls.empty() &&
+                          parsed.content == text && parsed.diagnostics.marker_seen &&
+                          parsed.diagnostics.fallback_reason ==
+                              ninfer::ToolCallParseFallbackReason::MalformedStructure,
+                      "a quoted broken wrapper before a real call was recovered (CR1)");
     return failures;
 }
 
@@ -740,14 +740,15 @@ int test_incremental_quoted_marker_preserves_bytes() {
     auto terminal = decoder.finish();
 
     int failures = 0;
-    failures += check(terminal.tool_calls.size() == 1 && terminal.tool_calls.front().name == "bash",
-                      "incremental quoted marker hid the real tool call");
-    failures += check(visible + terminal.content == "explaining " + quoted + " then the real turn",
+    failures += check(terminal.tool_calls.empty(),
+                      "a failed open wrapper's scope was re-entered during streaming (CR1)");
+    failures += check(visible + terminal.content == text,
                       "incremental quoted marker lost or duplicated bytes");
-    failures +=
-        check(terminal.diagnostics.marker_seen && terminal.diagnostics.structured_call_count == 1 &&
-                  terminal.diagnostics.fallback_reason == ninfer::ToolCallParseFallbackReason::None,
-              "incremental quoted marker changed terminal diagnostics");
+    failures += check(terminal.diagnostics.marker_seen &&
+                          terminal.diagnostics.structured_call_count == 0 &&
+                          terminal.diagnostics.fallback_reason ==
+                              ninfer::ToolCallParseFallbackReason::MalformedStructure,
+                      "incremental quoted marker changed terminal diagnostics");
     return failures;
 }
 
@@ -1145,17 +1146,18 @@ int test_payload_adversarial_corpus_round_trip() {
     for (const std::string& entry : corpus) {
         for (const char* suffix : {"x", "x\n"}) {
             failures += check_payload_round_trip(
-                contract, "write", "content", std::string_view{"x " + entry + suffix},
+                *contract, "write", "content", std::string_view{"x " + entry + suffix},
                 ("corpus entry as payload: " + entry).c_str());
         }
         // The entry leads the value (no prefix): the continuation after a candidate closer is
         // still ordinary text, so the closer stays payload and the value round-trips.
         failures += check_payload_round_trip(
-            contract, "write", "content", std::string_view{entry + " x"},
+            *contract, "write", "content", std::string_view{entry + " x"},
             ("entry at payload start: " + entry).c_str());
         // CRLF/tab around a repeated sequence keeps the boundary decision deterministic.
         failures += check_payload_round_trip(
-            contract, "write", "content", std::string_view{"\r\n" + entry + "\t" + entry + " x"},
+            *contract, "write", "content",
+            std::string_view{"\r\n" + entry + "\t" + entry + " x"},
             ("CRLF/tab repeated entry: " + entry).c_str());
     }
     return failures;
@@ -1250,17 +1252,24 @@ int test_tolerant_commits_function_closed_missing_wrapper() {
     const auto tool_strict = fi::parse_qwen_tool_call_output(tool_call_cut, 64, *contract);
     failures += check(!tool_strict.is_tool_call_response && tool_strict.tool_calls.empty(),
                       "strict retained a call with a missing tool_call wrapper close");
-    // The function_calls wrapper ends cleanly at the region end after the last invoke close:
-    // committed without a diagnostic in both modes (pre-existing contract, unchanged).
-    for (const bool tolerant : {true, false}) {
-        const auto parsed = fi::parse_qwen_tool_call_output(function_calls_cut, 64, *contract,
-                                                            tolerant);
+    // R2-I2/CR2: a wrapper open at the input end is an objective truncation, never a clean
+    // completion. Strict rejects (MalformedStructure); tolerant retains the closed call
+    // with the truncation diagnostic.
+    {
+        const auto fc_strict = fi::parse_qwen_tool_call_output(function_calls_cut, 64, *contract);
         failures += check(
-            parsed.is_tool_call_response && parsed.tool_calls.size() == 1 &&
-                parsed.tool_calls.front().name == "bash" &&
-                Json::parse(parsed.tool_calls.front().arguments_json).at("command") == "ls" &&
-                parsed.diagnostics.fallback_reason == Reason::None,
-            "function_calls region at the region end was not a clean completion");
+            !fc_strict.is_tool_call_response && fc_strict.tool_calls.empty() &&
+                fc_strict.diagnostics.fallback_reason == Reason::MalformedStructure,
+            "a missing function_calls close completed cleanly in strict mode");
+        const auto fc_tolerant =
+            fi::parse_qwen_tool_call_output(function_calls_cut, 64, *contract, true);
+        failures += check(
+            fc_tolerant.is_tool_call_response && fc_tolerant.tool_calls.size() == 1 &&
+                fc_tolerant.tool_calls.front().name == "bash" &&
+                Json::parse(fc_tolerant.tool_calls.front().arguments_json).at("command") ==
+                    "ls" &&
+                fc_tolerant.diagnostics.fallback_reason == Reason::TruncatedTail,
+            "a missing function_calls close dropped the tolerant call sequence");
     }
     // A bare function close at the region end is a clean end: committed without a diagnostic.
     const auto bare = fi::parse_qwen_tool_call_output(bare_complete, 64, *contract, true);
@@ -1463,20 +1472,14 @@ int test_all_delimiter_byte_cuts_other_families() {
             failures += check(!tolerant.is_tool_call_response && tolerant.tool_calls.empty(),
                               "tolerant executed an invoke before its complete close");
         } else if (cut <= wrapper_start) {
-            // The region ends after the last invoke close: the function_calls close is
-            // optional at the region end (pre-existing contract), a clean completion.
-            failures += check(
-                tolerant.is_tool_call_response && tolerant.tool_calls.size() == 1 &&
-                    tolerant.tool_calls.front().name == "read" &&
-                    tolerant.diagnostics.fallback_reason == Reason::None,
-                "tolerant did not complete the invoke-closed region at the region end");
-        } else if (cut < text.size()) {
-            // A cut inside the wrapper close literal: a truncated tail.
+            // R2-I2/CR2: the region ends after the last invoke close but the wrapper close
+            // is still missing: an objective truncation — tolerant retains the closed call
+            // with the truncation diagnostic, never a clean completion.
             failures += check(
                 tolerant.is_tool_call_response && tolerant.tool_calls.size() == 1 &&
                     tolerant.tool_calls.front().name == "read" &&
                     tolerant.diagnostics.fallback_reason == Reason::TruncatedTail,
-                "tolerant did not retain the invoke-closed call");
+                ("other families: tolerant cut at " + std::to_string(cut)).c_str());
         } else {
             failures += check(tolerant.is_tool_call_response && tolerant.tool_calls.size() == 1,
                               "the complete function_calls region was not committed");
@@ -1603,6 +1606,697 @@ int test_marker_breaking_angle_restarts_candidate() {
     if (terminal.tool_calls.size() == 1) {
         failures += check(terminal.tool_calls.front().arguments_json == R"({"path":"x"})",
                           "the latched region after a breaking '<' lost its arguments");
+    }
+    return failures;
+}
+
+// ---------------------------------------------------------------------------
+// Round-2 regression tests (NInfer_new_parser_design_round2_bugfix_implementation.md,
+// findings CR1-CR6). These pin the Round-2 invariants: a failed wrapper owns its still
+// unclosed scope (R2-I1), Complete implies wrapper balance (R2-I2), a wrapper close
+// returns to Top and the remainder is validated (R2-I3), complete and partial next
+// top-level entries agree on the previous call's boundary (R2-I4), declared-tool
+// identity holds in strict and tolerant alike (R2-I5), and fenced final content never
+// latches a tool marker (R2-I6).
+// ---------------------------------------------------------------------------
+
+// Shared Round-2 assertion runner: one-shot (the given mode, every finish reason the
+// parser API accepts) plus streamed (1/2/3/5/7-byte chunks, the same mode). The streaming
+// terminal must equal the one-shot parse exactly (visible + terminal content, calls,
+// diagnostics), and the one-shot result must match the expected structured outcome or the
+// verbatim fallback. Fixtures must not end in format whitespace (the fallback is verbatim).
+int check_round2_region(const std::string& text, const fi::ToolCallOutputContract& contract,
+                        bool tolerant, std::vector<std::string> expected_names,
+                        ninfer::ToolCallParseFallbackReason expected_reason,
+                        std::string_view message) {
+    using FinishReason = ninfer::FinishReason;
+    int failures = 0;
+    for (const FinishReason reason : {FinishReason::StopToken, FinishReason::StopString,
+                                      FinishReason::OutputLimit, FinishReason::ContextCapacity,
+                                      FinishReason::Cancelled}) {
+        const auto parsed =
+            fi::parse_qwen_tool_call_output(text, 64, contract, tolerant, reason);
+        failures += check(parsed.is_tool_call_response == !expected_names.empty(),
+                          (std::string("response flag: ") + std::string(message)).c_str());
+        failures += check(parsed.tool_calls.size() == expected_names.size(),
+                          (std::string("call count: ") + std::string(message)).c_str());
+        for (std::size_t i = 0; i < parsed.tool_calls.size() && i < expected_names.size(); ++i) {
+            failures += check(parsed.tool_calls[i].name == expected_names[i],
+                              (std::string("call name: ") + std::string(message)).c_str());
+        }
+        failures += check(parsed.diagnostics.fallback_reason == expected_reason,
+                          (std::string("fallback reason: ") + std::string(message)).c_str());
+        if (expected_names.empty()) {
+            failures += check(parsed.content == text,
+                              (std::string("verbatim fallback content: ") + std::string(message))
+                                  .c_str());
+        }
+        // Streaming (every chunk size) must reproduce the one-shot result exactly.
+        auto contract_ptr = std::make_shared<fi::ToolCallOutputContract>(contract);
+        for (const std::size_t chunk : {std::size_t{1}, std::size_t{2}, std::size_t{3}, std::size_t{5},
+                                       std::size_t{7}}) {
+            fi::ToolCallOutputDecoder decoder(contract_ptr, 64, tolerant);
+            std::string visible;
+            for (std::size_t offset = 0; offset < text.size(); offset += chunk) {
+                visible += decoder.feed(std::string_view(text).substr(offset, chunk));
+            }
+            auto terminal = decoder.finish(reason);
+            failures += check(
+                terminal.tool_calls.size() == parsed.tool_calls.size() &&
+                    visible + terminal.content == parsed.content,
+                (std::string("streaming diverged from one-shot: ") + std::string(message))
+                    .c_str());
+            for (std::size_t i = 0; i < terminal.tool_calls.size(); ++i) {
+                failures += check(terminal.tool_calls[i].name == parsed.tool_calls[i].name &&
+                                      terminal.tool_calls[i].arguments_json ==
+                                          parsed.tool_calls[i].arguments_json,
+                                  (std::string("streaming call diverged: ") + std::string(message))
+                                      .c_str());
+            }
+        }
+    }
+    return failures;
+}
+
+// CR1/R2-I1: a failed wrapper owns its still-unclosed scope. No marker located inside it
+// may become a recovery entry; the entire region falls back to content in strict and
+// tolerant alike (non-execution over recovery when the wire bytes cannot prove scope exit).
+int test_failed_open_wrapper_never_recovers_nested_wrapper() {
+    const auto contract = contract_from_definitions({
+        tool_definition("bash", Json{{"command", Json{{"type", "string"}}}})});
+    int failures = 0;
+    // The spec's exact reproducer: invalid outer name, nested valid tool_call.
+    const std::string nested_tool_call =
+        "<tool_call>\n"
+        "<function=bad.name>\n"
+        "<tool_call>\n"
+        "<function=bash>\n"
+        "<parameter=command>\necho SHOULD_NOT_EXECUTE\n</parameter>\n"
+        "</function>\n"
+        "</tool_call>";
+    failures += check_round2_region(
+        nested_tool_call, *contract, false, {},
+        ninfer::ToolCallParseFallbackReason::InvalidToolName, "CR1 nested tool_call (strict)");
+    failures += check_round2_region(
+        nested_tool_call, *contract, true, {},
+        ninfer::ToolCallParseFallbackReason::InvalidToolName, "CR1 nested tool_call (tolerant)");
+    // Nested <function_calls> instead of <tool_call>.
+    const std::string nested_function_calls =
+        "<tool_call>\n"
+        "<function=bad.name>\n"
+        "<function_calls>\n"
+        "<function=bash>\n"
+        "<parameter=command>\necho SHOULD_NOT_EXECUTE\n</parameter>\n"
+        "</function>\n"
+        "</function_calls>";
+    failures += check_round2_region(
+        nested_function_calls, *contract, false, {},
+        ninfer::ToolCallParseFallbackReason::InvalidToolName, "CR1 nested function_calls (strict)");
+    failures += check_round2_region(
+        nested_function_calls, *contract, true, {},
+        ninfer::ToolCallParseFallbackReason::InvalidToolName, "CR1 nested function_calls (tolerant)");
+    // A failed <function_calls> wrapper with a nested <tool_call>.
+    const std::string calls_wrapper =
+        "<function_calls>\n"
+        "<function=bad.name>\n"
+        "<tool_call>\n"
+        "<function=bash>\n"
+        "<parameter=command>\necho SHOULD_NOT_EXECUTE\n</parameter>\n"
+        "</function>\n"
+        "</tool_call>";
+    failures += check_round2_region(
+        calls_wrapper, *contract, false, {},
+        ninfer::ToolCallParseFallbackReason::InvalidToolName, "CR1 function_calls->tool_call (strict)");
+    failures += check_round2_region(
+        calls_wrapper, *contract, true, {},
+        ninfer::ToolCallParseFallbackReason::InvalidToolName, "CR1 function_calls->tool_call (tolerant)");
+    // An invalid header instead of an invalid name.
+    const std::string invalid_header =
+        "<tool_call>\n"
+        "<function bad.name>\n"
+        "<tool_call>\n"
+        "<function=bash>\n"
+        "<parameter=command>\necho SHOULD_NOT_EXECUTE\n</parameter>\n"
+        "</function>\n"
+        "</tool_call>";
+    failures += check_round2_region(
+        invalid_header, *contract, false, {},
+        ninfer::ToolCallParseFallbackReason::MalformedStructure, "CR1 invalid outer header (strict)");
+    failures += check_round2_region(
+        invalid_header, *contract, true, {},
+        ninfer::ToolCallParseFallbackReason::MalformedStructure, "CR1 invalid outer header (tolerant)");
+    // A complete outer header whose body breaks on a nested marker before the slice end:
+    // the break is a definitive structural failure with the wrapper open (scope owned, no retry).
+    const std::string truncated_header =
+        "<tool_call>\n"
+        "<function=bash\n"
+        "<tool_call>\n"
+        "<function=bash>\n"
+        "<parameter=command>\necho SHOULD_NOT_EXECUTE\n</parameter>\n"
+        "</function>\n"
+        "</tool_call>";
+    failures += check_round2_region(
+        truncated_header, *contract, false, {},
+        ninfer::ToolCallParseFallbackReason::MalformedStructure, "CR1 truncated outer header (strict)");
+    failures += check_round2_region(
+        truncated_header, *contract, true, {},
+        ninfer::ToolCallParseFallbackReason::MalformedStructure, "CR1 truncated outer header (tolerant)");
+    // A nested valid wrapper after arbitrary whitespace/prose.
+    const std::string prose_then_nested =
+        "<tool_call>\n"
+        "<function=bad.name>\n\n"
+        "some prose that is not markup\n"
+        "<tool_call>\n"
+        "<function=bash>\n"
+        "<parameter=command>\necho SHOULD_NOT_EXECUTE\n</parameter>\n"
+        "</function>\n"
+        "</tool_call>";
+    failures += check_round2_region(
+        prose_then_nested, *contract, false, {},
+        ninfer::ToolCallParseFallbackReason::InvalidToolName, "CR1 prose before nested wrapper (strict)");
+    failures += check_round2_region(
+        prose_then_nested, *contract, true, {},
+        ninfer::ToolCallParseFallbackReason::InvalidToolName, "CR1 prose before nested wrapper (tolerant)");
+    // Two nested wrapper candidates.
+    const std::string two_nested =
+        "<tool_call>\n"
+        "<function=bad.name>\n"
+        "<tool_call>\n"
+        "<function=bash>\n"
+        "<parameter=command>\necho A\n</parameter>\n"
+        "</function>\n"
+        "</tool_call>\n"
+        "<function_calls>\n"
+        "<function=bash>\n"
+        "<parameter=command>\necho B\n</parameter>\n"
+        "</function>\n"
+        "</function_calls>";
+    failures += check_round2_region(
+        two_nested, *contract, false, {},
+        ninfer::ToolCallParseFallbackReason::InvalidToolName, "CR1 two nested candidates (strict)");
+    failures += check_round2_region(
+        two_nested, *contract, true, {},
+        ninfer::ToolCallParseFallbackReason::InvalidToolName, "CR1 two nested candidates (tolerant)");
+    // A valid-looking nested wrapper followed by a genuine top-level wrapper after the
+    // failed wrapper's visible close: the scope exit is not provable from the wire bytes
+    // (the failed function broke the structure), so non-execution wins over availability.
+    const std::string proven_boundary =
+        "<tool_call>\n"
+        "<function=bad.name>\n"
+        "</function>\n"
+        "</tool_call>\n"
+        "<tool_call>\n"
+        "<function=bash>\n"
+        "<parameter=command>\necho AFTER_PROVEN_BOUNDARY\n</parameter>\n"
+        "</function>\n"
+        "</tool_call>";
+    failures += check_round2_region(
+        proven_boundary, *contract, false, {},
+        ninfer::ToolCallParseFallbackReason::InvalidToolName, "CR1 call after visible close (strict)");
+    failures += check_round2_region(
+        proven_boundary, *contract, true, {},
+        ninfer::ToolCallParseFallbackReason::InvalidToolName, "CR1 call after visible close (tolerant)");
+    return failures;
+}
+
+// CR1: recovery restarts only after a proven top-level scope. A failed bare region (no
+// wrapper open at the break) before a real wrapper is still recovered at the wrapper (F7);
+// a failed wrapper scope is never re-entered (the previous test).
+int test_recovery_only_restarts_after_proven_scope() {
+    const auto contract = contract_from_definitions({
+        tool_definition("bash", Json{{"command", Json{{"type", "string"}}}})});
+    int failures = 0;
+    // A failed bare function (no wrapper) before a real wrapper: the break leaves no
+    // wrapper open, so the top-level retry may restart at the wrapper.
+    const std::string bare_failed =
+        "<function=bad.name>\n"
+        "<parameter=command>\ncut\n" +
+        tool_call("bash", {{"command", "echo OK"}});
+    failures += check_round2_region(bare_failed, *contract, false, {"bash"},
+                                    ninfer::ToolCallParseFallbackReason::None,
+                                    "CR1 bare failed region recovered at wrapper (strict)");
+    failures += check_round2_region(bare_failed, *contract, true, {"bash"},
+                                    ninfer::ToolCallParseFallbackReason::None,
+                                    "CR1 bare failed region recovered at wrapper (tolerant)");
+    // Every single split of the CR1 reproducer must agree with the one-shot result (the
+    // failed wrapper's scope never exposes the nested call, at any chunk boundary).
+    const std::string nested =
+        "<tool_call>\n"
+        "<function=bad.name>\n"
+        "<tool_call>\n"
+        "<function=bash>\n"
+        "<parameter=command>\necho SHOULD_NOT_EXECUTE\n</parameter>\n"
+        "</function>\n"
+        "</tool_call>";
+    const auto one_shot = fi::parse_qwen_tool_call_output(nested, 64, *contract);
+    bool every_split_matches = one_shot.tool_calls.empty() && !one_shot.is_tool_call_response;
+    for (std::size_t split = 0; split <= nested.size() && every_split_matches; ++split) {
+        fi::ToolCallOutputDecoder decoder(
+            std::make_shared<fi::ToolCallOutputContract>(*contract), 64);
+        std::string visible = decoder.feed(std::string_view(nested).substr(0, split));
+        visible += decoder.feed(std::string_view(nested).substr(split));
+        auto terminal = decoder.finish();
+        every_split_matches = terminal.tool_calls.empty() && !terminal.content.empty() &&
+                              visible + terminal.content == one_shot.content &&
+                              terminal.diagnostics == one_shot.diagnostics;
+    }
+    failures += check(every_split_matches, "CR1 every-split streaming diverged from one-shot");
+    return failures;
+}
+
+// CR2/R2-I2: an open <function_calls> at the region end is an objective truncation, never
+// a clean completion. Strict rejects the region; tolerant may retain the function-closed
+// calls with TruncatedTail. One and N calls, every finish reason (via the shared runner).
+int test_function_calls_missing_wrapper_close() {
+    const auto contract = contract_from_definitions({
+        tool_definition("read", Json{{"path", Json{{"type", "string"}}}})});
+    int failures = 0;
+    const std::string one_open =
+        "<function_calls>\n<function=read>\n<parameter=path>a</parameter>\n</function>";
+    const std::string two_open =
+        one_open + "\n<function=read>\n<parameter=path>b</parameter>\n</function>";
+    failures += check_round2_region(one_open, *contract, false, {},
+                                    ninfer::ToolCallParseFallbackReason::MalformedStructure,
+                                    "CR2 one open call (strict)");
+    failures += check_round2_region(one_open, *contract, true, {"read"},
+                                    ninfer::ToolCallParseFallbackReason::TruncatedTail,
+                                    "CR2 one open call (tolerant)");
+    failures += check_round2_region(two_open, *contract, false, {},
+                                    ninfer::ToolCallParseFallbackReason::MalformedStructure,
+                                    "CR2 two open calls (strict)");
+    failures += check_round2_region(two_open, *contract, true, {"read", "read"},
+                                    ninfer::ToolCallParseFallbackReason::TruncatedTail,
+                                    "CR2 two open calls (tolerant)");
+    return failures;
+}
+
+// CR3/R2-I3: consuming </function_calls> does not consume the rest of the output: the
+// state returns to Top, which validates the remainder (EOF, a next region, a partial
+// marker, or trailing content).
+int test_function_calls_close_then_remainder() {
+    const auto contract = contract_from_definitions({
+        tool_definition("read", Json{{"path", Json{{"type", "string"}}}}),
+        tool_definition("bash", Json{{"command", Json{{"type", "string"}}}})});
+    int failures = 0;
+    const std::string closed =
+        "<function_calls>\n<function=read>\n<parameter=path>a</parameter>\n</function>\n"
+        "</function_calls>";
+    const std::string trailing = closed + "\nEXTRA";
+    const std::string whitespace = closed + "\n  ";
+    const std::string next_region = closed + "\n" + tool_call("bash", {{"command", "echo ok"}});
+    const std::string partial_marker = closed + "\n<tool_c";
+    failures += check_round2_region(trailing, *contract, false, {},
+                                    ninfer::ToolCallParseFallbackReason::TrailingContent,
+                                    "CR3 trailing prose (strict)");
+    failures += check_round2_region(trailing, *contract, true, {"read"},
+                                    ninfer::ToolCallParseFallbackReason::TruncatedTail,
+                                    "CR3 trailing prose (tolerant)");
+    failures += check_round2_region(whitespace, *contract, false, {"read"},
+                                    ninfer::ToolCallParseFallbackReason::None,
+                                    "CR3 trailing whitespace (strict)");
+    failures += check_round2_region(whitespace, *contract, true, {"read"},
+                                    ninfer::ToolCallParseFallbackReason::None,
+                                    "CR3 trailing whitespace (tolerant)");
+    failures += check_round2_region(next_region, *contract, false, {"read", "bash"},
+                                    ninfer::ToolCallParseFallbackReason::None,
+                                    "CR3 next valid region (strict)");
+    failures += check_round2_region(next_region, *contract, true, {"read", "bash"},
+                                    ninfer::ToolCallParseFallbackReason::None,
+                                    "CR3 next valid region (tolerant)");
+    failures += check_round2_region(partial_marker, *contract, false, {},
+                                    ninfer::ToolCallParseFallbackReason::MalformedStructure,
+                                    "CR3 partial marker (strict)");
+    failures += check_round2_region(partial_marker, *contract, true, {"read"},
+                                    ninfer::ToolCallParseFallbackReason::TruncatedTail,
+                                    "CR3 partial marker (tolerant)");
+    return failures;
+}
+
+// CR4/R2-I4: a complete next top-level entry must not make the previous function's close
+// look like quoted payload. Every supported entry form composes with every other.
+int test_entry_forms_compose_consistently() {
+    const auto contract = contract_from_definitions({
+        tool_definition("read", Json{{"path", Json{{"type", "string"}}}}),
+        tool_definition("bash", Json{{"command", Json{{"type", "string"}}}})});
+    int failures = 0;
+    const std::string bare_read =
+        "<function=read>\n<parameter=path>\na.txt\n</parameter>\n</function>";
+    const std::string invoke_read =
+        "<invoke=read>\n<parameter=path>\na.txt\n</parameter>\n</invoke>";
+    const std::string bare_bash =
+        "<function=bash>\n<parameter=command>\necho ok\n</parameter>\n</function>";
+    const std::string tc_bash = tool_call("bash", {{"command", "echo ok"}});
+    const std::string fc_bash =
+        "<function_calls>\n<function=bash>\n<parameter=command>\necho ok\n</parameter>\n</function>\n"
+        "</function_calls>";
+    for (const std::string& previous : {bare_read, invoke_read}) {
+        failures += check_round2_region(previous + "\n" + tc_bash, *contract, false,
+                                        {"read", "bash"}, ninfer::ToolCallParseFallbackReason::None,
+                                        "CR4 bare->tool_call (strict)");
+        failures += check_round2_region(previous + "\n" + tc_bash, *contract, true,
+                                        {"read", "bash"}, ninfer::ToolCallParseFallbackReason::None,
+                                        "CR4 bare->tool_call (tolerant)");
+        failures += check_round2_region(previous + "\n" + fc_bash, *contract, false,
+                                        {"read", "bash"}, ninfer::ToolCallParseFallbackReason::None,
+                                        "CR4 bare->function_calls (strict)");
+        failures += check_round2_region(previous + "\n" + fc_bash, *contract, true,
+                                        {"read", "bash"}, ninfer::ToolCallParseFallbackReason::None,
+                                        "CR4 bare->function_calls (tolerant)");
+        failures += check_round2_region(previous + "\n" + bare_bash, *contract, false,
+                                        {"read", "bash"}, ninfer::ToolCallParseFallbackReason::None,
+                                        "CR4 bare->bare (strict)");
+        failures += check_round2_region(previous + "\n" + bare_bash, *contract, true,
+                                        {"read", "bash"}, ninfer::ToolCallParseFallbackReason::None,
+                                        "CR4 bare->bare (tolerant)");
+    }
+    return failures;
+}
+
+// CR4: the previous parameter close is a structural boundary whether the next entry is
+// complete or a cut prefix: at every cut after the function close, the read call is
+// retained (tolerant) or the region stays a single clean rejection (strict); no cut may
+// reopen the previous value as payload.
+int test_complete_and_partial_next_entry_have_same_boundary_result() {
+    const auto contract = contract_from_definitions({
+        tool_definition("read", Json{{"path", Json{{"type", "string"}}}}),
+        tool_definition("bash", Json{{"command", Json{{"type", "string"}}}})});
+    const std::string text = "<function=read>\n<parameter=path>\na.txt\n</parameter>\n</function>\n"
+                             "<tool_call>\n"
+                             "<function=bash>\n"
+                             "<parameter=command>\necho ok\n</parameter>\n"
+                             "</function>\n"
+                             "</tool_call>";
+    const std::size_t fn_close_end = text.find("</function>") + 11;
+    int failures = 0;
+    // A clean end right after the first function close: committed in both modes without a
+    // diagnostic (the function close is the executability boundary).
+    {
+        const std::string after_first = text.substr(0, fn_close_end + 1);
+        for (const bool mode : {false, true}) {
+            const auto parsed = fi::parse_qwen_tool_call_output(after_first, 64, *contract, mode);
+            failures += check(parsed.is_tool_call_response && parsed.tool_calls.size() == 1 &&
+                                  parsed.tool_calls.front().name == "read" &&
+                                  parsed.diagnostics.fallback_reason ==
+                                      ninfer::ToolCallParseFallbackReason::None,
+                              (std::string("CR4 boundary: clean end after first close (") +
+                               (mode ? "tolerant)" : "strict)"))
+                                  .c_str());
+        }
+    }
+    for (std::size_t cut = fn_close_end + 2; cut <= text.size(); ++cut) {
+        const std::string cut_text(text.substr(0, cut));
+        if (cut == text.size()) {
+            failures += check_round2_region(cut_text, *contract, false, {"read", "bash"},
+                                            ninfer::ToolCallParseFallbackReason::None,
+                                            "CR4 boundary: complete text (strict)");
+            failures += check_round2_region(cut_text, *contract, true, {"read", "bash"},
+                                            ninfer::ToolCallParseFallbackReason::None,
+                                            "CR4 boundary: complete text (tolerant)");
+            continue;
+        }
+        // Strict is all-or-nothing: every cut before the complete text is a single clean
+        // rejection (EndOfInput break -> MalformedStructure); the committed read call is not
+        // executable without the complete region.
+        const auto strict = fi::parse_qwen_tool_call_output(cut_text, 64, *contract);
+        failures += check(!strict.is_tool_call_response && strict.tool_calls.empty() &&
+                              strict.diagnostics.fallback_reason ==
+                                  ninfer::ToolCallParseFallbackReason::MalformedStructure,
+                          (std::string("CR4 boundary: strict cut ") + std::to_string(cut)).c_str());
+        // Tolerant retains the committed read call at every cut (TruncatedTail); a cut that
+        // completes the bash call retains that call as well. Exact value bytes.
+        const auto tolerant = fi::parse_qwen_tool_call_output(cut_text, 64, *contract, true);
+        failures += check(tolerant.is_tool_call_response && tolerant.tool_calls.size() >= 1 &&
+                              tolerant.tool_calls.size() <= 2 &&
+                              tolerant.tool_calls.front().name == "read" &&
+                              Json::parse(tolerant.tool_calls.front().arguments_json)
+                                  .at("path")
+                                  .get<std::string>() ==
+                                  "a.txt" &&
+                              tolerant.diagnostics.fallback_reason ==
+                                  ninfer::ToolCallParseFallbackReason::TruncatedTail,
+                          (std::string("CR4 boundary: tolerant cut ") + std::to_string(cut)).c_str());
+    }
+    return failures;
+}
+
+// CR5/R2-I5: syntax tolerance never disables the declared-tool identity policy. With
+// enforce_declared_names active, no undeclared name is executable in strict or tolerant,
+// and the identity policy is identical in both modes.
+int test_tolerant_rejects_undeclared_tools() {
+    const auto contract = contract_from_definitions({
+        tool_definition("read", Json{{"path", Json{{"type", "string"}}}})});
+    int failures = 0;
+    // The spec's exact reproducer: a syntactically valid undeclared name inside a wrapper.
+    const std::string undeclared =
+        "<tool_call>\n<function=example_function_name>\n</function>\n</tool_call>";
+    failures += check_round2_region(undeclared, *contract, false, {},
+                                    ninfer::ToolCallParseFallbackReason::UndeclaredTool,
+                                    "CR5 undeclared single (strict)");
+    failures += check_round2_region(undeclared, *contract, true, {},
+                                    ninfer::ToolCallParseFallbackReason::UndeclaredTool,
+                                    "CR5 undeclared single (tolerant)");
+    // A valid first call followed by a later undeclared call: strict rejects the whole
+    // region; tolerant retains only the earlier already-complete declared call.
+    const std::string mixed = tool_call("read", {{"path", "a"}}) + "\n" +
+                              "<tool_call>\n<function=not_declared>\n</function>\n</tool_call>";
+    failures += check_round2_region(mixed, *contract, false, {},
+                                    ninfer::ToolCallParseFallbackReason::UndeclaredTool,
+                                    "CR5 valid then undeclared (strict)");
+    failures += check_round2_region(mixed, *contract, true, {"read"},
+                                    ninfer::ToolCallParseFallbackReason::TruncatedTail,
+                                    "CR5 valid then undeclared (tolerant)");
+    // A bare undeclared function (no wrapper).
+    const std::string bare_undeclared =
+        "<function=unknown>\n<parameter=x>\nv\n</parameter>\n</function>";
+    failures += check_round2_region(bare_undeclared, *contract, false, {},
+                                    ninfer::ToolCallParseFallbackReason::UndeclaredTool,
+                                    "CR5 bare undeclared (strict)");
+    failures += check_round2_region(bare_undeclared, *contract, true, {},
+                                    ninfer::ToolCallParseFallbackReason::UndeclaredTool,
+                                    "CR5 bare undeclared (tolerant)");
+    return failures;
+}
+
+// CR5: the declared-name matrix of the spec (declared: read, bash, write). Declared names
+// pass with a valid structure; undeclared syntactically valid names are never emitted;
+// a syntactically invalid name is InvalidToolName; the policy does not change with
+// tolerance.
+int test_strict_and_tolerant_share_declared_name_policy() {
+    const auto contract = contract_from_definitions({
+        tool_definition("read", Json{{"path", Json{{"type", "string"}}}}),
+        tool_definition("bash", Json{{"command", Json{{"type", "string"}}}}),
+        tool_definition("write", Json{{"content", Json{{"type", "string"}}}})});
+    int failures = 0;
+    const struct {
+        const char* name;
+        bool declared;
+        bool syntactically_valid;
+    } matrix[] = {{"read", true, true},
+                  {"bash", true, true},
+                  {"write", true, true},
+                  {"function_name", false, true},
+                  {"example_function_name", false, true},
+                  {"unknown", false, true},
+                  {"bad.name", false, false}};
+    for (const auto& entry : matrix) {
+        const std::string text = tool_call(entry.name);
+        const auto strict = fi::parse_qwen_tool_call_output(text, 64, *contract);
+        const auto tolerant = fi::parse_qwen_tool_call_output(text, 64, *contract, true);
+        const char* context = entry.name;
+        failures += check(strict.is_tool_call_response == entry.declared &&
+                              tolerant.is_tool_call_response == entry.declared &&
+                              strict.tool_calls.size() == (entry.declared ? 1 : 0) &&
+                              tolerant.tool_calls.size() == (entry.declared ? 1 : 0),
+                          (std::string("CR5 name acceptance diverged: ") + context).c_str());
+        const auto expected_reason = entry.declared
+                                         ? ninfer::ToolCallParseFallbackReason::None
+                                         : entry.syntactically_valid
+                                               ? ninfer::ToolCallParseFallbackReason::UndeclaredTool
+                                               : ninfer::ToolCallParseFallbackReason::InvalidToolName;
+        failures += check(strict.diagnostics.fallback_reason == expected_reason &&
+                              tolerant.diagnostics.fallback_reason == expected_reason,
+                          (std::string("CR5 name reason diverged: ") + context).c_str());
+    }
+    return failures;
+}
+
+// CR5 defense in depth: with the declared-name policy active, no generated call may leave
+// the frontend with a name absent from the contract. The invariant is checked on every
+// output the public API can produce (one-shot and streaming, both modes, the full name
+// matrix) — the API boundary, not the state-machine branch.
+int test_output_normalization_cannot_emit_out_of_set_name() {
+    const auto contract = contract_from_definitions({
+        tool_definition("read", Json{{"path", Json{{"type", "string"}}}})});
+    int failures = 0;
+    for (const char* name : {"read", "function_name", "example_function_name",
+                             "unknown", "bad.name"}) {
+        const std::string text = tool_call(name);
+        for (const bool tolerant : {false, true}) {
+            const auto parsed = fi::parse_qwen_tool_call_output(text, 64, *contract, tolerant);
+            for (const auto& call : parsed.tool_calls) {
+                failures += check(call.name == "read",
+                                  (std::string("CR5 out-of-set name emitted: ") + name).c_str());
+            }
+            fi::ToolCallOutputDecoder decoder(
+                std::make_shared<fi::ToolCallOutputContract>(*contract), 64, tolerant);
+            std::string visible;
+            for (std::size_t i = 0; i < text.size(); ++i) {
+                visible += decoder.feed(std::string_view(text).substr(i, 1));
+            }
+            for (const auto& call : decoder.finish().tool_calls) {
+                failures += check(call.name == "read",
+                                  (std::string("CR5 streamed out-of-set name emitted: ") + name)
+                                      .c_str());
+            }
+        }
+    }
+    return failures;
+}
+
+// CR5: the chat template's system prompt quotes <function=example_function_name> as the
+// format example. A model that echoes the example or a bare placeholder name must not
+// produce an executable call.
+int test_placeholder_function_name_is_not_executable() {
+    const auto contract = contract_from_definitions({
+        tool_definition("read", Json{{"path", Json{{"type", "string"}}}})});
+    int failures = 0;
+    failures += check_round2_region(tool_call("function_name"), *contract, false, {},
+                                    ninfer::ToolCallParseFallbackReason::UndeclaredTool,
+                                    "CR5 placeholder name (strict)");
+    failures += check_round2_region(tool_call("function_name"), *contract, true, {},
+                                    ninfer::ToolCallParseFallbackReason::UndeclaredTool,
+                                    "CR5 placeholder name (tolerant)");
+    failures += check_round2_region(tool_call("example_function_name"), *contract, false, {},
+                                    ninfer::ToolCallParseFallbackReason::UndeclaredTool,
+                                    "CR5 template example name (strict)");
+    failures += check_round2_region(tool_call("example_function_name"), *contract, true, {},
+                                    ninfer::ToolCallParseFallbackReason::UndeclaredTool,
+                                    "CR5 template example name (tolerant)");
+    return failures;
+}
+
+// CR6/R2-I6: syntactically valid tool markup inside a recognized final-content fenced
+// code block is ordinary content and never latches. Outside the fence, marker scanning
+// resumes; an unclosed fence stays open through EOF.
+int test_fenced_content_never_latches() {
+    const auto contract = contract_from_definitions({
+        tool_definition("bash", Json{{"command", Json{{"type", "string"}}}})});
+    int failures = 0;
+    const std::string example_block =
+        "<tool_call>\n"
+        "<function=bash>\n"
+        "<parameter=command>\necho example\n</parameter>\n"
+        "</function>\n"
+        "</tool_call>";
+    const std::string real_call = tool_call("bash", {{"command", "echo real"}});
+    // Backtick fence with an info string.
+    const std::string backtick = "Example:\n\n```xml\n" + example_block + "\n```\n";
+    failures += check_round2_region(backtick, *contract, false, {},
+                                    ninfer::ToolCallParseFallbackReason::MalformedStructure,
+                                    "CR6 backtick fence (strict)");
+    failures += check_round2_region(backtick, *contract, true, {},
+                                    ninfer::ToolCallParseFallbackReason::MalformedStructure,
+                                    "CR6 backtick fence (tolerant)");
+    // Tilde fence without an info string.
+    const std::string tilde = "~~~~\n" + example_block + "\n~~~~\n";
+    failures += check_round2_region(tilde, *contract, false, {},
+                                    ninfer::ToolCallParseFallbackReason::MalformedStructure,
+                                    "CR6 tilde fence (strict)");
+    failures += check_round2_region(tilde, *contract, true, {},
+                                    ninfer::ToolCallParseFallbackReason::MalformedStructure,
+                                    "CR6 tilde fence (tolerant)");
+    // An unclosed fence stays open through EOF: the marker inside is content.
+    const std::string unclosed = "```xml\n" + example_block + "\n";
+    failures += check_round2_region(unclosed, *contract, false, {},
+                                    ninfer::ToolCallParseFallbackReason::MalformedStructure,
+                                    "CR6 unclosed fence (strict)");
+    failures += check_round2_region(unclosed, *contract, true, {},
+                                    ninfer::ToolCallParseFallbackReason::MalformedStructure,
+                                    "CR6 unclosed fence (tolerant)");
+    // A real call immediately after the closing fence still executes; the fenced example
+    // stays content.
+    const std::string after_fence = "```xml\n" + example_block + "\n```\n" + real_call;
+    failures += check_round2_region(after_fence, *contract, false, {"bash"},
+                                    ninfer::ToolCallParseFallbackReason::None,
+                                    "CR6 real call after closed fence (strict)");
+    failures += check_round2_region(after_fence, *contract, true, {"bash"},
+                                    ninfer::ToolCallParseFallbackReason::None,
+                                    "CR6 real call after closed fence (tolerant)");
+    // A longer fence contains shorter backtick lines: the inner fences are content.
+    const std::string nested_fence = "````\n```\n" + example_block + "\n```\n````\n";
+    failures += check_round2_region(nested_fence, *contract, false, {},
+                                    ninfer::ToolCallParseFallbackReason::MalformedStructure,
+                                    "CR6 longer fence contains shorter (strict)");
+    failures += check_round2_region(nested_fence, *contract, true, {},
+                                    ninfer::ToolCallParseFallbackReason::MalformedStructure,
+                                    "CR6 longer fence contains shorter (tolerant)");
+    // The opening fence line's info string may carry a marker: it is content.
+    const std::string info_string = "```xml <tool_call>\n" + example_block + "\n```\n";
+    failures += check_round2_region(info_string, *contract, false, {},
+                                    ninfer::ToolCallParseFallbackReason::MalformedStructure,
+                                    "CR6 fence info string (strict)");
+    failures += check_round2_region(info_string, *contract, true, {},
+                                    ninfer::ToolCallParseFallbackReason::MalformedStructure,
+                                    "CR6 fence info string (tolerant)");
+    // CRLF line endings.
+    const std::string crlf = "Example:\r\n\r\n```xml\r\n" + example_block + "\r\n```\r\n";
+    failures += check_round2_region(crlf, *contract, false, {},
+                                    ninfer::ToolCallParseFallbackReason::MalformedStructure,
+                                    "CR6 CRLF fence (strict)");
+    failures += check_round2_region(crlf, *contract, true, {},
+                                    ninfer::ToolCallParseFallbackReason::MalformedStructure,
+                                    "CR6 CRLF fence (tolerant)");
+    // A complete call before a fence: the terminal policy decides (strict rejects the
+    // trailing fence block, tolerant retains the call with a truncation diagnostic).
+    const std::string before_fence = real_call + "\nExample:\n\n```\ncontent\n```\n";
+    failures += check_round2_region(before_fence, *contract, false, {},
+                                    ninfer::ToolCallParseFallbackReason::TrailingContent,
+                                    "CR6 call before fence (strict)");
+    failures += check_round2_region(before_fence, *contract, true, {"bash"},
+                                    ninfer::ToolCallParseFallbackReason::TruncatedTail,
+                                    "CR6 call before fence (tolerant)");
+    return failures;
+}
+
+// CR6/R2-I6 streaming invariance: the fence guard is a deterministic per-byte automaton,
+// so the result must be independent of the chunk partition. Every single split of a
+// fence plus real-call text must agree with the one-shot parse.
+int test_fence_split_at_every_byte() {
+    const auto contract = contract_from_definitions({
+        tool_definition("bash", Json{{"command", Json{{"type", "string"}}}})});
+    const std::string text = "Example:\n\n```xml\n"
+                             "<tool_call>\n"
+                             "<function=bash>\n"
+                             "<parameter=command>\necho example\n</parameter>\n"
+                             "</function>\n"
+                             "</tool_call>\n"
+                             "```\n"
+                             "<tool_call>\n"
+                             "<function=bash>\n"
+                             "<parameter=command>\necho real\n</parameter>\n"
+                             "</function>\n"
+                             "</tool_call>";
+    const auto one_shot = fi::parse_qwen_tool_call_output(text, 64, *contract);
+    int failures = 0;
+    failures += check(one_shot.is_tool_call_response && one_shot.tool_calls.size() == 1 &&
+                          one_shot.tool_calls.front().name == "bash",
+                      "CR6 every split: the one-shot parse lost the real call");
+    for (std::size_t split = 0; split <= text.size(); ++split) {
+        fi::ToolCallOutputDecoder decoder(
+            std::make_shared<fi::ToolCallOutputContract>(*contract), 64);
+        std::string visible = decoder.feed(std::string_view(text).substr(0, split));
+        visible += decoder.feed(std::string_view(text).substr(split));
+        auto terminal = decoder.finish();
+        failures += check(
+            terminal.tool_calls.size() == one_shot.tool_calls.size() &&
+                visible + terminal.content == one_shot.content &&
+                terminal.diagnostics == one_shot.diagnostics &&
+                (terminal.tool_calls.empty() ||
+                 terminal.tool_calls.front().arguments_json ==
+                     one_shot.tool_calls.front().arguments_json),
+            (std::string("CR6 every split: split ") + std::to_string(split) +
+             " diverged from one-shot")
+                .c_str());
     }
     return failures;
 }
@@ -1775,12 +2469,13 @@ int test_tolerant_undeclared_and_value_cut() {
                                    + open_tag + "/tmp/out.js\n" + close_tag + "\n"
                                    "</function>\n"
                                    "</tool_call>";
+    // R2-I5/CR5: tolerant mode repairs syntax damage; it does not accept undeclared
+    // identities. The undeclared call is never emitted in either mode.
     const auto tolerant = fi::parse_qwen_tool_call_output(undeclared, 64, *contract, true);
-    failures += check(tolerant.is_tool_call_response && tolerant.tool_calls.size() == 1 &&
-                          tolerant.tool_calls.front().name == "not_a_declared_tool",
-                      "tolerant mode did not keep the undeclared-name call structured");
-    failures += check(tolerant.diagnostics.fallback_reason == Reason::None,
-                      "tolerant undeclared call reported a fallback reason");
+    failures += check(!tolerant.is_tool_call_response && tolerant.tool_calls.empty() &&
+                          tolerant.content == undeclared && tolerant.diagnostics.marker_seen &&
+                          tolerant.diagnostics.fallback_reason == Reason::UndeclaredTool,
+                      "tolerant mode emitted a syntactically valid undeclared call (CR5)");
     const auto strict = fi::parse_qwen_tool_call_output(undeclared, 64, *contract);
     failures += check(!strict.is_tool_call_response &&
                           strict.diagnostics.fallback_reason == Reason::UndeclaredTool,
@@ -2015,8 +2710,9 @@ int test_recovery_policy_phase3() {
     const std::string value_cut = complete + std::string("<") + "parameter=extra>\npartial";
     const std::string trailing   = complete + "</function>\n</tool_call>\nextra answer";
     auto stream = [&](std::string_view text, bool tolerant, FinishReason reason,
-                      fi::ToolCallOutputDecoder::Terminal& terminal) {
-        fi::ToolCallOutputDecoder decoder(contract, 64, tolerant);
+                      fi::ToolCallOutputDecoder::Terminal& terminal,
+                      const std::shared_ptr<const fi::ToolCallOutputContract>& decoder_contract) {
+        fi::ToolCallOutputDecoder decoder(decoder_contract, 64, tolerant);
         std::string visible;
         for (std::size_t offset = 0; offset < text.size(); offset += 7) {
             visible += decoder.feed(std::string_view(text).substr(offset, 7));
@@ -2035,7 +2731,7 @@ int test_recovery_policy_phase3() {
                               one_shot.diagnostics.fallback_reason == Reason::TruncatedTail,
                           "missing wrapper close was not recovered");
         auto terminal = fi::ToolCallOutputDecoder::Terminal{};
-        const std::string visible = stream(missing_wrapper, true, reason, terminal);
+        const std::string visible = stream(missing_wrapper, true, reason, terminal, contract);
         failures += check(visible.empty() && terminal.content.empty() &&
                               terminal.tool_calls.size() == 1 &&
                               terminal.diagnostics.fallback_reason == Reason::TruncatedTail,
@@ -2056,7 +2752,7 @@ int test_recovery_policy_phase3() {
                               cut.diagnostics.fallback_reason == Reason::TruncatedTail,
                           "a cut string value was committed");
         auto cut_terminal = fi::ToolCallOutputDecoder::Terminal{};
-        stream(value_cut, true, reason, cut_terminal);
+        stream(value_cut, true, reason, cut_terminal, contract);
         failures += check(cut_terminal.tool_calls.empty() &&
                               cut_terminal.diagnostics.fallback_reason == Reason::TruncatedTail,
                           "streaming committed a cut string value");
@@ -2095,7 +2791,7 @@ int test_recovery_policy_phase3() {
                               strict.diagnostics.fallback_reason == Reason::MalformedStructure,
                           "a quoted closer committed a string value early (strict)");
         auto terminal = fi::ToolCallOutputDecoder::Terminal{};
-        stream(fixture, true, FinishReason::StopToken, terminal);
+        stream(fixture, true, FinishReason::StopToken, terminal, write_contract);
         failures += check(terminal.tool_calls.empty() && terminal.content == fixture &&
                               terminal.diagnostics.fallback_reason == Reason::TruncatedTail,
                           "streaming committed a string value at a quoted closer");
@@ -2123,20 +2819,27 @@ int test_function_calls_holds_call_sequence() {
                               parsed.diagnostics.fallback_reason == Reason::None,
                           "a complete <function_calls> call sequence was not committed");
     }
-    // The wrapper close is optional at the region end (pre-existing contract).
+    // R2-I2/CR2: a wrapper open at the input end is an objective truncation, never a clean
+    // completion. Strict rejects (MalformedStructure); tolerant retains the closed calls
+    // with the truncation diagnostic.
     const std::string two_calls_open =
         "<function_calls>\n<function=read>\n<parameter=path>a</parameter>\n"
         "</function>\n<function=read>\n<parameter=path>b</parameter>\n"
         "</function>";
-    for (const bool tolerant : {true, false}) {
-        const auto parsed = fi::parse_qwen_tool_call_output(two_calls_open, 64, *contract, tolerant);
-        failures += check(parsed.is_tool_call_response && parsed.tool_calls.size() == 2 &&
-                              parsed.diagnostics.fallback_reason == Reason::None,
-                          "a <function_calls> sequence at the region end was not a clean "
-                          "completion");
+    {
+        const auto strict_open = fi::parse_qwen_tool_call_output(two_calls_open, 64, *contract);
+        failures += check(
+            !strict_open.is_tool_call_response && strict_open.tool_calls.empty() &&
+                strict_open.diagnostics.fallback_reason == Reason::MalformedStructure,
+            "a missing function_calls close completed cleanly in strict mode");
+        const auto two_tolerant =
+            fi::parse_qwen_tool_call_output(two_calls_open, 64, *contract, true);
+        // CR2: an open function_calls wrapper at EOF is a truncation, not a clean end: the
+        // closed calls are retained with the TruncatedTail diagnostic in tolerant mode.
+        failures += check(two_tolerant.is_tool_call_response && two_tolerant.tool_calls.size() == 2 &&
+                              two_tolerant.diagnostics.fallback_reason == Reason::TruncatedTail,
+                          "a missing function_calls close demoted the tolerant call sequence");
     }
-    // The first call is complete, the second is cut inside its value: tolerant retains the
-    // first call with a truncation diagnostic; strict rejects the region.
     const std::string second_cut =
         "<function_calls>\n<function=read>\n<parameter=path>a</parameter>\n"
         "</function>\n<function=read>\n<parameter=path=c";
@@ -2260,6 +2963,18 @@ int main() {
     failures += test_recovery_retry_entry_policy();
     failures += test_marker_breaking_angle_restarts_candidate();
     failures += test_function_calls_holds_call_sequence();
+    failures += test_failed_open_wrapper_never_recovers_nested_wrapper();
+    failures += test_recovery_only_restarts_after_proven_scope();
+    failures += test_function_calls_missing_wrapper_close();
+    failures += test_function_calls_close_then_remainder();
+    failures += test_entry_forms_compose_consistently();
+    failures += test_complete_and_partial_next_entry_have_same_boundary_result();
+    failures += test_tolerant_rejects_undeclared_tools();
+    failures += test_strict_and_tolerant_share_declared_name_policy();
+    failures += test_output_normalization_cannot_emit_out_of_set_name();
+    failures += test_placeholder_function_name_is_not_executable();
+    failures += test_fenced_content_never_latches();
+    failures += test_fence_split_at_every_byte();
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }
