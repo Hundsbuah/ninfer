@@ -2671,9 +2671,9 @@ int run_small_prefill_cases(KvCacheStorage storage) {
     return failures;
 }
 
-// Ngram copy verification checks one request's drafts at widths 17-64, beyond the batched
-// verification domain. Dense and masked single-row calls, cached and appended, against the FP64
-// oracle, including loose envelopes whose visible keys still lie in the prompt-route region.
+// Ngram copy verification checks one request's drafts at widths 17-64. Dense and masked single-row
+// calls, cached and appended, against the FP64 oracle, including loose envelopes whose visible keys
+// still lie in the prompt-route region.
 int run_wide_copy_cases(KvCacheStorage storage) {
     int failures = 0;
     for (const Geometry& geometry : kGeometries) {
@@ -2703,6 +2703,45 @@ int run_wide_copy_cases(KvCacheStorage storage) {
                 failures += run_a3_case(geometry, storage, {width, 31, maximum, 2103u},
                                         MappingPattern::Offset);
             }
+        }
+    }
+    return failures;
+}
+
+// Ngram copy rounds above one request verify every row of the batch at widths 17-64: two and
+// eight requests, ragged valid prefixes and contexts, permuted table rows, a dense full batch and
+// graph replay, against the FP64 oracle.
+int run_wide_batch_copy_cases(KvCacheStorage storage) {
+    int failures = 0;
+    for (const Geometry& geometry : kGeometries) {
+        for (int width : {17, 24, 32, 33, 48, 63, 64}) {
+            failures += run_batch_case(geometry, storage,
+                                       {width,
+                                        {2048, 127},
+                                        {width, width / 2},
+                                        {1, 0},
+                                        MappingPattern::Fragmented,
+                                        static_cast<unsigned>(2200 + width),
+                                        width == 32 || width == 64});
+        }
+        for (int width : {17, 32, 64}) {
+            std::vector<std::int32_t> valid(8);
+            for (int b = 0; b < 8; ++b) valid[b] = b == 0 ? width : 1 + (5 * b) % width;
+            failures += run_batch_case(geometry, storage,
+                                       {width,
+                                        {8192, 1024, 127, 61, 1, 0, 2048, 300},
+                                        valid,
+                                        {7, 0, 5, 2, 6, 1, 4, 3},
+                                        MappingPattern::Fragmented,
+                                        static_cast<unsigned>(2300 + width),
+                                        true});
+            failures += run_batch_case(geometry, storage,
+                                       {width,
+                                        {128, 64, 32, 8, 2, 17, 63, 127},
+                                        std::vector<std::int32_t>(8, width),
+                                        {7, 0, 5, 2, 6, 1, 4, 3},
+                                        MappingPattern::Fragmented,
+                                        static_cast<unsigned>(2400 + width)});
         }
     }
     return failures;
@@ -2850,7 +2889,10 @@ int run_softmax_attention_wide_tests(std::optional<KvCacheStorage> selected) {
         const int current = run_wide_copy_cases(storage);
         std::cout << (current ? "FAIL" : "PASS") << " causal_softmax_attention "
                   << cache_name(storage) << " wide copy verification\n";
-        failures += current;
+        const int batched = run_wide_batch_copy_cases(storage);
+        std::cout << (batched ? "FAIL" : "PASS") << " causal_softmax_attention "
+                  << cache_name(storage) << " wide batched copy verification\n";
+        failures += current + batched;
     }
     return failures ? 1 : 0;
 }
