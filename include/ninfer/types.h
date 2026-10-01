@@ -523,6 +523,8 @@ struct ToolCallParseDiagnostics {
     // retry), and whether the pre-latch stream ended inside an unclosed fence.
     std::uint32_t fenced_markers_suppressed       = 0;
     bool ended_in_unclosed_fence                  = false;
+    // Round 4 (N-07): the Stage-2 work budget was exhausted; the region was returned as text.
+    bool parse_budget_exhausted                  = false;
     ToolCallParseFallbackReason fallback_reason   = ToolCallParseFallbackReason::None;
 
     [[nodiscard]] friend constexpr bool

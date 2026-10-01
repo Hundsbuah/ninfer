@@ -3654,8 +3654,9 @@ int test_round3_work_bounds() {
         fi::ToolCallStreamParser machine(policy);
         machine.feed(std::string_view(text));
         const auto term = machine.finish(FinishReason::OutputLimit);
-        failures += check(term.stage2_steps < 4096,
-                          "R3-14: 2000 closer triples bound the Stage-2 steps");
+        failures += check(term.stage2_steps <= std::max<std::uint64_t>(100000, 4 * text.size()) &&
+                              !term.parse_budget_exhausted,
+                          "R4 N-01/N-07: 2000 closer triples bound the Stage-2 work units");
     }
     {
         // An exhausted Stage-2 step budget fails closed to Invalid (section 7.11): the
@@ -3672,8 +3673,100 @@ int test_round3_work_bounds() {
         machine.feed(std::string_view(s1));
         const auto term = machine.finish(FinishReason::StopToken);
         failures += check(term.status == fi::ToolCallStreamStatus::Invalid &&
-                              term.region.calls.empty(),
-                          "R3-14: an exhausted Stage-2 budget fails closed");
+                              term.region.calls.empty() && term.parse_budget_exhausted,
+                          "R4 N-07: an exhausted Stage-2 budget fails closed");
+    }
+    return failures;
+}
+
+// N-04: there is no depth or chain bound on the number of values on one Stage-2 path. A
+// call with 70 parameters whose last value needs Stage 2 completes with all 70 parameters;
+// the removed depth constant of 64 would have rejected it.
+int test_round4_stage2_many_values() {
+    using ninfer::FinishReason;
+    Json properties = Json::object();
+    for (int i = 0; i < 70; ++i) { properties["p" + std::to_string(i)] = Json{{"type", "string"}}; }
+    const auto contract = contract_for("multi", std::move(properties));
+    std::string text = "<tool_call>\n<function=multi>\n";
+    for (int i = 0; i < 69; ++i) {
+        text += "<parameter=p" + std::to_string(i) + ">\nv" + std::to_string(i) + "\n</parameter>\n";
+    }
+    // The last value needs Stage 2: it embeds a complete tool call with its own closer, which
+    // the greedy one-token rule mis-selects.
+    text += "<parameter=p69>\n# Example\n" + tool_call("read", {{"path", "foo.cpp"}}) + "\nDone.\n</parameter>\n";
+    text += "</function>\n</tool_call>";
+    const auto parsed = fi::parse_qwen_tool_call_output(text, 64, contract, false,
+                                                        FinishReason::StopToken);
+    int ok = parsed.is_tool_call_response && parsed.tool_calls.size() == 1 &&
+             parsed.tool_calls[0].name == "multi" &&
+             parsed.diagnostics.fallback_reason == ninfer::ToolCallParseFallbackReason::None;
+    if (ok) {
+        const Json args = Json::parse(parsed.tool_calls[0].arguments_json);
+        if (!args.is_object()) { ok = false; }
+        else {
+            for (int i = 0; i < 70 && ok; ++i) { ok = args.contains("p" + std::to_string(i)); }
+        }
+    }
+    return check(ok, "N-04: a 70-parameter call whose last value needs Stage 2 completes");
+}
+
+// N-01, N-07: the global Stage-2 work budget bounds the deterministic work (stage2_steps is
+// the charged unit count) and exhaustion fails closed with parse_budget_exhausted.
+int test_round4_work_bounds() {
+    using ninfer::FinishReason;
+    using ninfer::ToolCallParseFallbackReason;
+    fi::ToolCallParsePolicy policy;
+    policy.max_name_length = 64;
+    int failures = 0;
+    const auto limit_of = [](const std::string& t) {
+        return std::max<std::uint64_t>(100000, 4 * t.size());
+    };
+    {
+        // Repetition with trailing prose: 300 complete calls plus prose after the last one.
+        std::string text;
+        for (int i = 0; i < 300; ++i) {
+            text += "Example " + std::to_string(i) + ":\n" +
+                    tool_call("bash", {{"command", "ls -la"}}) + "\n";
+        }
+        text += "That is all.";
+        const std::uint64_t limit = limit_of(text);
+        fi::ToolCallStreamParser machine(policy);
+        machine.feed(std::string_view(text));
+        const auto term = machine.finish(FinishReason::StopToken);
+        failures += check(term.status == fi::ToolCallStreamStatus::Invalid &&
+                              term.stage2_steps <= limit + 1,
+                          "N-01: repetition with trailing prose is Invalid within the work bound");
+    }
+    {
+        // Closer triples inside one write value: Stage 2 resolves it; the work stays bounded
+        // and the budget is not exhausted.
+        std::string content;
+        for (int i = 0; i < 2000; ++i) { content += "<parameter=p>\nv\n</parameter>\n</parameter>\n</parameter>\n"; }
+        const std::string text = tool_call("write", {{"path", "d.md"}, {"content", content}});
+        const std::uint64_t limit = limit_of(text);
+        fi::ToolCallStreamParser machine(policy);
+        machine.feed(std::string_view(text));
+        const auto term = machine.finish(FinishReason::StopToken);
+        failures += check(term.status == fi::ToolCallStreamStatus::Complete &&
+                              !term.parse_budget_exhausted && term.stage2_steps <= limit + 1,
+                          "N-01: closer triples complete within the work bound without exhaustion");
+    }
+    {
+        // Tiny budget: a Stage-2 budget of 8 cannot finish the Round-3 S1 example, so the
+        // region fails closed with parse_budget_exhausted and no calls.
+        const std::string s1 = tool_call("write", {{"path", "docs/x.md"},
+                                                   {"content", "# Example\n" +
+                                                                  tool_call("read", {{"path", "foo.cpp"}}) +
+                                                                  "\nDone."}});
+        fi::ToolCallParsePolicy small;
+        small.max_name_length = 64;
+        small.stage2_step_budget = 8;
+        fi::ToolCallStreamParser machine(small);
+        machine.feed(std::string_view(s1));
+        const auto term = machine.finish(FinishReason::StopToken);
+        failures += check(term.status == fi::ToolCallStreamStatus::Invalid &&
+                              term.region.calls.empty() && term.parse_budget_exhausted,
+                          "N-07: a tiny Stage-2 budget fails closed with parse_budget_exhausted");
     }
     return failures;
 }
@@ -3746,6 +3839,8 @@ int main() {
     failures += test_round3_spec_corpus();
     failures += test_round3_streaming_equivalence_fuzz();
     failures += test_round3_work_bounds();
+    failures += test_round4_stage2_many_values();
+    failures += test_round4_work_bounds();
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }

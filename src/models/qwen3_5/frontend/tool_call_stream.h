@@ -77,9 +77,10 @@ struct ToolCallParsePolicy {
     // whose continuation opens an undeclared or repeated parameter of the current call.
     bool (*parameter_plausible)(const void* contract, std::string_view tool_name,
                                 std::string_view parameter_name) = nullptr;
-    // R3-14: deterministic Stage-2 step budget (candidate/glue steps per base). Zero selects
-    // the default max(200000, 32 x region bytes); a positive value overrides it (tests pin
-    // the fail-closed behavior with a tiny budget).
+    // Round 4: the global Stage-2 work budget of one finish() call (charged per glue
+    // transition, candidate, and candidate-walk '<' visit across all bases). Zero selects the
+    // default max(100000, 4 x region bytes); a positive value overrides it (tests pin the
+    // fail-closed behavior with a tiny budget).
     std::uint64_t stage2_step_budget = 0;
 };
 // Objective parse outcome of one tool region (P3.1): what was safely recognized, where the
@@ -120,10 +121,10 @@ struct ToolCallParseProgress {
     // prose owns no payload scope: the retry may re-read the region from the break offset,
     // unlike a wrapper that failed while parsing a function header (R2-I1 still applies).
     bool prose_after_wrapper = false;
-    // R3-01: the Consistent (Stage-2) parse accepted a region whose chosen path used a
-    // pass-2 (lazy, unbalanced) value boundary. Selection prefers the earliest base whose
-    // path used only balanced boundaries.
-    bool stage2_lazy_boundary_used = false;
+    // Stage-2 internal: the machine stopped at the start of a parameter value, waiting for
+    // the sequential value chooser to select its boundary (the state in `open_call`/the caller's
+    // RegionState carries the value start).
+    bool stage2_at_value = false;
 };
 
 // P3.5: the explicit, pure recovery decision. Integrity over availability: a call is
@@ -221,11 +222,15 @@ struct ToolCallStreamResult {
     // first marker and the accepted region (rtrimmed at the parse entry).
     std::string tail;
     bool marker_seen = false;
-    // R3-14: deterministic work counters (not wall-clock): Stage-2 candidate/glue steps
-    // summed over all bases, and pre-latch bytes re-fed by the NotMarker rescan. Tests pin
-    // the bounds without timing.
+    // Round 4: deterministic work counters (not wall-clock): Stage-2 work units charged over
+    // all bases (glue transitions + candidates + candidate-walk '<' visits, from the global
+    // WorkBudget) and pre-latch bytes re-fed by the NotMarker rescan. Tests pin the bounds
+    // without timing.
     std::uint64_t stage2_steps = 0;
     std::uint64_t rescan_steps = 0;
+    // Round 4 (N-07): the global Stage-2 work budget was exhausted; fail closed (nothing from
+    // Stage 2 is accepted; the region falls back to the Stage-1/Stage-3 result).
+    bool parse_budget_exhausted = false;
     // R3-06/R3-07: fence and completion diagnostics for the request/operational log.
     bool markup_tolerant_completion = false;
     std::uint32_t fenced_markers_suppressed = 0;
@@ -352,7 +357,7 @@ public:
     // the next '<' through this same transition (the deterministic rescan; R3-14 counts the
     // re-fed bytes). Recursion depth is bounded by the '<' count of one candidate, which is
     // bounded by kMaxToolHeaderBytes.
-    [[nodiscard]] bool marker_byte(char byte, std::string& visible) noexcept;
+    [[nodiscard]] bool marker_byte(char byte, std::string& visible);
 
     ToolCallParsePolicy policy_;
     FenceTracker fence_;

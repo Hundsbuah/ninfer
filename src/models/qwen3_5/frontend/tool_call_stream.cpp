@@ -1,5 +1,7 @@
 #include <algorithm>
+#include <optional>
 #include <unordered_map>
+#include <unordered_set>
 #include "models/qwen3_5/frontend/tool_call_stream.h"
 
 namespace ninfer::models::qwen3_5::frontend {
@@ -179,15 +181,15 @@ enum class BoundaryMode : std::uint8_t {
     Greedy,
     Consistent,
 };
-struct ConsistentCompleter;
+struct Stage2Context;
 
 // The region machine with a selectable value-boundary policy and an entry machine state.
-// `s` is the machine state (by reference; positions are absolute within `text`). `cc`
-// (non-null only for Consistent mode) charges the deterministic step budget, memoizes
-// proven-Definitive states, and selects the value boundaries. `index` (non-null only for
+// `s` is the machine state (by reference; positions are absolute within `text`). `cx`
+// (non-null only for Consistent mode) is the Stage-2 context: it charges the global work
+// budget, holds the shared dead memo and the region index. `index` (non-null only for
 // Stage-1 lookups) supplies absolute closer positions; a null index falls back to a linear scan.
 ToolCallParseProgress parse_region_at(std::string_view text, const ToolCallParsePolicy& policy,
-                                      RegionState& s, BoundaryMode mode, ConsistentCompleter* cc,
+                                      RegionState& s, BoundaryMode mode, Stage2Context* cx,
                                       const RegionIndex* index);
 
 // Deterministic parse of a complete tool-region slice (Stage 1). The slice always starts at a
@@ -199,11 +201,11 @@ ToolCallParseProgress parse_region(std::string_view text, const ToolCallParsePol
     return parse_region_at(text, policy, s, BoundaryMode::Greedy, nullptr, nullptr);
 }
 
-// Stage 2 — ConsistentCompleter (R3-01): the only mechanism that makes a truncated region
-// complete. It runs only when Stage 1 accepted nothing, on every admissible base of the
-// Stage-1 retry chain, and parses the canonical grammar (tolerant header repairs disabled in
-// the Consistent machine): the glue transitions are the Stage-1 machine itself, and only the
-// parameter-value boundary selection differs.
+// Stage 2 (R3-01): resolves value boundaries that the greedy one-token rule chose wrongly; it
+// never completes a truncated region. It runs only when Stage 1 accepted nothing, on every
+// admissible base of the Stage-1 retry chain, and parses the canonical grammar (tolerant header
+// repairs disabled in the Consistent machine): the glue transitions are the Stage-1 machine
+// itself, and only the parameter-value boundary selection differs.
 //
 //   pass 1 (balanced): the value-family closers not consumed by a nested same-family opener
 //                      inside the value (depth counting, same family only);
@@ -213,185 +215,211 @@ ToolCallParseProgress parse_region(std::string_view text, const ToolCallParsePol
 // opens a repeated or undeclared parameter of the current call (plausibility), or when a
 // viable candidate of the same value was already contradicted and the candidate is not
 // preceded by '\n' (canonical framing: the real value close is serialized as
-// '\n</parameter>'). A candidate stands when its path ends EndOfInput (the region result is
-// EndOfInput); it is abandoned only when the path ends Definitive. When every candidate is
-// contradicted, the value is open to the end (EndOfInput, never Complete).
+// '\n</parameter>'). A candidate stands when its glue to the next value start (or the region
+// end) is not Definitive; it is abandoned when that glue is Definitive. When every candidate
+// is contradicted, the value is open to the end (EndOfInput, never Complete).
 //
-// Bounded by construction (R3-I8/R3-14): a hard recursion depth bound fails closed, a
-// deterministic step budget bounds candidate/glue work, and the memo key is an O(1) hash of
-// the machine state (position, mode, families, wrapper, call and parameter identity) — never
-// a string concatenation.
-struct ConsistentCompleter {
-    static constexpr std::uint32_t kMaxStage2Depth = 64;
+// Bounded by construction (R3-I8/R3-14): a single global WorkBudget over one finish() call
+// bounds the total candidate/glue/walk work (fail closed), and the dead-memo key is an O(1)
+// hash of the machine state (position, mode, families, wrapper, call and parameter identity)
+// — never a string concatenation. There is no recursion and no depth constant: once the parse
+// reaches the start of the next parameter value, the boundary chosen for the previous value is
+// final, so the selection is a linear chain of decisions driven by run_stage2_base.
 
-    std::string_view text;
-    ToolCallParsePolicy policy;
-    std::uint64_t budget;
-    std::uint64_t steps = 0;
-    std::uint32_t lazy_choices = 0; // pass-2 boundaries used on the standing path
-    std::uint32_t depth = 0;
-    bool exhausted = false;
-    std::unordered_map<std::uint64_t, bool> memo; // state hash -> the path proved Definitive
+enum class CandidatePass : std::uint8_t { Balanced, Lazy };
+enum class Stage2Verdict : std::uint8_t { Complete, EndOfInput, Definitive, Exhausted };
 
-    // Charge one candidate/glue step; true when the budget is exhausted (fail closed).
+struct Stage2Path {
+    std::vector<std::pair<std::size_t, std::size_t>> values; // chosen [begin, end) per parameter
+    bool lazy_used = false;                                  // a pass-2 boundary stands on the path
+};
+
+constexpr std::uint64_t kStage2WorkMinimum = 100'000;
+constexpr std::uint64_t kStage2WorkPerByte = 4;
+
+struct WorkBudget {
+    std::uint64_t limit = 0;
+    std::uint64_t used  = 0;
+    bool exhausted      = false;
+    // Charge one unit; true once the budget is exhausted.
     [[nodiscard]] bool charge() noexcept {
-        if (exhausted) { return true; }
-        if (++steps > budget) { exhausted = true; return true; }
-        return false;
-    }
-
-    [[nodiscard]] static std::uint64_t state_hash(const RegionState& s) noexcept {
-        std::uint64_t h = 0x9e3779b97f4a7c15ULL;
-        auto mix = [&h](std::uint64_t v) {
-            h ^= v;
-            h = (h << 27) | (h >> 37);
-            h *= 0x9e3779b97f4a7c15ULL;
-        };
-        auto mix_str = [&mix](std::string_view v) {
-            std::uint64_t f = 0xcbf29ce484222325ULL;
-            for (const char c : v) { f ^= static_cast<std::uint8_t>(c); f *= 0x100000001b3ULL; }
-            mix(f);
-        };
-        mix(s.pos);
-        mix(static_cast<std::uint64_t>(s.mode));
-        mix(static_cast<std::uint64_t>(s.fn_family));
-        mix(static_cast<std::uint64_t>(s.param_family));
-        mix(static_cast<std::uint64_t>(s.wrapper));
-        mix(static_cast<std::uint64_t>(s.function_calls_had_call));
-        mix(static_cast<std::uint64_t>(s.no_retain));
-        mix(static_cast<std::uint64_t>(s.region.calls.empty()));
-        mix_str(s.current.name);
-        for (const ParsedParameter& p : s.current.parameters) { mix_str(p.name); }
-        mix_str(s.param_name);
-        return h;
-    }
-
-    // The Stage-2 value-boundary selection for a machine state in ParameterValue mode.
-    // Returns the standing candidate's path outcome (Complete or EndOfInput) or the
-    // EndOfInput outcome with the value open to the end; never a Definitive outcome.
-    ToolCallParseProgress select_value(RegionState& s) noexcept {
-        const std::string_view required_close = tool_close_literal(s.param_family);
-        // Candidate census: every closer occurrence and the balanced subset (depth 0, same
-        // family only, R3-01): a complete same-family opener inside the value consumes the next
-        // closer of that family; a cross-family opener (the other parameter family) is closed by
-        // its own closer and never consumes this family's closers. A partial opener at the
-        // value end cannot decide depth yet and is ignored.
-        std::vector<std::size_t> all;
-        std::vector<std::size_t> balanced;
-        {
-            std::size_t depth = 0;
-            for (std::size_t i = s.value_begin; i < text.size();) {
-                if (text[i] != '<') { ++i; continue; }
-                if (starts_with_at(text, i, required_close)) {
-                    if (depth == 0) { balanced.push_back(i); }
-                    else { --depth; }
-                    all.push_back(i);
-                    i += required_close.size();
-                    continue;
-                }
-                ToolOpenTag opener = {};
-                if (parse_tool_parameter_open(text.substr(i), opener) == ToolHeaderStatus::Complete) {
-                    if (opener.kind == s.param_family) { ++depth; }
-                    i += opener.consumed;
-                    continue;
-                }
-                ++i;
-            }
-        }
-        auto try_list = [&](const std::vector<std::size_t>& list, bool lazy) {
-            bool skipped_viable = false;
-            for (const std::size_t c : list) {
-                if (charge()) { exhausted = true; }
-                if (exhausted) { break; }
-                if (skipped_viable && (c == 0 || text[c - 1] != '\n')) { continue; }
-                const std::size_t after = c + required_close.size();
-                if (classify_close_continuation(text, after, s.fn_family, s.wrapper) ==
-                    CloseContinuation::Invalid) {
-                    continue;
-                }
-                // Plausibility: the continuation opens the next parameter of the same call.
-                // Its name must not repeat a name of the current call (including the value
-                // being closed) and, when the tool has an unambiguous non-empty declared
-                // schema, must be declared (the predicate returns false exactly in that case).
-                const std::size_t at = skip_ws(text, after);
-                if (at < text.size()) {
-                    ToolOpenTag next = {};
-                    if (parse_tool_parameter_open(text.substr(at), next) == ToolHeaderStatus::Complete) {
-                        const std::string_view m = next.name;
-                        bool bad = m == s.param_name;
-                        if (!bad) {
-                            for (const ParsedParameter& p : s.current.parameters) {
-                                if (p.name == m) { bad = true; break; }
-                            }
-                        }
-                        if (!bad && policy.parameter_plausible != nullptr &&
-                            !policy.parameter_plausible(policy.contract, s.current.name, m)) {
-                            bad = true;
-                        }
-                        if (bad) { continue; }
-                    }
-                }
-                const std::size_t saved_parameters = s.current.parameters.size();
-                const std::size_t saved_calls      = s.region.calls.size();
-                const std::uint32_t saved_lazy     = lazy_choices;
-                s.current.parameters.push_back(
-                    ParsedParameter{.name = s.param_name,
-                                    .value = std::string(text.substr(s.value_begin, c - s.value_begin))});
-                RegionState after_state = s;
-                after_state.pos  = after;
-                after_state.mode = RegionState::Mode::FunctionBody;
-                const std::uint64_t key = state_hash(after_state);
-                ToolCallParseProgress r;
-                const auto found = memo.find(key);
-                if (found != memo.end()) {
-                    r.termination = ToolCallRegionTermination::Definitive; // memoized abandon
-                } else if (depth + 1 >= kMaxStage2Depth) {
-                    // R3-I8: the hard recursion bound fails closed.
-                    exhausted = true;
-                    s.current.parameters.resize(saved_parameters);
-                    s.region.calls.resize(saved_calls);
-                    lazy_choices = saved_lazy;
-                    break;
-                } else {
-                    ++depth;
-                    r = parse_region_at(text, policy, after_state, BoundaryMode::Consistent, this,
-                                        nullptr);
-                    --depth;
-                    if (r.termination == ToolCallRegionTermination::Definitive) {
-                        memo.emplace(key, true);
-                    }
-                }
-                if (r.termination != ToolCallRegionTermination::Definitive) {
-                    if (lazy) { ++lazy_choices; }
-                    return r;
-                }
-                // Abandoned: roll the machine state back to before the candidate.
-                s.current.parameters.resize(saved_parameters);
-                s.region.calls.resize(saved_calls);
-                lazy_choices = saved_lazy;
-                skipped_viable = true;
-            }
-            return ToolCallParseProgress{.termination = ToolCallRegionTermination::Definitive};
-        };
-        auto r = try_list(balanced, false);
-        if (r.termination != ToolCallRegionTermination::Definitive) { return r; }
-        r = try_list(all, true);
-        if (r.termination != ToolCallRegionTermination::Definitive) { return r; }
-        // Every candidate contradicted (or the budget/depth bound fired): the value is open
-        // to the end. Never Complete.
-        ToolCallParseProgress open;
-        open.termination      = ToolCallRegionTermination::EndOfInput;
-        open.break_offset     = s.value_begin;
-        open.wrapper_at_break = s.wrapper;
-        open.open_call        = std::move(s.current);
-        open.open_value_open  = true;
-        open.calls            = std::move(s.region.calls);
-        return open;
+        if (!exhausted && ++used > limit) { exhausted = true; }
+        return exhausted;
     }
 };
 
+struct Stage2Context {
+    std::string_view text;                  // the whole region_ (absolute positions)
+    const ToolCallParsePolicy& policy;
+    const RegionIndex& index;
+    WorkBudget budget;                      // ONE budget for all bases of this finish() call
+    std::unordered_set<std::uint64_t> dead; // post-candidate states proven Definitive, shared by all bases
+};
+
+// The O(1) dead-memo key: a hash of the machine-state fields that decide the glue outcome
+// (never a string concatenation).
+std::uint64_t stage2_state_hash(const RegionState& s) noexcept {
+    std::uint64_t h = 0x9e3779b97f4a7c15ULL;
+    auto mix = [&h](std::uint64_t v) {
+        h ^= v;
+        h = (h << 27) | (h >> 37);
+        h *= 0x9e3779b97f4a7c15ULL;
+    };
+    auto mix_str = [&mix](std::string_view v) {
+        std::uint64_t f = 0xcbf29ce484222325ULL;
+        for (const char c : v) { f ^= static_cast<std::uint8_t>(c); f *= 0x100000001b3ULL; }
+        mix(f);
+    };
+    mix(s.pos);
+    mix(static_cast<std::uint64_t>(s.mode));
+    mix(static_cast<std::uint64_t>(s.fn_family));
+    mix(static_cast<std::uint64_t>(s.param_family));
+    mix(static_cast<std::uint64_t>(s.wrapper));
+    mix(static_cast<std::uint64_t>(s.function_calls_had_call));
+    mix(static_cast<std::uint64_t>(s.no_retain));
+    mix(static_cast<std::uint64_t>(s.region.calls.empty()));
+    mix_str(s.current.name);
+    for (const ParsedParameter& p : s.current.parameters) { mix_str(p.name); }
+    mix_str(s.param_name);
+    return h;
+}
+
+// The plausibility rule: after a candidate value close, if a complete parameter opener follows,
+// its name must not equal the value's name or any name already in the current call, and the
+// policy predicate must not reject it. False when the candidate is contradicted.
+bool next_parameter_plausible(const Stage2Context& cx, const RegionState& s, std::size_t after) {
+    const std::string_view& text = cx.text;
+    const std::size_t at = skip_ws(text, after);
+    if (at >= text.size()) { return true; }
+    ToolOpenTag next = {};
+    if (parse_tool_parameter_open(text.substr(at), next) != ToolHeaderStatus::Complete) {
+        return true;
+    }
+    const std::string_view m = next.name;
+    bool bad = m == s.param_name;
+    if (!bad) {
+        for (const ParsedParameter& p : s.current.parameters) {
+            if (p.name == m) { bad = true; break; }
+        }
+    }
+    if (!bad && cx.policy.parameter_plausible != nullptr &&
+        !cx.policy.parameter_plausible(cx.policy.contract, s.current.name, m)) {
+        bad = true;
+    }
+    return !bad;
+}
+
+// The lazy candidate walk: yields the candidate closers of one value in order, charging the
+// budget one unit per '<' visited. Pass 1 (Balanced) yields only the closers at nesting depth
+// 0 (a nested same-family opener consumes the next closer); pass 2 (Lazy) yields every closer.
+// Both passes restart from value_begin and tokenize as the Round-3 census (complete openers'
+// bytes are skipped).
+class CandidateWalk {
+public:
+    CandidateWalk(std::string_view text, std::size_t value_begin, ToolTagKind family,
+                  CandidatePass pass)
+        : text_(text), pos_(value_begin), family_(family), pass_(pass) {}
+    // Next candidate closer (absolute), ascending. False at the end or when the budget is exhausted.
+    [[nodiscard]] bool next(std::size_t& candidate, WorkBudget& budget) {
+        const std::string_view close = tool_close_literal(family_);
+        for (;;) {
+            const std::size_t found = text_.find('<', pos_);
+            if (found == std::string_view::npos) { return false; }
+            pos_ = found;
+            if (budget.charge()) { return false; }
+            if (starts_with_at(text_, pos_, close)) {
+                const std::size_t at = pos_;
+                pos_ += close.size();
+                if (pass_ == CandidatePass::Lazy || depth_ == 0) { candidate = at; return true; }
+                --depth_; // consumed by a nested same-family opener
+                continue;
+            }
+            ToolOpenTag opener = {};
+            // Same-family depth (N-05): only a complete opener of the value's own family
+            // consumes the next closer; a different-family opener is ordinary bytes.
+            if (parse_tool_parameter_open(text_.substr(pos_), opener) == ToolHeaderStatus::Complete) {
+                if (opener.kind == family_) { ++depth_; }
+                pos_ += opener.consumed;
+                continue;
+            }
+            ++pos_;
+        }
+    }
+
+private:
+    std::string_view text_;
+    std::size_t pos_;
+    std::size_t depth_ = 0;
+    ToolTagKind family_;
+    CandidatePass pass_;
+};
+
+// The Stage-2 driver for one base: runs the canonical (Consistent) machine and, at each
+// parameter-value start, selects the standing value boundary (pass 1 balanced, else pass 2
+// lazy). No recursion: once the machine reaches the next value start (or the region end), the
+// previous value's boundary is final. `out` carries the standing path's progress (Complete or
+// EndOfInput) with empty values; `path` records the chosen [begin, end) per parameter, in
+// order, for materialization.
+Stage2Verdict run_stage2_base(Stage2Context& cx, std::size_t base, Stage2Path& path,
+                              ToolCallParseProgress& out) {
+    RegionState s;
+    s.pos = base;
+    out = parse_region_at(cx.text, cx.policy, s, BoundaryMode::Consistent, &cx, &cx.index);
+    for (;;) {
+        if (cx.budget.exhausted) { return Stage2Verdict::Exhausted; }
+        if (!out.stage2_at_value) {
+            switch (out.termination) {
+            case ToolCallRegionTermination::Complete:   return Stage2Verdict::Complete;
+            case ToolCallRegionTermination::EndOfInput: return Stage2Verdict::EndOfInput;
+            case ToolCallRegionTermination::Definitive: return Stage2Verdict::Definitive;
+            }
+        }
+        // `s` is the machine state at the start of a parameter value.
+        bool stood = false;
+        for (const CandidatePass pass : {CandidatePass::Balanced, CandidatePass::Lazy}) {
+            bool skipped_viable = false; // per value and per pass
+            CandidateWalk walk(cx.text, s.value_begin, s.param_family, pass);
+            std::size_t c = 0;
+            while (walk.next(c, cx.budget)) {
+                if (cx.budget.charge()) { return Stage2Verdict::Exhausted; } // one unit per candidate
+                if (skipped_viable && (c == 0 || cx.text[c - 1] != '\n')) { continue; } // canonical framing
+                const std::size_t after = c + tool_close_literal(s.param_family).size();
+                if (classify_close_continuation(cx.text, after, s.fn_family, s.wrapper) ==
+                    CloseContinuation::Invalid) {
+                    continue;
+                }
+                if (!next_parameter_plausible(cx, s, after)) { continue; }
+                RegionState trial = s; // values are not materialized: the copy is small
+                trial.current.parameters.push_back(ParsedParameter{.name = s.param_name, .value = {}});
+                trial.pos  = after;
+                trial.mode = RegionState::Mode::FunctionBody;
+                const std::uint64_t key = stage2_state_hash(trial);
+                if (cx.dead.contains(key)) { skipped_viable = true; continue; }
+                ToolCallParseProgress r =
+                    parse_region_at(cx.text, cx.policy, trial, BoundaryMode::Consistent, &cx,
+                                    &cx.index);
+                if (cx.budget.exhausted) { return Stage2Verdict::Exhausted; }
+                if (!r.stage2_at_value && r.termination == ToolCallRegionTermination::Definitive) {
+                    cx.dead.insert(key); // the glue up to the next value or the end is contradicted
+                    skipped_viable = true;
+                    continue;
+                }
+                path.values.emplace_back(s.value_begin, c); // the candidate stands
+                if (pass == CandidatePass::Lazy) { path.lazy_used = true; }
+                s     = std::move(trial);
+                out   = std::move(r);
+                stood = true;
+                break;
+            }
+            if (cx.budget.exhausted) { return Stage2Verdict::Exhausted; }
+            if (stood) { break; }
+        }
+        if (!stood) { return Stage2Verdict::EndOfInput; } // every candidate contradicted: value open
+    }
+}
+
 ToolCallParseProgress parse_region_at(std::string_view text, const ToolCallParsePolicy& policy,
-                                      RegionState& s, BoundaryMode mode, ConsistentCompleter* cc,
+                                      RegionState& s, BoundaryMode mode, Stage2Context* cx,
                                       const RegionIndex* index) {
     // R3-01: Stage 2 parses the canonical grammar — tolerant header repairs and the tolerant
     // NoEntry repair entry are Stage-1 mechanisms and do not run in the Consistent parse.
@@ -439,7 +467,7 @@ ToolCallParseProgress parse_region_at(std::string_view text, const ToolCallParse
     for (;;) {
         // R3-14: one glue step per machine transition in the Stage-2 parse; the budget fails
         // closed (the base is rejected as a definitive break, never completed).
-        if (mode == BoundaryMode::Consistent && cc->charge()) {
+        if (mode == BoundaryMode::Consistent && cx->budget.charge()) {
             out.termination                   = ToolCallRegionTermination::Definitive;
             out.failure                       = ToolCallParseFailure::MalformedStructure;
             out.break_offset                  = s.pos;
@@ -720,10 +748,10 @@ ToolCallParseProgress parse_region_at(std::string_view text, const ToolCallParse
         }
         case RegionState::Mode::ParameterValue: {
             if (mode == BoundaryMode::Consistent) {
-                // R3-01: the Stage-2 candidate selection owns the boundary; the machine
-                // returns the standing path's outcome (or the open-value EndOfInput).
-                out = cc->select_value(s);
-                out.stage2_lazy_boundary_used = cc->lazy_choices > 0;
+                // Round 4: the sequential value chooser (run_stage2_base) owns the boundary.
+                // The machine stops at the value start and returns to the driver; `s` keeps the
+                // state at the value start (nothing is moved into `out`).
+                out.stage2_at_value = true;
                 return out;
             }
             // A parameter value is an opaque byte range (I1/F1): literal openers inside the
@@ -928,7 +956,7 @@ void ToolCallStreamParser::latch(std::string_view marker) {
     marker_prefix_.clear();
 }
 
-bool ToolCallStreamParser::marker_byte(char byte, std::string& visible) noexcept {
+bool ToolCallStreamParser::marker_byte(char byte, std::string& visible) {
     if (!marker_prefix_.empty()) {
         marker_prefix_.push_back(byte);
         ToolOpenTag marker = {};
@@ -1160,68 +1188,69 @@ ToolCallStreamResult ToolCallStreamParser::finish(FinishReason finish_reason) co
         base = next;
     }
 
-    // Stage 2 (R3-01): consistent completion on every admissible base of the Stage-1 chain.
-    // The canonical parse (tolerant repairs off) reuses the Stage-1 machine with the
-    // ConsistentCompleter value-boundary selection.
-    struct Stage2Result {
-        std::size_t base;
-        ToolCallParseProgress progress;
-    };
-    std::vector<Stage2Result> stage2;
-    for (const Attempt& attempt : chain) {
-        // R3-14: without a parameter closer literal of either family there is no consistent
-        // value boundary, so the consistent parse degenerates to the greedy one; skip it
-        // (steps stay 0). Both family forms must be checked: a short-family region carries only
-        // '</param>', and skipping it would silently disable Stage 2 for that family.
-        if (region_.find(tool_close_literal(ToolTagKind::Parameter), attempt.base) ==
-                std::string_view::npos &&
-            region_.find(tool_close_literal(ToolTagKind::Param), attempt.base) ==
-                std::string_view::npos) {
-            continue;
-        }
-        ConsistentCompleter cc;
-        cc.text   = region_; // the whole region (absolute positions, §2.1)
-        cc.policy = policy_;
-        cc.budget = policy_.stage2_step_budget != 0
-                        ? policy_.stage2_step_budget
-                        : std::max<std::uint64_t>(200000, 32 * cc.text.size());
-        RegionState s{};
-        s.pos = attempt.base;
-        const ToolCallParseProgress r =
-            parse_region_at(cc.text, cc.policy, s, BoundaryMode::Consistent, &cc, nullptr);
-        result.stage2_steps += cc.steps;
-        stage2.push_back(Stage2Result{attempt.base, r});
-    }
+    // Stage 2 (R3-01): sequential value-boundary resolution over every admissible base of the
+    // Stage-1 chain. The canonical parse (tolerant repairs off) reuses the Stage-1 machine with
+    // the sequential chooser (run_stage2_base); one global WorkBudget and one shared dead memo
+    // span all bases. The selection outcome is identical to the Round-3 rule: the earliest base
+    // whose completion used only balanced boundaries; else exactly one unbalanced completion;
+    // two or more unbalanced completions reject the region as ambiguous (Stage 3 does not run).
     {
-        // R3-01 selection: the earliest base whose chosen path used only pass-1 (balanced)
-        // boundaries; else the only completed base; two or more completed bases without a
-        // balanced one reject the region as ambiguous (Stage 3 does not run).
-        std::size_t balanced_index = std::size_t(-1);
-        std::size_t only_index     = std::size_t(-1);
-        std::size_t complete_count = 0;
-        for (std::size_t i = 0; i < stage2.size(); ++i) {
-            if (stage2[i].progress.termination != ToolCallRegionTermination::Complete) { continue; }
-            ++complete_count;
-            if (balanced_index == std::size_t(-1) && !stage2[i].progress.stage2_lazy_boundary_used) {
-                balanced_index = i;
+        WorkBudget budget;
+        budget.limit = policy_.stage2_step_budget != 0
+                           ? policy_.stage2_step_budget
+                           : std::max<std::uint64_t>(kStage2WorkMinimum,
+                                                     kStage2WorkPerByte * region_.size());
+        Stage2Context cx{region_, policy_, index, std::move(budget), {}};
+        std::size_t unbalanced_count = 0;
+        std::optional<std::pair<std::size_t, std::vector<ParsedFunctionCall>>> first_unbalanced;
+        bool stage2_exhausted = false;
+        for (const Attempt& attempt : chain) {
+            // N-02: skip a base only when neither family carries a closer at or after it.
+            if (!index.has_close_at_or_after(attempt.base)) { continue; }
+            Stage2Path path;
+            ToolCallParseProgress out;
+            const Stage2Verdict verdict = run_stage2_base(cx, attempt.base, path, out);
+            if (verdict == Stage2Verdict::Exhausted) { stage2_exhausted = true; break; }
+            if (verdict != Stage2Verdict::Complete) { continue; }
+            // Materialize the chosen values: one path entry per parameter, in order.
+            std::size_t k = 0;
+            for (ParsedFunctionCall& call : out.calls) {
+                for (ParsedParameter& p : call.parameters) {
+                    const auto [b, e] = path.values[k++];
+                    p.value.assign(region_.data() + b, e - b);
+                }
             }
-            only_index = i;
+            if (!path.lazy_used) {
+                // Earliest balanced completion: accept it now and return. Later bases are not
+                // searched (the selection rule cannot change once a balanced base stands).
+                result.status  = ToolCallStreamStatus::Complete;
+                result.failure = ToolCallParseFailure::None;
+                result.region.calls = std::move(out.calls);
+                result.truncated_tail             = false;
+                result.markup_tolerant_completion = true;
+                result.tail          = region_.substr(0, attempt.base);
+                return result;
+            }
+            if (++unbalanced_count == 1) {
+                first_unbalanced.emplace(attempt.base, std::move(out.calls));
+            }
         }
-        if (complete_count >= 2 && balanced_index == std::size_t(-1)) {
+        result.stage2_steps = cx.budget.used;
+        if (stage2_exhausted) {
+            result.parse_budget_exhausted = true; // fail closed: nothing from Stage 2 is accepted
+        } else if (unbalanced_count >= 2) {
             result.status  = ToolCallStreamStatus::Invalid;
             result.failure = ToolCallParseFailure::AmbiguousStructure;
             result.tail    = region_;
             return result;
-        }
-        if (complete_count == 1 || balanced_index != std::size_t(-1)) {
-            // Stage 2 accepts: the region was resolved by consistent completion (R3-I7).
-            const std::size_t pick = balanced_index != std::size_t(-1) ? balanced_index : only_index;
+        } else if (unbalanced_count == 1) {
+            // Stage 2 accepts the single unbalanced completion (R3-I7).
             result.status  = ToolCallStreamStatus::Complete;
             result.failure = ToolCallParseFailure::None;
-            result.region.calls = std::move(stage2[pick].progress.calls);
+            result.region.calls = std::move(first_unbalanced->second);
             result.truncated_tail             = false;
             result.markup_tolerant_completion = true;
-            result.tail          = region_.substr(0, stage2[pick].base);
+            result.tail          = region_.substr(0, first_unbalanced->first);
             return result;
         }
     }

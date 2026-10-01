@@ -498,6 +498,7 @@ ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text,
         diagnostics.fallback_reason = failure;
         diagnostics.fenced_markers_suppressed = result.fenced_markers_suppressed;
         diagnostics.ended_in_unclosed_fence   = result.ended_in_unclosed_fence;
+        diagnostics.parse_budget_exhausted      = result.parse_budget_exhausted;
         return fallback(text, diagnostics);
     }
     // R2-I5 (CR5) defense in depth: identity is a property of the output, not a side effect
@@ -563,6 +564,7 @@ ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text,
         ToolCallParseDiagnostics diagnostics;
         diagnostics.marker_seen     = true;
         diagnostics.fallback_reason = FallbackReason::AmbiguousStructure;
+        diagnostics.parse_budget_exhausted = result.parse_budget_exhausted;
         return fallback(text, diagnostics);
     }
 
@@ -573,6 +575,7 @@ ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text,
     out.diagnostics.markup_tolerant_completion = result.markup_tolerant_completion;
     out.diagnostics.fenced_markers_suppressed  = result.fenced_markers_suppressed;
     out.diagnostics.ended_in_unclosed_fence    = result.ended_in_unclosed_fence;
+    out.diagnostics.parse_budget_exhausted   = result.parse_budget_exhausted;
 
     // Generated prose can quote a tool-call marker before the real turn. Bytes before the
     // accepted region (prose plus any failed earlier region) stay ordinary content.
