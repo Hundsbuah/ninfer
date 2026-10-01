@@ -1,9 +1,12 @@
 # Constrained tool decoding — design (Phase 4)
 
-Status: CPU grammar-state core implemented and fully tested; sampling integration behind the
-feature flag `--constrained-tool-decoding` (default `off`); GPU runtime behavior not executed
-(project constraint). This document is the P4.1 deliverable: the sampling data flow as it exists
-in the source, the reference findings, and the design decisions.
+Status: CPU grammar-state core implemented and fully tested. Runtime sampling constraints (logit
+masking) are not implemented in this build: the engine refuses `--constrained-tool-decoding`
+values other than `off` at startup, the wire grammar is not enforced at generation time, and
+malformed native tool syntax can still be generated. The tool-call parser is the post-generation
+consistency boundary, not a generator constraint. This document is the P4.1 deliverable: the
+sampling data flow as it exists in the source (integration points for a future implementation),
+the reference findings, and the design decisions.
 
 ## 1. Current sampling data flow (NInfer source)
 
@@ -233,11 +236,11 @@ hard restriction, not a bias.
 ## 4. Feature flag (P4.11)
 
 `--constrained-tool-decoding off|tool-calls-only` (default `off`), parsed in
-`apps/cli/options.cpp` into `EngineOptions::constrained_tool_decoding`
+`src/serve/serve_options.cpp` into `EngineOptions::constrained_tool_decoding`
 (`include/ninfer/types.h`, `ConstrainedToolDecoding { Off, ToolCallsOnly }`). Naming follows
-the existing kebab-case flag convention. With `off` the sampling path is bit-identical to the
-current behavior (verified: the existing test gates are green with the flag compiled in and
-defaulted off).
+the existing kebab-case flag convention. The engine refuses any value other than `off` at
+startup (before any device work), because the sampling integration is not wired in: accepting
+the mode would claim a constraint the sampling path does not enforce.
 
 ## 5. Verification status (P4.13)
 
@@ -249,11 +252,11 @@ defaulted off).
 | Lazy trigger | tested (partial marker → `NeedMore`; prose never rejects) — the inactive scan is a superset approximation of the parser's pre-latch machine (no fence tracker, no R3-05 rescan; R3-11), not a byte-for-byte mirror |
 | Checkpoint/rollback (P4.8) | tested (value semantics; restore reproduces fresh-state behavior) |
 | Speculative semantics | documented (D7); CPU state semantics tested; GPU runtime flow build-verified only, **not verified** |
-| CUDA integration compiles | the flag, the option, and the constraint core compile into the CUDA build (`ninfer_model_runtime`); the sampling pipeline is unchanged when the flag is off |
+| Sampling integration | **not implemented in this build**: the grammar-state core compiles into `ninfer_model_runtime`, but the sampling pipeline never consults it; the engine refuses the flag at startup (F10) |
 | GPU runtime behavior | **not executed** (project constraint: no GPU runtime tests) |
 | Unconstrained default path | unchanged; the existing parser/grammar/frontend test gates are green |
 
-Remaining uncertainty: the runtime correctness of the host mask + device −inf pass and of the
-correction-token flow under real sampling requires a GPU runtime environment; that
-verification is the documented follow-up gated on GPU access (the feature stays `off` by
-default until then).
+Remaining uncertainty: the sampling integration (host allowed-set mask, device -inf pass,
+correction-token flow) is a documented follow-up requiring a GPU runtime environment to
+verify. Until it lands, `off` is the only accepted value and the tool-call parser is the sole
+consistency boundary for the tool wire syntax.

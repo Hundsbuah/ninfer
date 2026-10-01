@@ -157,8 +157,9 @@ it.
 Status in this build: `tool-calls-only` is not implemented. The CPU grammar-state core is
 implemented and tested (it tracks the marker trigger, advances on decoded bytes, and
 re-validates the open region with the same strict parser in prefix mode), but the sampling
-integration and its GPU verification are not part of the delivered scope. Selecting
-`tool-calls-only` therefore fails at engine startup — before any device work, on the CLI
+integration and its GPU verification are not part of the delivered scope, so malformed native tool
+syntax can still be generated: the parser is the post-generation consistency boundary, not a
+generator constraint. Selecting
 and the server alike — with
 `--constrained-tool-decoding=tool-calls-only is not implemented in this build; use off`;
 `off` is accepted and leaves the sampling path bit-identical. The design and the

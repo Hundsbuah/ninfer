@@ -271,12 +271,17 @@ followed by a line break or the end of the turn, so a marker the model quotes wh
 by a space, punctuation or an escaped `
 `) stays in the reasoning channel.
 
-By default the parser keeps that all-or-nothing behaviour. With `--tolerant-tool-calls` the server
-recovers a call instead when the model adds a suffix after a complete call, a second call is
-malformed, a single final call is cut by the output budget before its closing tags, or the closing
-bracket after the function name is missing: the recovered call is reported structurally with a
-`truncated_tail` diagnostic (logged at Info severity) rather than demoted to text, and an
-undeclared tool name stays structured for the consumer to judge.
+By default the parser keeps that all-or-nothing behaviour. Strict and tolerant parsing run the same
+Stage-2 consistent-completion pass; tolerant mode only changes what a syntax break or a cut-off tail
+may commit, and it never authorizes a tool name outside the declared tools — an undeclared call is a
+break in both modes and is never returned as a structured call. With `--tolerant-tool-calls` a
+complete, function-closed call before a malformed tail is recovered when the recovery policy proves
+it independent of the missing bytes: a suffix after a complete call, a malformed second call, or a
+missing closing bracket after the function name. `StopString`, `OutputLimit`, `ContextCapacity`, and
+`Cancelled` are deliberate cuts: after one, only a completion that is clean on its own commits, and a
+broken tail leaves the region as text. A natural stop (`StopToken`, or no reported reason) may commit
+a function-closed final call cut before its wrapper close, reported with a `truncated_tail`
+diagnostic (logged at Info severity) rather than demoted to text.
 
 Messages enter the selected template in their input order. The maintained Qwen templates keep
 system/developer messages at their original positions. A final assistant message is an assistant
@@ -968,7 +973,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--long-anchor-spacing N` | original: minimum token gap between automatic long anchors, doubling per anchor walking back from the prompt end (anchor k sits at least `N * 2^k` tokens below the previous grid point), so short tool-loop turns do not each cost an anchor and deep history stays covered; `0` anchors every one of the last N message boundaries | `1024` |
 | `--no-thinking` | disable thinking by default | thinking on |
 | `--preserve-thinking` | preserve closed-turn assistant reasoning by default | off |
-| `--tolerant-tool-calls` | recover complete tool calls cut by a malformed wrapper, a trailing suffix or the output budget instead of demoting them to text | off |
+| `--tolerant-tool-calls` | keep function-closed Qwen calls before a cut-off or malformed tail when the recovery policy proves them independent of the missing bytes; never an open value, and an undeclared tool/name is never returned as a call | off |
 | `--cors` | permissive browser CORS headers | off |
 | `--usage-chunk-choice` | give the streamed usage chunk a zero-delta choice, for strict client parsers that reject the OpenAI-conformant empty `choices` array | off |
 | `--temperature F` | process-level temperature override | unset |
@@ -1075,14 +1080,16 @@ unspecified. `enable_thinking` records whether the response starts in thinking m
 
 `request_done.result.tool_call_parse` records whether a complete marker was seen, the structured
 call count, empty non-string arguments omitted during normalization, schema-mismatched arguments
-preserved for consumer validation, `duplicate_parameters_repaired`, and a stable fallback reason.
-A parameter named more than once in one call keeps its last value, as in JSON object syntax, and
-counts once in `duplicate_parameters_repaired` for each repeat instead of demoting the call to text.
-Fallback reasons are `none`, `malformed_structure`, `invalid_tool_name`, `undeclared_tool`,
-`trailing_content`, and `truncated_tail`. `truncated_tail` occurs only with `--tolerant-tool-calls`:
-with a nonzero `structured_call_count` the recovered calls were returned structurally (a discarded
-suffix or a call cut at the region end), and with none the region was returned as text. These
-counters contain no tool arguments or generated text.
+preserved for consumer validation, repaired duplicate parameters, `markup_tolerant_completion` (a
+Stage-2 completion repaired broken markup), `fenced_markers_suppressed` (complete markers
+suppressed by a recognized code fence), `ended_in_unclosed_fence` (the stream ended inside an
+unclosed fence), `parse_budget_exhausted` (a Stage-2 work-budget exhaustion), and a stable fallback
+reason. A parameter named more than once in one call keeps its last value, as in JSON object syntax,
+and counts once in `duplicate_parameters_repaired` for each repeat instead of demoting the call to
+text. Fallback reasons are `none`, `malformed_structure`, `invalid_tool_name`, `undeclared_tool`,
+`trailing_content`, `truncated_tail`, and `ambiguous_structure` (a Stage-2 region with two or more
+unbalanced completions, or a declared call carrying a synthetic argument). These counters contain no
+tool arguments or generated text.
 
 `request_done.timings_seconds` contains `prepare`, `ttft`, `vision`, `prefill`, `decode`, and `total`
 as full-precision JSON numbers. Its `speculative` object contains `backend`, `draft_window`, `rounds`,
