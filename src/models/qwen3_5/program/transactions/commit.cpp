@@ -143,6 +143,11 @@ StartResult ProgramImpl::start_request(MaterializationTransaction& transaction) 
         return StartResult{.sequence = handle};
     } catch (...) {
         if (destination && *destination < max_concurrency) {
+            // Startup may have queued uploads, a restore or a fork before a later check failed.
+            // Complete them before the lane's buffers, pages and execution row return to the pools.
+            try {
+                device.synchronize();
+            } catch (...) {}
             const std::uint32_t lane = *destination;
             if (active_continuations[lane] < continuation_capacity) {
                 clear_lane_best_effort(active_sequence(lane), requests[lane]);
@@ -768,6 +773,10 @@ AbortResult ProgramImpl::abort(SequenceHandle sequence) noexcept {
     }
     SequenceState& state = active_sequence(lane);
     const std::uint32_t continuation_index = active_continuations[lane];
+    // A non-final prefill step returns without waiting, so a cancellation can arrive with the
+    // lane's chunk, uploads or initialization still queued. Settle them before the lane's buffers,
+    // pages and execution row return to the pools or move into the prefix cache.
+    device.synchronize();
     if (hybrid_) {
         // The committed state is publishable as an endpoint when no model unit is in flight.
         out.timings     = request.timings;
