@@ -7,10 +7,12 @@
 #include <spdlog/logger.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <iomanip>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <utility>
 
 namespace ninfer::serve {
@@ -330,6 +332,25 @@ OperationalRecord render_request_done(const RequestLogContext& context,
 std::optional<OperationalRecord> render_tool_call_fallback(const RequestLogContext& context,
                                                            const GenerationOutcome& outcome) {
     const ninfer::ToolCallParseFallbackReason reason = outcome.tool_call_parse.fallback_reason;
+    // A fence that latched no marker and suppressed complete ones explains markup-less text that
+    // would otherwise look like a plain request: record the suppression without the region.
+    if (!outcome.tool_call_parse.marker_seen && outcome.tool_calls.empty() &&
+        outcome.tool_call_parse.ended_in_unclosed_fence &&
+        outcome.tool_call_parse.fenced_markers_suppressed > 0) {
+        std::string message = "req#" + std::to_string(context.id) +
+                              " tool-call fence left unclosed | fenced_markers_suppressed=" +
+                              std::to_string(outcome.tool_call_parse.fenced_markers_suppressed);
+        if (const std::size_t fence = outcome.text.find("```"); fence != std::string::npos) {
+            const std::size_t limit = std::min(fence + 80, outcome.text.size());
+            std::string snippet = outcome.text.substr(fence, limit - fence);
+            for (char& byte : snippet) {
+                if (byte == '\n' || byte == '\r' || byte == '\t') { byte = ' '; }
+            }
+            message += " | " + snippet;
+        }
+        return OperationalRecord{.severity = OperationalSeverity::Warning,
+                                 .message  = std::move(message)};
+    }
     if (!outcome.tool_call_parse.marker_seen ||
         reason == ninfer::ToolCallParseFallbackReason::None) {
         return std::nullopt;
@@ -348,24 +369,42 @@ std::optional<OperationalRecord> render_tool_call_fallback(const RequestLogConte
                         pretty_code(ninfer::tool_call_parse_fallback_reason_name(reason)),
         };
     }
-    // The reason names the verdict; a bounded, single-line snippet of the returned markup shows
-    // what earned it. Text before the first marker never appears.
+    // The reason names the verdict; the fence and budget parts carry the structural diagnostics;
+    // a bounded, single-line snippet of the returned markup shows what earned the verdict. Text
+    // before the first marker (in any marker family) never appears.
     constexpr std::size_t kMarkupSnippetBytes = 240;
+    std::string message = "req#" + std::to_string(context.id) + " tool markup returned as text | " +
+                          pretty_code(ninfer::tool_call_parse_fallback_reason_name(reason));
+    if (outcome.tool_call_parse.fenced_markers_suppressed > 0 &&
+        outcome.tool_call_parse.ended_in_unclosed_fence) {
+        message += " | fenced_markers_suppressed=" +
+                   std::to_string(outcome.tool_call_parse.fenced_markers_suppressed);
+    }
+    if (outcome.tool_call_parse.parse_budget_exhausted) {
+        message += " | parse budget exhausted";
+    }
+    const std::array<std::string_view, 4> kMarkerFamilies = {"<tool_call>", "<function_calls>",
+                                                             "<function=", "<invoke "};
     std::string snippet;
-    if (const std::size_t marker = outcome.text.find("<tool_call>");
-        marker != std::string::npos) {
-        snippet = outcome.text.substr(marker, kMarkupSnippetBytes);
+    std::size_t marker = std::string::npos;
+    for (const std::string_view family : kMarkerFamilies) {
+        const std::size_t found = outcome.text.find(family);
+        if (found != std::string::npos && (marker == std::string::npos || found < marker)) {
+            marker = found;
+        }
+    }
+    if (marker != std::string::npos) {
+        const std::size_t limit = std::min(marker + kMarkupSnippetBytes, outcome.text.size());
+        snippet = outcome.text.substr(marker, limit - marker);
         if (outcome.text.size() - marker > kMarkupSnippetBytes) { snippet += "..."; }
         for (char& byte : snippet) {
             if (byte == '\n' || byte == '\r' || byte == '\t') { byte = ' '; }
         }
     }
-
+    message += snippet.empty() ? std::string{} : " | " + snippet;
     return OperationalRecord{
         .severity = OperationalSeverity::Warning,
-        .message  = "req#" + std::to_string(context.id) + " tool markup returned as text | " +
-                   pretty_code(ninfer::tool_call_parse_fallback_reason_name(reason)) +
-                   (snippet.empty() ? std::string{} : " | " + snippet),
+        .message  = std::move(message),
     };
 }
 

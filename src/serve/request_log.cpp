@@ -99,6 +99,10 @@ Json tool_call_parse_json(const ninfer::ToolCallParseDiagnostics& diagnostics) {
                 {"empty_arguments_omitted", diagnostics.empty_arguments_omitted},
                 {"schema_mismatch_arguments", diagnostics.schema_mismatch_arguments},
                 {"duplicate_parameters_repaired", diagnostics.duplicate_parameters_repaired},
+                {"markup_tolerant_completion", diagnostics.markup_tolerant_completion},
+                {"fenced_markers_suppressed", diagnostics.fenced_markers_suppressed},
+                {"ended_in_unclosed_fence", diagnostics.ended_in_unclosed_fence},
+                {"parse_budget_exhausted", diagnostics.parse_budget_exhausted},
                 {"fallback_reason",
                  ninfer::tool_call_parse_fallback_reason_name(diagnostics.fallback_reason)}};
 }
