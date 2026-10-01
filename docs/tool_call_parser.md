@@ -109,7 +109,7 @@ ContextCapacity, Cancelled), a definitive break leaves nothing committable behin
 region with a suffix or trailing content is returned as text and only a region whose
 completion is clean is committed. A name-only
 truncation (no closed parameter and no function close) still falls back to text.
-undeclared name is a break in tolerant mode as in strict mode: identity is not a syntax
+An undeclared name is a break in tolerant mode as in strict mode: identity is not a syntax
 issue that tolerance repairs, so an undeclared call is never emitted in either mode
 (`UndeclaredTool`). The empty `<function_calls>` wrapper is unrecoverable in both modes;
 a `<function_calls>` region holds a sequence of calls (another call may follow any function
@@ -133,17 +133,19 @@ Inside a `<tool_call>` wrapper the rule is stricter: a `</parameter>` followed b
 the function close.
 
 When the first (greedy) boundary choice leads the region into a definitive structural break, the
-parser re-parses it with a consistent completion (Stage 2): an open value is closed at a
-boundary that stays balanced against nested openers of the same parameter family — an unbalanced
-candidate (it would leave a nested opener unmatched) is discarded — and the first completion
-that parses cleanly becomes the structured turn; a candidate that terminates in EndOfInput
-leaves the region's result as EndOfInput, never Complete. Two or more Stage-2 bases that
-complete the region with unbalanced boundaries make it ambiguous
+parser re-parses it with a consistent completion (Stage 2): pass 1 tries only the closers that are
+balanced against nested openers of the same parameter family; only when no pass-1 candidate stands
+does pass 2 try every closer of the family in order, and a standing pass-2 boundary marks the
+completion as unbalanced. The earliest base whose completion is balanced wins; otherwise a single
+completion wins; two or more unbalanced completions make the region ambiguous
 (`ambiguous_structure`), as does a call of a declared tool that carries a synthetic argument
 (a repeated parameter name, or a non-declared name outside the first parameter of a tool with
-an unambiguous declared schema). The residual ambiguity is documented in the Round-3 spec §9;
-notably, a bare (unwrapped) call whose open value contains a complete example, ended by a
-natural stop, commits the example as the turn (R3-04).
+an unambiguous declared schema). Stage 2 is bounded by a deterministic work budget (four units
+per region byte, at least 100 000); a region that exhausts it is returned as text and records
+`parse_budget_exhausted`. The residual ambiguity is documented in the Round-3 spec §9: a bare
+(unwrapped) call whose open value contains a complete example, ended by a natural stop, commits
+the example as the turn (R3-04), and a degenerate output made only of prose and unfenced complete
+examples commits its last example in strict mode.
 
 ## Constrained tool decoding
 
@@ -181,6 +183,8 @@ acceptance gate for the sampling integration are documented in
 - `fenced_markers_suppressed` / `ended_in_unclosed_fence`: complete markers a recognized code
   fence suppressed (pre-latch and retry), and whether the pre-latch stream ended inside an
   unclosed fence.
+- `parse_budget_exhausted`: the Stage-2 work budget was exhausted and the region was returned
+  as text.
 - `duplicate_parameters_repaired`: counts repeated parameter names in one call of a tool the
   contract does not declare (the last value wins, as in JSON object syntax); the count is
   exposed for diagnostics.

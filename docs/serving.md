@@ -273,23 +273,26 @@ the parser re-parses the region with a consistent completion (Stage 2): an open 
 a boundary that stays balanced against nested openers of the same parameter family, and the first
 such completion that parses cleanly becomes the structured turn, so a quoted example that closes its
 own structure and then continues as prose is preserved byte-exact as the outer parameter's value.
+Stage 2 is bounded by a deterministic work budget (four units per region byte, at least 100 000);
+a region that exhausts it is returned as text and records `parse_budget_exhausted`.
 A region that fails both stages is ordinary content. Later content is still examined: retry entries
 skip markers inside a recognized code fence, and the first region that parses in either stage becomes
 the structured turn. Generated reasoning closes only at a `</think>` followed by a line break or the
 end of the turn, so a marker the model quotes while reasoning (followed by a space, punctuation or
 an escaped `\n`) stays in the reasoning channel.
 
-By default the parser keeps that all-or-nothing behaviour. With `--tolerant-tool-calls` a region that
-fails the strict structure rules still produces structured calls when the completion is decisive — a
-suffix after a complete call, a broken region after complete calls, or a region completed by Stage 2
-— and the recovery decision depends on the finish reason: after a natural stop (`StopToken`, or no
-reported reason), the committed calls may be followed by trailing prose; after a cut
-(`OutputLimit`, `StopString`, `ContextCapacity`, `Cancelled`), a definitive break leaves nothing
-committable behind it, so a region with trailing content is returned as text and only a region whose
-completion is clean is committed. An undeclared tool name is never recovered, and a call of a
-declared tool with a repeated parameter name, or a non-declared name outside the first parameter of
-a tool with an unambiguous declared schema, is returned as text with the `ambiguous_structure`
-reason.
+By default the parser keeps that all-or-nothing behaviour. The consistent completion (Stage 2)
+is part of both modes. With `--tolerant-tool-calls`, a region that neither stage accepts may
+still return the calls whose function close was consumed, with the `truncated_tail` reason:
+the output ending inside the region (a cut next call, parameter or wrapper close) returns the
+function-closed calls before the cut, whatever the finish reason; a region that breaks on a
+malformed token or on trailing text returns calls without parameters, and calls with parameters
+only after a natural stop (`StopToken`, or no reported reason) and only when the remaining text
+contains no `</parameter>` or `</param>` closer that could still belong to a value; after a cut
+(`StopString`, `OutputLimit`, `ContextCapacity`, `Cancelled`) such a region is returned as text.
+A call whose function close is missing, an undeclared tool name, and a call of a declared tool
+with a repeated parameter name or (when its declared schema is unambiguous) with a non-declared
+name after its first parameter are never returned as calls.
 Messages enter the selected template in their input order. The maintained Qwen templates keep
 system/developer messages at their original positions. A final assistant message is an assistant
 prefill: generation continues that turn in place instead of opening a new assistant turn. Because
@@ -1089,7 +1092,9 @@ call count, empty non-string arguments omitted during normalization, schema-mism
 preserved for consumer validation, `duplicate_parameters_repaired`, and a stable fallback reason.
 The diagnostics also include `markup_tolerant_completion` (the region was resolved by the
 Stage-2 consistent completion instead of the greedy parse), `fenced_markers_suppressed`
-(complete markers a recognized code fence suppressed) and `ended_in_unclosed_fence`. Fallback
+(complete markers a recognized code fence suppressed), `ended_in_unclosed_fence`, and
+`parse_budget_exhausted` (the Stage-2 work budget was exhausted and the region was returned
+as text). Fallback
 reasons are `none`, `malformed_structure`, `invalid_tool_name`, `undeclared_tool`,
 `trailing_content`, `truncated_tail`, and `ambiguous_structure`. A call of a declared tool with a
 repeated parameter name, or with a non-declared name outside its first parameter when the declared
