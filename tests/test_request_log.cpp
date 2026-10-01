@@ -534,27 +534,32 @@ int main() {
     normalized_tool_outcome.tool_calls.push_back(
         ninfer::GeneratedToolCall{.name = "Edit", .arguments_json = R"({"file_path":"x"})"});
     normalized_tool_outcome.tool_call_parse = {
-        .marker_seen               = true,
-        .structured_call_count     = 1,
-        .empty_arguments_omitted   = 1,
-        .schema_mismatch_arguments = 2,
-        .fallback_reason           = ninfer::ToolCallParseFallbackReason::None,
+        .marker_seen                   = true,
+        .structured_call_count         = 2,
+        .empty_arguments_omitted       = 1,
+        .schema_mismatch_arguments     = 3,
+        .duplicate_parameters_repaired = 4,
+        .markup_tolerant_completion    = true,
+        .fenced_markers_suppressed     = 5,
+        .ended_in_unclosed_fence       = true,
+        .parse_budget_exhausted        = true,
+        .fallback_reason               = ninfer::ToolCallParseFallbackReason::TrailingContent,
     };
     const Json normalized_tool_done =
         Json::parse(format_request_done_json("serve-test", 3002, context, normalized_tool_outcome));
-    failures += check(
-        normalized_tool_done.at("result").at("tool_call_count") == 1 &&
-            normalized_tool_done.at("result").at("tool_call_parse").at("structured_call_count") ==
-                1 &&
-            normalized_tool_done.at("result").at("tool_call_parse").at("empty_arguments_omitted") ==
-                1 &&
-            normalized_tool_done.at("result")
-                    .at("tool_call_parse")
-                    .at("schema_mismatch_arguments") == 2 &&
-            normalized_tool_done.at("result").at("tool_call_parse").at("fallback_reason") ==
-                "none" &&
-            !render_tool_call_fallback(context, normalized_tool_outcome),
-        "successful tool-call normalization diagnostics are incomplete or noisy");
+    const Json norm_parse = normalized_tool_done.at("result").at("tool_call_parse");
+    failures += check(normalized_tool_done.at("result").at("tool_call_count") == 1 &&
+                          norm_parse.at("marker_seen") == true &&
+                          norm_parse.at("structured_call_count") == 2 &&
+                          norm_parse.at("empty_arguments_omitted") == 1 &&
+                          norm_parse.at("schema_mismatch_arguments") == 3 &&
+                          norm_parse.at("duplicate_parameters_repaired") == 4 &&
+                          norm_parse.at("markup_tolerant_completion") == true &&
+                          norm_parse.at("fenced_markers_suppressed") == 5 &&
+                          norm_parse.at("ended_in_unclosed_fence") == true &&
+                          norm_parse.at("parse_budget_exhausted") == true &&
+                          norm_parse.at("fallback_reason") == "trailing_content",
+                      "tool-call parse diagnostics are incomplete or renamed in JSONL");
 
     GenerationOutcome fallback_outcome = outcome;
     fallback_outcome.tool_call_parse   = {
@@ -591,6 +596,63 @@ int main() {
                           snippet_warning->message.find("sentinel-answer-text") ==
                               std::string::npos,
                       "tool-call fallback snippet is unbounded, multi-line or leaks prior text");
+
+    // R5-04: the fence part and budget part in the text-fallback warning.
+    GenerationOutcome fence_outcome = outcome;
+    fence_outcome.tool_call_parse = {
+        .marker_seen               = true,
+        .structured_call_count     = 0,
+        .fenced_markers_suppressed = 2,
+        .ended_in_unclosed_fence   = true,
+        .fallback_reason           = ninfer::ToolCallParseFallbackReason::TrailingContent,
+    };
+    fence_outcome.text = "";
+    const std::optional<OperationalRecord> fence_rec =
+        render_tool_call_fallback(context, fence_outcome);
+    failures += check(fence_rec && fence_rec->message ==
+                          "req#7 tool markup returned as text | trailing content | "
+                          "fenced_markers_suppressed=2",
+                      "R5-04: the fence part precedes the snippet in the warning");
+    // No marker seen, no calls, unclosed fence: the separate fence warning.
+    GenerationOutcome no_marker_outcome = outcome;
+    no_marker_outcome.tool_call_parse = {
+        .marker_seen               = false,
+        .structured_call_count     = 0,
+        .fenced_markers_suppressed = 2,
+        .ended_in_unclosed_fence   = true,
+        .fallback_reason           = ninfer::ToolCallParseFallbackReason::None,
+    };
+    no_marker_outcome.text = "```xml\n<tool_call>\n";
+    const std::optional<OperationalRecord> unclosed_rec =
+        render_tool_call_fallback(context, no_marker_outcome);
+    failures += check(unclosed_rec &&
+                          unclosed_rec->severity == OperationalSeverity::Warning &&
+                          unclosed_rec->message.find("tool-call fence left unclosed") !=
+                              std::string::npos &&
+                          unclosed_rec->message.find("fenced_markers_suppressed=2") !=
+                              std::string::npos,
+                      "R5-04: the no-marker unclosed fence warning is emitted");
+    // parse_budget_exhausted adds the budget part after the fence part.
+    fence_outcome.tool_call_parse.parse_budget_exhausted = true;
+    const std::optional<OperationalRecord> budget_rec =
+        render_tool_call_fallback(context, fence_outcome);
+    failures += check(budget_rec && budget_rec->message ==
+                          "req#7 tool markup returned as text | trailing content | "
+                          "fenced_markers_suppressed=2 | parse budget exhausted",
+                      "R5-04: the budget part follows the fence part");
+    // The snippet starts at the first marker of any Qwen marker family, not only <tool_call>.
+    GenerationOutcome family_outcome = outcome;
+    family_outcome.tool_call_parse = {
+        .marker_seen               = true,
+        .structured_call_count     = 0,
+        .fallback_reason           = ninfer::ToolCallParseFallbackReason::MalformedStructure,
+    };
+    family_outcome.text = "intro text\n<function=bash>\n<parameter=command>\ncut";
+    const std::optional<OperationalRecord> family_rec =
+        render_tool_call_fallback(context, family_outcome);
+    failures += check(family_rec &&
+                          family_rec->message.find(" | <function=bash> ") != std::string::npos,
+                      "R5-04: the snippet must start at the first marker of any marker family");
 
     const Json error =
         Json::parse(format_request_error_json("serve-test", 4000, context, "generation failed"));

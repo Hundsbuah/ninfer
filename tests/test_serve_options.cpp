@@ -719,6 +719,15 @@ int main() {
               "serve help omits external context-cost presets");
     failures += check(serve_usage_text("ninfer-serve").find("metadata.name") != std::string::npos,
                       "serve help omits the artifact-derived model id default");
+    const std::string tolerant_help = serve_usage_text("ninfer-serve");
+    failures += check(tolerant_help.find("never an open value") != std::string::npos &&
+                          tolerant_help.find("undeclared tool/name is never returned as a call") !=
+                              std::string::npos,
+                      "R5-05: the tolerant-tool-calls help must state the open-value and "
+                      "undeclared-tool policy");
+    failures += check(tolerant_help.find("keep a final call cut by the output") ==
+                          std::string::npos,
+                      "R5-05: the help must not claim an output-budget cut keeps a call");
 
     const ServeOptions inherited = parse(
         {"ninfer-serve", "model.ninfer", "--max-context", "16384", "--use-original-prefix-caching"});
