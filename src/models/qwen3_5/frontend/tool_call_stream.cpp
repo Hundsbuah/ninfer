@@ -1233,6 +1233,13 @@ ToolCallStreamResult ToolCallStreamParser::finish(FinishReason finish_reason) co
         }
         chain.push_back(Attempt{base, std::move(progress)});
         const Attempt& last = chain.back();
+        // R7-01: the initially latched marker is the only admissible tool entry under
+        // RequireToolAtContentStart. Any later base would make region_[0:base] visible
+        // Content before the accepted call, so a later entry base never enters the chain;
+        // Stage 2 and Stage 3 then operate on the initial entry only. The base-0 attempt
+        // is the latched entry even when the region starts with held formatting whitespace,
+        // so the cutoff is structural (no numeric base comparison).
+        if (policy_.intent == ToolCallIntentPolicy::RequireToolAtContentStart) { break; }
         // R3-02: a prose break directly after an open wrapper owns no scope (the retry may
         // re-read from the break offset). R2-I1/R3-04: a wrapper that failed while parsing
         // a function header owns its scope; an open value keeps its payload after a cut
