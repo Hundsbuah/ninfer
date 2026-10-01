@@ -3874,6 +3874,87 @@ int test_round4_same_family_balance() {
     return failures;
 }
 
+int test_round4_fence_diagnostics_scope() {
+    using ninfer::FinishReason;
+    using ninfer::ToolCallParseFallbackReason;
+    Json write_props = Json::object();
+    write_props["path"]    = Json{{"type", "string"}};
+    write_props["content"] = Json{{"type", "string"}};
+    Json read_props = Json::object();
+    read_props["path"] = Json{{"type", "string"}};
+    Json bash_props = Json::object();
+    bash_props["command"] = Json{{"type", "string"}};
+    const std::vector<std::string> definitions = {tool_definition("write", write_props),
+                                                  tool_definition("read", read_props),
+                                                  tool_definition("bash", bash_props)};
+    const auto shared = contract_from_definitions(definitions);
+    int failures = 0;
+    // N6d: a closed fence before a call -> accepted, both fence fields 0/false.
+    {
+        const std::string text = "Run this:\n```bash\nls\n```\n" + tool_call("bash", {{"command", "ls"}});
+        const auto o = fi::parse_qwen_tool_call_output(text, 64, *shared, false, FinishReason::StopToken);
+        failures += check(o.is_tool_call_response && o.tool_calls.size() == 1 &&
+                              o.tool_calls[0].name == "bash" &&
+                              o.diagnostics.fenced_markers_suppressed == 0 &&
+                              !o.diagnostics.ended_in_unclosed_fence,
+                          "N6d: a closed fence before a call is accepted, fence 0/false");
+        failures += stream_matches_one_shot(text, shared, false, FinishReason::StopToken, "N6d streaming");
+    }
+    // N6a: a write content with a python fence -> accepted, fence 0/false.
+    {
+        const std::string text = tool_call("write", {{"path", "a.md"}, {"content", "```python\nprint(1)"}});
+        const auto o = fi::parse_qwen_tool_call_output(text, 64, *shared, false, FinishReason::StopToken);
+        failures += check(o.is_tool_call_response && o.tool_calls.size() == 1 &&
+                              o.tool_calls[0].name == "write" &&
+                              o.diagnostics.fenced_markers_suppressed == 0 &&
+                              !o.diagnostics.ended_in_unclosed_fence,
+                          "N6a: an accepted write with a python fence, fence 0/false");
+        failures += stream_matches_one_shot(text, shared, false, FinishReason::StopToken, "N6a streaming");
+    }
+    // N6b: a write content with a fenced read example -> accepted, fence 0/false.
+    {
+        const std::string content = "Ex:\n```xml\n" + tool_call("read", {{"path", "foo.cpp"}}) + "\n```\nmore";
+        const std::string text = tool_call("write", {{"path", "a.md"}, {"content", content}});
+        const auto o = fi::parse_qwen_tool_call_output(text, 64, *shared, false, FinishReason::StopToken);
+        failures += check(o.is_tool_call_response && o.tool_calls.size() == 1 &&
+                              o.tool_calls[0].name == "write" &&
+                              o.diagnostics.fenced_markers_suppressed == 0 &&
+                              !o.diagnostics.ended_in_unclosed_fence,
+                          "N6b: an accepted write with a fenced example, fence 0/false");
+        failures += stream_matches_one_shot(text, shared, false, FinishReason::StopToken, "N6b streaming");
+    }
+    // N6c: rejected, strict, OutputLimit -> text, malformed_structure, fence 2/true.
+    {
+        const std::string text = "<function=read>\n<parameter=path>\nx\n```xml\n" +
+                                 tool_call("bash", {{"command", "ls"}}) + "\n";
+        const auto o = fi::parse_qwen_tool_call_output(text, 64, *shared, false, FinishReason::OutputLimit);
+        failures += check(!o.is_tool_call_response && o.tool_calls.empty() &&
+                              o.diagnostics.fallback_reason == ToolCallParseFallbackReason::MalformedStructure &&
+                              o.diagnostics.fenced_markers_suppressed == 2 &&
+                              o.diagnostics.ended_in_unclosed_fence,
+                          "N6c: a rejected region with an unclosed fence, fence 2/true");
+        failures += stream_matches_one_shot(text, shared, false, FinishReason::OutputLimit, "N6c streaming");
+    }
+    // Round-3 S3 (no latch): unchanged (fence 2/true).
+    {
+        const std::string text = "Here is code:\n```python\nprint(1)\n\n" +
+                                 tool_call("write", {{"path", "d.md"}, {"content", "Doc"}});
+        const auto o = fi::parse_qwen_tool_call_output(text, 64, *shared, false, FinishReason::StopToken);
+        failures += check(!o.is_tool_call_response && o.tool_calls.empty() &&
+                              o.diagnostics.ended_in_unclosed_fence &&
+                              o.diagnostics.fenced_markers_suppressed == 2,
+                          "R3 S3: the no-latch unclosed fence is unchanged (fence 2/true)");
+    }
+    // N-08 reproducer: reports ended_in_unclosed_fence == false.
+    {
+        const std::string text = std::string("```\nx\n```  \r\n") + tool_call("bash", {{"command", "ls"}});
+        const auto o = fi::parse_qwen_tool_call_output(text, 64, *shared, false, FinishReason::StopToken);
+        failures += check(o.is_tool_call_response && !o.diagnostics.ended_in_unclosed_fence,
+                          "N-08: the N-08 reproducer reports ended_in_unclosed_fence == false");
+    }
+    return failures;
+}
+
 
 int main() {
     int failures = 0;
@@ -3946,6 +4027,7 @@ int main() {
     failures += test_round4_work_bounds();
     failures += test_round4_param_family_stage2();
     failures += test_round4_same_family_balance();
+    failures += test_round4_fence_diagnostics_scope();
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }

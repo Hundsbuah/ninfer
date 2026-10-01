@@ -564,6 +564,8 @@ ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text,
         ToolCallParseDiagnostics diagnostics;
         diagnostics.marker_seen     = true;
         diagnostics.fallback_reason = FallbackReason::AmbiguousStructure;
+        diagnostics.fenced_markers_suppressed = result.fenced_markers_suppressed; // N-06 item 3
+        diagnostics.ended_in_unclosed_fence   = result.ended_in_unclosed_fence;     // N-06 item 3
         diagnostics.parse_budget_exhausted = result.parse_budget_exhausted;
         return fallback(text, diagnostics);
     }
@@ -614,8 +616,12 @@ ToolCallOutputDecoder::Terminal ToolCallOutputDecoder::finish(FinishReason finis
                                                               *contract_, tolerant_, finish_reason);
     // R3-06: the entry re-parse sees only the region; the pre-latch fence diagnostic comes
     // from this machine (the same pre-latch bytes, deterministic over the byte stream).
-    const FenceDiagnostics pre_fence = compute_fence_diagnostics(
+    // N-06: apply the same latch rule as the one-shot entry — a latch only happens outside a
+    // fence, so the pre-latch stream cannot end inside one; force its unclosed-fence flag to
+    // false when latched so streaming stays equal to one-shot.
+    FenceDiagnostics pre_fence = compute_fence_diagnostics(
         machine_.content_prefix() + machine_.held_tail(), std::string_view{});
+    if (machine_.latched()) { pre_fence.ended_in_unclosed_fence = false; }
     parsed.diagnostics.fenced_markers_suppressed += pre_fence.suppressed_markers;
     parsed.diagnostics.ended_in_unclosed_fence   |= pre_fence.ended_in_unclosed_fence;
     if (machine_.latched() && parsed.is_tool_call_response) {

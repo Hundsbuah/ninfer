@@ -1017,9 +1017,22 @@ std::string ToolCallStreamParser::feed(std::string_view chunk) {
     for (std::size_t i = 0; i < chunk.size(); ++i) {
         const char byte = chunk[i];
         if (fence_.consume(byte) == FenceTracker::Verdict::Content) {
+            // N-08: a fence Content byte that is format whitespace is held instead of
+            // published, so the streamed output equals the one-shot entry (which rtrims the
+            // whitespace before an accepted region). The fence tracker's verdicts are
+            // unchanged; only the publication timing of whitespace changes.
+            if (is_tool_format_whitespace(byte)) {
+                if (!marker_prefix_.empty()) {
+                    publish(pending_ws_, visible);
+                    pending_ws_.clear();
+                    publish(marker_prefix_, visible);
+                    marker_prefix_.clear();
+                }
+                pending_ws_.push_back(byte); // held like any other whitespace: may precede a latch
+                continue;
+            }
             // R2-I6 (CR6): a fence byte is ordinary content and cannot continue a top-level
-            // marker (a marker is single-line and the newline that bounds a fence line has
-            // already broken any held candidate). Publish the held bytes as content.
+            // marker. Publish the held bytes as content.
             publish(pending_ws_, visible);
             pending_ws_.clear();
             publish(marker_prefix_, visible);
@@ -1094,13 +1107,22 @@ ToolCallStreamResult ToolCallStreamParser::finish(FinishReason finish_reason) co
     ToolCallStreamResult result;
     result.marker_seen  = marker_seen_;
     result.rescan_steps = rescan_steps_;
-    // R3-06: deterministic fence scan over the pre-latch bytes and the latched region (the
-    // same bytes in one-shot and streaming): suppressed markers and the unclosed-fence flag.
+    // N-06: the pre-latch part is always computed. When a marker latched, the pre-latch
+    // stream ends outside a fence (a latch only happens outside a fence), so its
+    // unclosed-fence flag is false and its suppressed-marker count is unaffected. The region
+    // part is added only on the paths that return the region as text (Stage-2 ambiguity and
+    // the final reject), so accepting paths no longer scan the accepted call's values.
     const std::string pre_latch = content_ + pending_ws_ + marker_prefix_;
-    const FenceDiagnostics fence_diag =
-        compute_fence_diagnostics(pre_latch, latched_ ? region_ : std::string_view{});
+    FenceDiagnostics fence_diag = compute_fence_diagnostics(pre_latch, std::string_view{});
+    if (latched_) { fence_diag.ended_in_unclosed_fence = false; }
     result.fenced_markers_suppressed = fence_diag.suppressed_markers;
     result.ended_in_unclosed_fence   = fence_diag.ended_in_unclosed_fence;
+    auto add_region_fence_part = [&result, this]() {
+        const FenceDiagnostics region_diag = compute_fence_diagnostics(std::string_view{}, region_);
+        result.fenced_markers_suppressed += region_diag.suppressed_markers;
+        result.ended_in_unclosed_fence   = result.ended_in_unclosed_fence ||
+                                           region_diag.ended_in_unclosed_fence;
+    };
     if (!latched_) {
         // No marker anywhere: the whole stream is ordinary content (R3-09: the entry reports
         // default diagnostics; the fence fields stay visible).
@@ -1241,10 +1263,11 @@ ToolCallStreamResult ToolCallStreamParser::finish(FinishReason finish_reason) co
         if (stage2_exhausted) {
             result.parse_budget_exhausted = true; // fail closed: nothing from Stage 2 is accepted
         } else if (unbalanced_count >= 2) {
-            result.status  = ToolCallStreamStatus::Invalid;
-            result.failure = ToolCallParseFailure::AmbiguousStructure;
-            result.tail    = region_;
-            return result;
+        result.status  = ToolCallStreamStatus::Invalid;
+        result.failure = ToolCallParseFailure::AmbiguousStructure;
+        result.tail    = region_;
+        add_region_fence_part(); // N-06: the region is returned as text, so add its fence part
+        return result;
         } else if (unbalanced_count == 1) {
             // Stage 2 accepts the single unbalanced completion (R3-I7).
             result.status  = ToolCallStreamStatus::Complete;
@@ -1295,8 +1318,9 @@ ToolCallStreamResult ToolCallStreamParser::finish(FinishReason finish_reason) co
     result.failure = first.termination == ToolCallRegionTermination::Definitive
                          ? first.failure
                          : policy_.tolerant ? ToolCallParseFailure::TruncatedTail
-                                            : ToolCallParseFailure::MalformedStructure;
+                                        : ToolCallParseFailure::MalformedStructure;
     result.tail    = region_;
+    add_region_fence_part(); // N-06: the region is returned as text, so add its fence part
     return result;
 }
 
