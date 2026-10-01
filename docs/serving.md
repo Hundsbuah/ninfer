@@ -978,6 +978,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--preserve-thinking` | preserve closed-turn assistant reasoning by default | off |
 | `--tolerant-tool-calls` | keep function-closed Qwen calls before a cut-off or malformed tail when the recovery policy proves them independent of the missing bytes; never an open value, and an undeclared tool/name is never returned as a call | off |
 | `--tool-call-syntax` | top-level tool-call syntax: `qwen-wrapped` (default; latches only the wrapped `<tool_call>` entry) or `compat` (also accepts the legacy bare `<function=...>`/`<invoke=...>` and `<function_calls>` top-level entries) | `qwen-wrapped` |
+| `--tool-call-ambiguity` | ambiguous-byte protocol policy for tool-call regions: `fail-closed` (default; a Stage-2 value boundary whose closer chain stands while an earlier closer chain had already formed a complete call is refused — the region is returned as text with the `ambiguous_structure` fallback reason, no call executes) or `payload-fidelity` (the later closing chain wins and embedded tool markup in a string value stays byte-exact; the known R1 phantom-acceptance class stays executable) | `fail-closed` |
 | `--cors` | permissive browser CORS headers | off |
 | `--usage-chunk-choice` | give the streamed usage chunk a zero-delta choice, for strict client parsers that reject the OpenAI-conformant empty `choices` array | off |
 | `--temperature F` | process-level temperature override | unset |

@@ -165,6 +165,34 @@ constraint core tracks the compatibility superset. It is an explicit configurati
 never inferred from template filenames or other metadata substrings, and a canonical wrapped
 Qwen3.8 call parses identically in both modes.
 
+## Ambiguous byte protocol
+
+The raw wire protocol has no escaping or length framing for string parameter values, so the
+same bytes can be a structural closer or literal tool markup inside a payload (the canonical
+closer lines quoted inside a `write.content` value). A byte parser cannot prove which. The
+output contract's `ToolCallAmbiguityPolicy` (serving: `--tool-call-ambiguity`) makes the choice
+explicit:
+
+- `FailClosed` (default; the production Qwen3.8 policy): a Stage-2 value boundary is ambiguous
+  when a candidate's closer chain stands while an earlier candidate's closer chain had already
+  formed a complete call — both interpretations are structurally plausible (a complete call at
+  the early close, or the later close as payload). The parser refuses it: the region is
+  returned as text with the `ambiguous_structure` fallback reason, and no alternative call may
+  execute. This prevents the known R1 phantom-call class without claiming the byte protocol is
+  unambiguous.
+- `PayloadFidelity` (the historical round-4 behavior): the later closing chain wins; embedded
+  tool markup inside a string value is preserved byte-exact. The R1 phantom-acceptance class
+  stays executable, and the pinned `test_round4_r1_residual_pinned` fixture documents that
+  verdict under this policy.
+
+What is and is not ambiguous is decided by nesting, not by the policy: a well-formed nested
+example (its own `<parameter>` openers present) is balanced — its closers are consumed by
+nesting depth, only the outer close is a viable boundary, and both policies commit the payload
+byte-exact. `FailClosed` refuses only the unbalanced class (an early complete closer chain plus
+prose plus the outer closer chain, with no matching openers), which includes some legitimate
+but structurally ambiguous `write.content` payloads. Choosing `PayloadFidelity` knowingly is
+valid; claiming phantom-call elimination under it is not.
+
 ## Constrained tool decoding
 
 `--constrained-tool-decoding off|tool-calls-only` (default `off`) reserves
