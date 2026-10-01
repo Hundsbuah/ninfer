@@ -28,8 +28,9 @@ recognition. Accepted forms:
   - a bare opener with a `name` attribute.
 - Closes: `</function>`, `</invoke>`, `</parameter>`, `</param>`, `</tool_call>`. A close
   matches its family; the wrapper closes only at its own literal.
-- Parameter values are raw bytes: they preserve function/tool-call markers, balanced nested
-  `<parameter=...>...</parameter>` text, and any other markup as value bytes.
+- Parameter values are raw bytes: they preserve function/tool-call markers, nested
+  `<parameter=...>...</parameter>` text, and any other markup as value bytes; a quoted example
+  that closes its own structure stays byte-exact (Stage-2 consistent completion, below).
 
 Header forms that are not prefixes of a valid header (a broken keyword, a missing separator
 after a value, an empty unquoted value, an unterminated quote at the region end) are rejected,
@@ -85,7 +86,10 @@ written inside a fenced code block of final content cannot latch as a structured
 unclosed fence stays open to the end of the input (suppression is the safe direction). The
 tracker only sees the pre-latch content channel: once a region has latched, the region's own
 bytes are parsed by the wire grammar, which owns value bytes (a value may contain fence
-markup).
+markup). The fence state is also computed over the latched region's bytes, independent of the
+chunk partition: recovery retry entries skip markers inside a recognized fence, and the
+diagnostics report `fenced_markers_suppressed` (complete markers a fence suppressed, pre-latch
+and retry) and `ended_in_unclosed_fence` (the pre-latch stream ended inside an unclosed fence).
 ## Strict vs. tolerant
 
 Both modes parse with the same grammar and the same state machine; the policy changes only
@@ -99,8 +103,12 @@ Tolerant (`--tolerant-tool-calls`): commits only calls whose function close has 
 consumed. A call whose function close was not consumed is never executable, whatever its
 parameter values show: the function close is the executability boundary, not the value
 close. Complete calls before a later broken call, and a function-closed final call cut
-before its wrapper close, are retained with a `truncated_tail` diagnostic. A name-only
-truncation (no closed parameter and no function close) still falls back to text. An
+before its wrapper close, are retained with a `truncated_tail` diagnostic after a natural
+stop (StopToken, or no reported reason); after a cut (OutputLimit, StopString,
+ContextCapacity, Cancelled), a definitive break leaves nothing committable behind it, so a
+region with a suffix or trailing content is returned as text and only a region whose
+completion is clean is committed. A name-only
+truncation (no closed parameter and no function close) still falls back to text.
 undeclared name is a break in tolerant mode as in strict mode: identity is not a syntax
 issue that tolerance repairs, so an undeclared call is never emitted in either mode
 (`UndeclaredTool`). The empty `<function_calls>` wrapper is unrecoverable in both modes;
@@ -108,24 +116,34 @@ a `<function_calls>` region holds a sequence of calls (another call may follow a
 close), and an unclosed `<function_calls>` at the input end retains the closed calls with
 `TruncatedTail` — never a clean completion.
 
-## Fundamental delimiter ambiguity
+## Delimiter boundaries and consistent completion
 
-The wire format has no delimiter escape. A `</parameter>` inside a value is a real closer
-only when the bytes after it form a legal continuation, decided by one shared wire-grammar
+The wire format has no delimiter escape. A `</parameter>` inside a value is a real closer only
+when the bytes after it form a legal continuation, decided by one shared wire-grammar
 classification consumed by both the value scan and the function-close lookahead: another
-parameter opener, the function's closer followed by a legal top-level entry (the wrapper
-close, another function/invoke opener, or the end of input), or the end of the input. A
-closer at the input end is a provisional boundary: the parameter commits, but a function
-that never closes stays non-executable.
-Any other continuation (immediate markup that is not a structural token, a quoted closer
-immediately followed by the next token) is value text — a shell command that echoes the
-markup. Inside a `<tool_call>` wrapper the rule is stricter: a `</parameter>` followed by
-`</function>`/`</invoke>` is a real closer only when the wrapper close or the region end
-follows the function close.
+parameter opener, the function's closer followed by a legal top-level entry (the wrapper close,
+another function/invoke opener, or the end of input), or the end of the input. A closer at the
+input end is a provisional boundary: the parameter commits, but a function that never closes
+stays non-executable.
 
-Because of this boundary, the parser does not claim that arbitrary strings are safe values:
-a value containing a markup sequence that matches the closer rule at its end is ambiguous by
-construction, and such a region degrades to content instead of guessing.
+Any other continuation (immediate markup that is not a structural token, a quoted closer
+immediately followed by the next token) is value text — a shell command that echoes the markup.
+Inside a `<tool_call>` wrapper the rule is stricter: a `</parameter>` followed by
+`</function>`/`</invoke>` is a real closer only when the wrapper close or the region end follows
+the function close.
+
+When the first (greedy) boundary choice leads the region into a definitive structural break, the
+parser re-parses it with a consistent completion (Stage 2): an open value is closed at a
+boundary that stays balanced against nested openers of the same parameter family — an unbalanced
+candidate (it would leave a nested opener unmatched) is discarded — and the first completion
+that parses cleanly becomes the structured turn; a candidate that terminates in EndOfInput
+leaves the region's result as EndOfInput, never Complete. Two or more Stage-2 bases that
+complete the region with unbalanced boundaries make it ambiguous
+(`ambiguous_structure`), as does a call of a declared tool that carries a synthetic argument
+(a repeated parameter name, or a non-declared name outside the first parameter of a tool with
+an unambiguous declared schema). The residual ambiguity is documented in the Round-3 spec §9;
+notably, a bare (unwrapped) call whose open value contains a complete example, ended by a
+natural stop, commits the example as the turn (R3-04).
 
 ## Constrained tool decoding
 
@@ -148,10 +166,23 @@ acceptance gate for the sampling integration are documented in
 ## Diagnostics
 
 - Failure classes: `MalformedStructure`, `InvalidToolName`, `UndeclaredTool`, `TrailingContent`,
-  `TruncatedTail`. The parse entry maps these 1:1 onto the fallback reason recorded on the
-  demoted text.
+  `TruncatedTail`, `AmbiguousStructure`. The parse entry maps these 1:1 onto the fallback reason
+  recorded on the demoted text (`none`, `malformed_structure`, `invalid_tool_name`,
+  `undeclared_tool`, `trailing_content`, `truncated_tail`, `ambiguous_structure`). An output
+  without any marker records `none`.
+- `ambiguous_structure`: the region is ambiguous — two or more Stage-2 bases complete it with
+  unbalanced boundaries, or a call of a declared tool carries a synthetic argument (a repeated
+  parameter name, or a non-declared name outside the first parameter of a tool with an
+  unambiguous declared schema). The region is returned verbatim as text; the legacy last-value
+  merge applies only to tools the contract does not declare.
 - `truncated_tail`: set on a tolerant truncation that retained complete-enough calls.
-- `duplicate_parameters_repaired`: counts repeated parameter names in one call (the last
-  value wins, as in JSON object syntax); the count is exposed for diagnostics.
+- `markup_tolerant_completion`: the structured region was resolved by the Stage-2 consistent
+  completion instead of the greedy Stage-1 parse.
+- `fenced_markers_suppressed` / `ended_in_unclosed_fence`: complete markers a recognized code
+  fence suppressed (pre-latch and retry), and whether the pre-latch stream ended inside an
+  unclosed fence.
+- `duplicate_parameters_repaired`: counts repeated parameter names in one call of a tool the
+  contract does not declare (the last value wins, as in JSON object syntax); the count is
+  exposed for diagnostics.
 - Tolerant truncations are logged at Info severity with the finish reason that cut the stream
   (`OutputLimit`, `ContextCapacity`, ...). A budget cut never makes an open value committable.

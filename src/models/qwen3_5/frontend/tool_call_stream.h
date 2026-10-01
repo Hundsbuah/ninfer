@@ -31,6 +31,9 @@ enum class ToolCallParseFailure : std::uint8_t {
     UndeclaredTool,
     TrailingContent,
     TruncatedTail,
+    // R3-08: a committed call of a declared tool contains a synthetic argument, or two or more
+    // Stage-2 bases complete the region with unbalanced boundaries (multi-base ambiguity).
+    AmbiguousStructure,
 };
 
 // Parser-owned AST. The stream parser never builds response objects; the parse entry applies
@@ -47,7 +50,8 @@ struct ParsedFunctionCall {
 
 struct ParsedToolRegion {
     std::vector<ParsedFunctionCall> calls;
-    std::uint32_t duplicate_parameters_repaired = 0;
+    // R3-08: every parameter occurrence is retained (a repeated name is ambiguous for a
+    // declared tool); the legacy last-wins merge and its count move to the parse entry.
 };
 
 // The region's outer wrapper (F5): an explicit kind instead of the old ambiguous boolean
@@ -66,6 +70,17 @@ struct ToolCallParsePolicy {
     bool enforce_declared_names = false;
     bool (*declared_check)(const void* contract, std::string_view name) = nullptr;
     const void* contract = nullptr;
+    // R3-01: Stage-2 plausibility predicate. Must return false exactly when the named tool
+    // has an unambiguous declared schema with at least one property and the named parameter
+    // is not among them; true otherwise (unknown tool, conflicting contract, empty schema)
+    // so the rule does not apply. Used by the consistent completer to skip a value boundary
+    // whose continuation opens an undeclared or repeated parameter of the current call.
+    bool (*parameter_plausible)(const void* contract, std::string_view tool_name,
+                                std::string_view parameter_name) = nullptr;
+    // R3-14: deterministic Stage-2 step budget (candidate/glue steps per base). Zero selects
+    // the default max(200000, 32 x region bytes); a positive value overrides it (tests pin
+    // the fail-closed behavior with a tiny budget).
+    std::uint64_t stage2_step_budget = 0;
 };
 // Objective parse outcome of one tool region (P3.1): what was safely recognized, where the
 // input ended, which state was complete and which was incomplete. It carries no policy
@@ -87,7 +102,6 @@ struct ToolCallParseProgress {
     bool open_value_open  = false; // the open call's current parameter value is unclosed
     ToolCallRegionTermination termination = ToolCallRegionTermination::Complete;
     ToolCallParseFailure failure = ToolCallParseFailure::None; // only when Definitive
-    std::uint32_t duplicate_parameters_repaired = 0;
     // A break the wire format does not forgive (an empty <function_calls> wrapper): no call
     // may be committed, even by tolerant recovery.
     bool unrecoverable_break = false;
@@ -100,6 +114,15 @@ struct ToolCallParseProgress {
     // the remaining ambiguous bytes (R2-I1); the retry search runs only from a proven
     // top-level scope.
     ToolWrapperKind wrapper_at_break = ToolWrapperKind::None;
+    // R3-02: the break happened directly after an open wrapper literal, on a byte that does
+    // not attempt a function opener (no function header was tried inside the wrapper). Such
+    // prose owns no payload scope: the retry may re-read the region from the break offset,
+    // unlike a wrapper that failed while parsing a function header (R2-I1 still applies).
+    bool prose_after_wrapper = false;
+    // R3-01: the Consistent (Stage-2) parse accepted a region whose chosen path used a
+    // pass-2 (lazy, unbalanced) value boundary. Selection prefers the earliest base whose
+    // path used only balanced boundaries.
+    bool stage2_lazy_boundary_used = false;
 };
 
 // P3.5: the explicit, pure recovery decision. Integrity over availability: a call is
@@ -120,10 +143,17 @@ struct ToolCallRecoveryResult {
 
 struct ToolCallRecoveryPolicy {
     bool tolerant = false;
-    // Informational only: decide_tool_call_recovery deliberately does not consume the
-    // finish reason — a budget cut never makes an open parameter value safe (pinned by
-    // test).
+    // The finish reason is decision-relevant (R3-03): a natural stop (StopToken, or None for
+    // one-shot callers whose end is unknown) allows committing a complete call before a
+    // definitive tail; a deliberate cut (StopString/OutputLimit/ContextCapacity/Cancelled)
+    // forbids it. A budget cut never makes an open parameter value safe: an open value is
+    // never committed, whatever the reason (F2/I2, pinned by test).
     FinishReason finish_reason = FinishReason::None;
+    // R3-03: the tail after the definitive break (region-relative, from break_offset) already
+    // contains a `</parameter>` or `</param>` closer. When the stream was cut, that later
+    // closer could have extended a committed parameter value, so the committed calls are not
+    // safe to commit. Precomputed by the caller (pure decision, no byte access here).
+    bool tail_has_value_closer = false;
 };
 
 [[nodiscard]] constexpr ToolCallRecoveryResult
@@ -144,18 +174,38 @@ decide_tool_call_recovery(const ToolCallParseProgress& progress,
         result.diagnostic = progress.failure;
         return result;
     }
-    // Tolerant recovery commits the structurally complete calls. An open call is never
-    // committed (F2/I2): its function close was not consumed, so its arguments are not
-    // executable. A missing value close alone is not a truncation of the call list.
+    // Tolerant, EndOfInput (R3-03, unchanged): a function-closed call commits, open value or
+    // not (an open value never contributes parameter bytes); a region with no complete call
+    // is rejected.
+    if (progress.termination == ToolCallRegionTermination::EndOfInput) {
+        if (!progress.calls.empty()) {
+            result.decision   = ToolCallRecoveryDecision::CommitCalls;
+            result.diagnostic = ToolCallParseFailure::TruncatedTail;
+        } else {
+            result.diagnostic = ToolCallParseFailure::TruncatedTail;
+        }
+        return result;
+    }
+    // Tolerant, Definitive (R3-03): a committed call with a parameter value is committed only
+    // when the stream ended naturally and the tail after the break carries no value closer —
+    // otherwise the later value could have extended the committed one. A call without
+    // parameters cannot be extended and commits unchanged.
+    bool parameterized = false;
+    for (const ParsedFunctionCall& call : progress.calls) {
+        if (!call.parameters.empty()) { parameterized = true; break; }
+    }
+    const bool natural_stop =
+        policy.finish_reason == FinishReason::StopToken || policy.finish_reason == FinishReason::None;
+    if (parameterized && (!natural_stop || policy.tail_has_value_closer)) {
+        result.diagnostic = progress.failure;
+        return result;
+    }
     if (!progress.calls.empty()) {
         result.decision   = ToolCallRecoveryDecision::CommitCalls;
         result.diagnostic = ToolCallParseFailure::TruncatedTail;
-        return result;
+    } else {
+        result.diagnostic = progress.failure;
     }
-    result.decision = ToolCallRecoveryDecision::Reject;
-    result.diagnostic = progress.termination == ToolCallRegionTermination::EndOfInput
-                           ? ToolCallParseFailure::TruncatedTail
-                           : progress.failure;
     return result;
 }
 
@@ -170,6 +220,15 @@ struct ToolCallStreamResult {
     // first marker and the accepted region (rtrimmed at the parse entry).
     std::string tail;
     bool marker_seen = false;
+    // R3-14: deterministic work counters (not wall-clock): Stage-2 candidate/glue steps
+    // summed over all bases, and pre-latch bytes re-fed by the NotMarker rescan. Tests pin
+    // the bounds without timing.
+    std::uint64_t stage2_steps = 0;
+    std::uint64_t rescan_steps = 0;
+    // R3-06/R3-07: fence and completion diagnostics for the request/operational log.
+    bool markup_tolerant_completion = false;
+    std::uint32_t fenced_markers_suppressed = 0;
+    bool ended_in_unclosed_fence = false;
 };
 
 // Stateful, incremental parser for the Qwen tool-call wire syntax. One instance parses one
@@ -196,6 +255,18 @@ struct ToolCallStreamResult {
 // the Phase-4 grammar-constraint core consumes it directly.
 [[nodiscard]] ToolCallParseProgress parse_tool_call_region(std::string_view text,
                                                            const ToolCallParsePolicy& policy);
+
+// R3-06: deterministic fence scan over one pre-latch byte stream and one latched region.
+// Counts the complete top-level markers a recognized code fence suppressed (in fence bytes,
+// pre-latch and region) and reports whether the pre-latch stream ended inside an unclosed
+// fence. The marker count is a shadow scan: the same classify_tool_marker_prefix transition
+// over fence bytes, never latching.
+struct FenceDiagnostics {
+    std::uint32_t suppressed_markers = 0;
+    bool ended_in_unclosed_fence = false;
+};
+[[nodiscard]] FenceDiagnostics compute_fence_diagnostics(std::string_view pre_latch,
+                                                         std::string_view region);
 
 class ToolCallStreamParser {
 public:
@@ -226,18 +297,22 @@ public:
     // pending marker candidate (both empty after a latch).
     [[nodiscard]] std::string held_tail() const { return pending_ws_ + marker_prefix_; }
 
-    // R2-I6 (CR6): a line-oriented, streaming-safe fence tracker for the pre-latch content
-    // channel. It decides which bytes belong to a recognized fenced code block and therefore
-    // cannot start a top-level tool marker. Deterministic rules (a practical CommonMark
-    // subset, documented so the behavior is chunk- and line-oriented, not full Markdown):
-    //   * a line starts at the stream start or after a newline (CRLF or LF) and may carry up
-    //     to 3 spaces of indentation;
+    // R3-06: a line-oriented, streaming-safe fence tracker for the pre-latch content channel.
+    // It decides which bytes belong to a recognized fenced code block and therefore cannot
+    // start a top-level tool marker (fence bytes are ordinary content; a tool marker inside a
+    // fence never latches). Deterministic rules (a practical CommonMark subset, documented so
+    // the behavior is line-oriented, not full Markdown):
+    //   * a line starts at the stream start or after a LF and may carry up to 3 spaces of
+    //     indentation (an opener line; a closing run additionally up to opener_indent + 3);
     //   * outside a fence, a run of >= 3 '`' or '~' at line start opens a fence with that
-    //     character and run length; the rest of the line is the info string;
-    //   * inside a fence, a run of the same character of length >= the opener length at line
-    //     start, followed only by whitespace up to the line end, closes the fence;
-    //   * a different character, a shorter run, or a non-whitespace byte after a close run is
-    //     ordinary fence content (no nested fences);
+    //     character; extra fence characters on the opener line extend the run length;
+    //   * inside a fence, a run of the same character, indented up to opener_indent + 3
+    //     spaces, of length >= the opener length, followed only by format whitespace up to
+    //     the line end (CR, spaces, tabs) closes the fence; a different character, a shorter
+    //     run, or a non-whitespace byte after a close run keeps the line as fence content
+    //     (no nested fences);
+    //   * a backtick info string containing a backtick cancels the opener (the line is
+    //     inline code); CRLF framing of the close line keeps the close valid;
     //   * an unclosed fence stays open through EOF (suppression is the safe direction).
     class FenceTracker {
     public:
@@ -246,24 +321,43 @@ public:
             Content, // the byte is fence structure: publish as ordinary content, no candidate
         };
         [[nodiscard]] Verdict consume(char byte) noexcept;
+        // True while a fence is still open (the pre-latch stream ended in an unclosed fence).
+        [[nodiscard]] bool open() const noexcept { return in_fence_; }
 
     private:
+        enum class Phase : std::uint8_t {
+            LineIndent, // line start: counting indentation before a run or body byte
+            LineRun,    // a fence-character run (opener candidate or close candidate)
+            OpenerTail, // the rest of an opener line (run extension or info string)
+            LineTail,   // format whitespace after a close run: the close is still valid
+            LineBody,   // the line is classified (fence content or ordinary text)
+        };
         bool in_fence_ = false;
         char fence_char_ = '\0';
         std::size_t fence_len_ = 0;
-        bool at_line_start_ = true;
+        std::size_t fence_indent_ = 0;
+        Phase phase_ = Phase::LineIndent;
         char run_char_ = '\0';
         std::size_t run_len_ = 0;
         std::size_t indent_ = 0;
-        bool close_pending_ = false;
+        bool close_ok_ = false;
         bool opener_line_ = false;
     };
 
     void publish(std::string_view bytes, std::string& visible);
     void latch(std::string_view marker);
+    // R3-05: one marker-machine byte; true on latch. A NotMarker result publishes the failed
+    // candidate head (trailing format whitespace held, R3-07) and re-feeds the bytes from
+    // the next '<' through this same transition (the deterministic rescan; R3-14 counts the
+    // re-fed bytes). Recursion depth is bounded by the '<' count of one candidate, which is
+    // bounded by kMaxToolHeaderBytes.
+    [[nodiscard]] bool marker_byte(char byte, std::string& visible) noexcept;
 
     ToolCallParsePolicy policy_;
     FenceTracker fence_;
+    // R3-14: deterministic pre-latch rescan counter (bytes re-fed after a NotMarker);
+    // copied to ToolCallStreamResult::rescan_steps at finish().
+    std::uint64_t rescan_steps_ = 0;
 
     std::string content_;       // all bytes determined to be ordinary content
     std::string pending_ws_;    // whitespace since the last published byte (held: may precede a marker)

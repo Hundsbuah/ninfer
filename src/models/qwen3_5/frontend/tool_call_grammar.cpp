@@ -24,16 +24,25 @@ bool is_literal_prefix(std::string_view text, std::string_view literal) noexcept
 
 // Parse a value starting after the '=' of a short form or attribute. Returns the value and
 // advances `pos` past it; NeedMore when the input ends inside a quoted value, Invalid for an
-// empty unquoted value.
-ToolHeaderStatus parse_value(std::string_view text, std::size_t& pos, std::string_view& value)
-    noexcept {
+// empty unquoted value. `allow_slash` admits '/' inside the unquoted value (the short form of
+// parameter/param names only — R3-10); function short forms and attribute values keep the
+// strict rule.
+ToolHeaderStatus parse_value(std::string_view text, std::size_t& pos, std::string_view& value,
+                             bool allow_slash) noexcept {
     skip_ws(text, pos);
     if (pos >= text.size()) { return ToolHeaderStatus::NeedMore; }
     if (text[pos] == '"' || text[pos] == '\'') {
         const char quote = text[pos];
         ++pos;
-        const std::size_t end = text.find(quote, pos);
-        if (end == std::string_view::npos) { return ToolHeaderStatus::NeedMore; }
+        // R3-05: a quoted value is single-line. A CR or LF before the closing quote is
+        // Invalid: the header grammar is line-oriented, and the rule also bounds the
+        // candidate machine against an unterminated quoted value in prose.
+        std::size_t end = pos;
+        while (end < text.size() && text[end] != quote && text[end] != '\r' && text[end] != '\n') {
+            ++end;
+        }
+        if (end == text.size()) { return ToolHeaderStatus::NeedMore; }
+        if (text[end] != quote) { return ToolHeaderStatus::Invalid; }
         value = text.substr(pos, end - pos);
         pos   = end + 1;
         return ToolHeaderStatus::Complete;
@@ -43,7 +52,7 @@ ToolHeaderStatus parse_value(std::string_view text, std::size_t& pos, std::strin
     }
     const std::size_t begin = pos;
     while (pos < text.size() && !is_tool_format_whitespace(text[pos]) && text[pos] != '>' &&
-           text[pos] != '/') {
+           (allow_slash || text[pos] != '/')) {
         ++pos;
     }
     value = text.substr(begin, pos - begin);
@@ -53,8 +62,25 @@ ToolHeaderStatus parse_value(std::string_view text, std::size_t& pos, std::strin
 // Parse the header body starting right after the tag keyword. `text[0]` is the boundary byte:
 // '=' (short form), format whitespace or '>' (attribute list / bare opener). `out.consumed`
 // counts from the start of `text` through the terminating '>'.
+ToolHeaderStatus parse_header_unbounded(std::string_view text, ToolTagKind kind, ToolOpenTag& out)
+    noexcept;
+
+// R3-05 (F8): the maximal header size (bytes after the keyword). A header whose terminating
+// '>' is not reached inside the bound is Invalid instead of NeedMore: a prose prefix with a
+// truncated or unterminated header must fail fast, not hold the candidate machine.
+ToolHeaderStatus parse_header_after_keyword(std::string_view text, ToolTagKind kind,
+                                            ToolOpenTag& out) noexcept;
 ToolHeaderStatus parse_header_after_keyword(std::string_view text, ToolTagKind kind,
                                             ToolOpenTag& out) noexcept {
+    const bool over_bound = text.size() > kMaxToolHeaderBytes;
+    const std::string_view body = over_bound ? text.substr(0, kMaxToolHeaderBytes) : text;
+    const ToolHeaderStatus status = parse_header_unbounded(body, kind, out);
+    return (status == ToolHeaderStatus::NeedMore && over_bound) ? ToolHeaderStatus::Invalid
+                                                                : status;
+}
+
+ToolHeaderStatus parse_header_unbounded(std::string_view text, ToolTagKind kind, ToolOpenTag& out)
+    noexcept {
     out.kind     = kind;
     out.name     = {};
     out.consumed = 0;
@@ -69,7 +95,10 @@ ToolHeaderStatus parse_header_after_keyword(std::string_view text, ToolTagKind k
     if (text[pos] == '=') {
         ++pos;
         std::string_view value = {};
-        const ToolHeaderStatus status = parse_value(text, pos, value);
+        // R3-10: the short unquoted value of parameter/param admits '/' ("<parameter=a/b>");
+        // attribute values and function short forms keep the strict rule.
+        const ToolHeaderStatus status =
+            parse_value(text, pos, value, is_tool_parameter_kind(kind));
         if (status == ToolHeaderStatus::NeedMore) { return ToolHeaderStatus::NeedMore; }
         if (status == ToolHeaderStatus::Invalid) { return ToolHeaderStatus::Invalid; }
         skip_ws(text, pos);
@@ -99,7 +128,7 @@ ToolHeaderStatus parse_header_after_keyword(std::string_view text, ToolTagKind k
         if (text[pos] != '=') { return ToolHeaderStatus::Invalid; }
         ++pos;
         std::string_view value = {};
-        const ToolHeaderStatus status = parse_value(text, pos, value);
+        const ToolHeaderStatus status = parse_value(text, pos, value, /*allow_slash=*/false);
         if (status != ToolHeaderStatus::Complete) { return status; }
         if (!saw_name && attr_name == "name") {
             saw_name = true;
@@ -212,25 +241,17 @@ ToolMarkerStatus classify_tool_marker_prefix(std::string_view text, ToolOpenTag&
     return ToolMarkerStatus::NotMarker;
 }
 
-std::size_t find_tool_marker(std::string_view text, std::size_t search_from,
-                              bool wrapper_only) noexcept {
+std::size_t find_tool_marker(std::string_view text, std::size_t search_from) noexcept {
     for (std::size_t index = search_from; index < text.size(); ++index) {
         if (text[index] != '<') { continue; }
         if (index + 1 < text.size()) {
             const char next = text[index + 1];
-            if (wrapper_only) {
-                if (next != 't' && next != 'f') { continue; }
-            } else if (next != 't' && next != 'f' && next != 'i') {
+            if (next != 't' && next != 'f' && next != 'i') {
                 continue;
             }
         }
         ToolOpenTag marker = {};
-        if (classify_tool_marker_prefix(text.substr(index), marker) ==
-            ToolMarkerStatus::Complete) {
-            if (wrapper_only &&
-                (marker.kind != ToolTagKind::ToolCall && marker.kind != ToolTagKind::FunctionCalls)) {
-                continue;
-            }
+        if (classify_tool_marker_prefix(text.substr(index), marker) == ToolMarkerStatus::Complete) {
             return index;
         }
     }

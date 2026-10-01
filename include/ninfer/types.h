@@ -480,6 +480,11 @@ enum class ToolCallParseFallbackReason : std::uint8_t {
     // call whose closing tags were cut off at the region end. A structured response was still
     // produced, so this is surfaced for transparency, not as a fallback-to-text failure.
     TruncatedTail,
+    // R3-08: a committed call of a declared tool contains a synthetic argument (a repeated
+    // parameter name, or a non-first name outside the unambiguous declared schema), or two or
+    // more Stage-2 bases complete the region with unbalanced boundaries; the region is
+    // ambiguous and is returned as text.
+    AmbiguousStructure,
 };
 
 [[nodiscard]] inline constexpr const char*
@@ -499,6 +504,8 @@ tool_call_parse_fallback_reason_name(ToolCallParseFallbackReason reason) noexcep
         return "trailing_content";
     case ToolCallParseFallbackReason::TruncatedTail:
         return "truncated_tail";
+    case ToolCallParseFallbackReason::AmbiguousStructure:
+        return "ambiguous_structure";
     }
     return "malformed_structure";
 }
@@ -509,6 +516,13 @@ struct ToolCallParseDiagnostics {
     std::uint32_t empty_arguments_omitted         = 0;
     std::uint32_t schema_mismatch_arguments       = 0;
     std::uint32_t duplicate_parameters_repaired   = 0;
+    // R3-07: the structured region was resolved by Stage-2 consistent completion
+    // (markup-tolerant), not by the greedy Stage-1 parse.
+    bool markup_tolerant_completion               = false;
+    // R3-06: complete top-level markers a recognized code fence suppressed (pre-latch and
+    // retry), and whether the pre-latch stream ended inside an unclosed fence.
+    std::uint32_t fenced_markers_suppressed       = 0;
+    bool ended_in_unclosed_fence                  = false;
     ToolCallParseFallbackReason fallback_reason   = ToolCallParseFallbackReason::None;
 
     [[nodiscard]] friend constexpr bool

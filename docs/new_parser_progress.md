@@ -501,7 +501,8 @@ ninfer_tool_call_grammar_state_test, ninfer_qwen3_5_frontend_test).
 
 No product behavior change outside the F5 gap: the single-call <function_calls> regions
 (the entire existing test corpus) parse byte-identically; the tool_call wrapper path is
-untouched; one-shot and streaming stay equal by construction.
+untouched. (Superseded by Round 3, R3-07: one-shot/streaming equality is verified by the
+shared re-scan transition and the deterministic fragment fuzz, not assumed by construction.)
 ## Third Review Round — Spec Full Audit, I2 Matrix, Adversarial Corpus (2026-09-29)
 
 Re-review items completed this round:
@@ -532,9 +533,11 @@ Re-review items completed this round:
   '<invoke=fake>', '<function name="fake">', '<parameter name="x">') into a declared string
   argument with ordinary prefix/suffix text, at the payload start, and around a CRLF/tab
   repeated sequence: the exact value round-trips in both modes and in 1/2/3/5/7 chunked
-  streaming. Entries that are (or end with) the outer closer literal stay out of the
-  matrix (fundamentally ambiguous at the value end, documented in tool_call_parser.md);
-  the prefix/suffix combination is the spec's own unambiguity rule.
+  streaming. Entries that are (or end with) the outer closer literal stayed out of the
+  matrix. (Superseded by Round 3, R3-01: closer-ending payloads are no longer fundamentally
+  ambiguous — the Stage-2 consistent completion resolves them, and the corpus test now
+  round-trips the previously excluded entries; the residual ambiguity list is in the
+  Round-3 spec §9.)
 - Fresh adversarial probe round (build-new-parser/probe/adversarial_p7.cpp, all OK):
   A1 multi-call sequence with CRLF separators (2 calls, both modes); A2 second call as a
   bare <function name="read"> opener (2 calls); A3 two declared tools with the third call

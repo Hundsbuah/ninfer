@@ -48,9 +48,6 @@ constexpr bool is_format_whitespace(char byte) {
 
 constexpr bool is_ascii_digit(char byte) { return byte >= '0' && byte <= '9'; }
 
-constexpr bool is_ascii_alphanumeric(char byte) {
-    return (byte >= 'a' && byte <= 'z') || (byte >= 'A' && byte <= 'Z') || is_ascii_digit(byte);
-}
 
 std::string_view trim_format_whitespace(std::string_view text) {
     std::size_t begin = 0;
@@ -427,6 +424,17 @@ bool declared_tool_name_check(const void* contract, std::string_view name) {
     return find_tool_contract(*static_cast<const Contract*>(contract), name) != nullptr;
 }
 
+// R3-01 plausibility: a parameter boundary is implausible exactly when the named tool has an
+// unambiguous declared schema with at least one property and the name is not declared.
+bool declared_parameter_plausible(const void* contract, std::string_view tool_name,
+                                  std::string_view param_name) {
+    const Contract& c = *static_cast<const Contract*>(contract);
+    const Contract::Tool* tool = find_tool_contract(c, tool_name);
+    if (tool == nullptr || !tool->unambiguous || tool->parameters.empty()) { return true; }
+    return std::any_of(tool->parameters.begin(), tool->parameters.end(),
+                       [&](const Contract::Parameter& p) { return p.name == param_name; });
+}
+
 ToolCallParseFallbackReason to_fallback_reason(ToolCallParseFailure failure) {
     switch (failure) {
         case ToolCallParseFailure::None:               return ToolCallParseFallbackReason::None;
@@ -435,6 +443,7 @@ ToolCallParseFallbackReason to_fallback_reason(ToolCallParseFailure failure) {
         case ToolCallParseFailure::UndeclaredTool:     return ToolCallParseFallbackReason::UndeclaredTool;
         case ToolCallParseFailure::TrailingContent:    return ToolCallParseFallbackReason::TrailingContent;
         case ToolCallParseFailure::TruncatedTail:      return ToolCallParseFallbackReason::TruncatedTail;
+        case ToolCallParseFailure::AmbiguousStructure: return ToolCallParseFallbackReason::AmbiguousStructure;
     }
     return ToolCallParseFallbackReason::MalformedStructure;
 }
@@ -465,6 +474,7 @@ ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text,
     policy.enforce_declared_names = contract.enforce_declared_names;
     policy.declared_check         = declared_tool_name_check;
     policy.contract               = &contract;
+    policy.parameter_plausible    = declared_parameter_plausible;
 
     // One-shot and streaming share the same incremental parser: this feeds the whole output
     // and finishes once; the streaming decoder feeds chunks of the same machine.
@@ -472,8 +482,11 @@ ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text,
     machine.feed(text);
     const ToolCallStreamResult result = machine.finish(finish_reason);
     if (!result.marker_seen) {
+        // R3-09: no marker was ever seen: default diagnostics (fallback None, marker_seen
+        // false) — the fence fields stay visible for the operational log.
         ToolCallParseDiagnostics diagnostics;
-        diagnostics.fallback_reason = ToolCallParseFallbackReason::MalformedStructure;
+        diagnostics.fenced_markers_suppressed = result.fenced_markers_suppressed;
+        diagnostics.ended_in_unclosed_fence   = result.ended_in_unclosed_fence;
         return fallback(text, diagnostics);
     }
     const ToolCallParseFallbackReason failure = to_fallback_reason(result.failure);
@@ -483,6 +496,8 @@ ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text,
         ToolCallParseDiagnostics diagnostics;
         diagnostics.marker_seen     = true;
         diagnostics.fallback_reason = failure;
+        diagnostics.fenced_markers_suppressed = result.fenced_markers_suppressed;
+        diagnostics.ended_in_unclosed_fence   = result.ended_in_unclosed_fence;
         return fallback(text, diagnostics);
     }
     // R2-I5 (CR5) defense in depth: identity is a property of the output, not a side effect
@@ -500,20 +515,74 @@ ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text,
         }
     }
 
+    // R3-08: the single output boundary for parameter occurrences (after a stage accepted
+    // the region, before normalization). A declared tool with an unambiguous non-empty
+    // schema: a repeated parameter name, or a non-first parameter outside the declared
+    // schema, makes the region ambiguous — it is returned verbatim as text. Undeclared
+    // tools keep the legacy JSON-object rule (last wins), and its count is kept.
+    std::vector<ParsedFunctionCall> calls = result.region.calls;
+    bool ambiguous_region = false;
+    std::uint32_t legacy_repairs = 0;
+    for (ParsedFunctionCall& call : calls) {
+        bool duplicate = false;
+        for (std::size_t i = 0; i < call.parameters.size() && !duplicate; ++i) {
+            for (std::size_t j = i + 1; j < call.parameters.size(); ++j) {
+                if (call.parameters[i].name == call.parameters[j].name) {
+                    duplicate = true;
+                    break;
+                }
+            }
+        }
+        const Contract::Tool* tool = find_tool_contract(contract, call.name);
+        if (tool != nullptr) {
+            if (duplicate) { ambiguous_region = true; break; }
+            if (tool->unambiguous && !tool->parameters.empty()) {
+                for (std::size_t i = 1; i < call.parameters.size() && !ambiguous_region; ++i) {
+                    const std::string_view name = call.parameters[i].name;
+                    if (!std::any_of(tool->parameters.begin(), tool->parameters.end(),
+                                     [&](const Contract::Parameter& p) { return p.name == name; })) {
+                        ambiguous_region = true;
+                    }
+                }
+            }
+        } else if (duplicate) {
+            // Legacy JSON-object rule for tools the contract does not declare: last wins.
+            std::vector<ParsedParameter> merged;
+            merged.reserve(call.parameters.size());
+            for (const ParsedParameter& parameter : call.parameters) {
+                const auto existing =
+                    std::find_if(merged.begin(), merged.end(),
+                                 [&](const ParsedParameter& p) { return p.name == parameter.name; });
+                if (existing == merged.end()) { merged.push_back(parameter); }
+                else { *existing = parameter; ++legacy_repairs; }
+            }
+            call.parameters = std::move(merged);
+        }
+    }
+    if (ambiguous_region) {
+        ToolCallParseDiagnostics diagnostics;
+        diagnostics.marker_seen     = true;
+        diagnostics.fallback_reason = FallbackReason::AmbiguousStructure;
+        return fallback(text, diagnostics);
+    }
+
     ParsedToolCallOutput out;
     out.diagnostics.marker_seen     = true;
     // A recovered truncated tail keeps its reason for transparency without demoting the output.
     out.diagnostics.fallback_reason = failure;
+    out.diagnostics.markup_tolerant_completion = result.markup_tolerant_completion;
+    out.diagnostics.fenced_markers_suppressed  = result.fenced_markers_suppressed;
+    out.diagnostics.ended_in_unclosed_fence    = result.ended_in_unclosed_fence;
 
     // Generated prose can quote a tool-call marker before the real turn. Bytes before the
     // accepted region (prose plus any failed earlier region) stay ordinary content.
     out.content = rtrim_format_whitespace(machine.content_prefix() + result.tail);
-    out.tool_calls.reserve(result.region.calls.size());
-    for (const ParsedFunctionCall& call : result.region.calls) {
+    out.tool_calls.reserve(calls.size());
+    for (const ParsedFunctionCall& call : calls) {
         out.tool_calls.push_back(normalize_parsed_tool_call(call, contract, out.diagnostics));
     }
 
-    out.diagnostics.duplicate_parameters_repaired = result.region.duplicate_parameters_repaired;
+    out.diagnostics.duplicate_parameters_repaired = legacy_repairs;
     out.diagnostics.structured_call_count         = static_cast<std::uint32_t>(out.tool_calls.size());
     out.is_tool_call_response                     = true;
     return out;
@@ -540,6 +609,12 @@ ToolCallOutputDecoder::Terminal ToolCallOutputDecoder::finish(FinishReason finis
     if (machine_.latched()) { region.assign(machine_.latched_region()); }
     ParsedToolCallOutput parsed = parse_qwen_tool_call_output(region, max_tool_name_length_,
                                                               *contract_, tolerant_, finish_reason);
+    // R3-06: the entry re-parse sees only the region; the pre-latch fence diagnostic comes
+    // from this machine (the same pre-latch bytes, deterministic over the byte stream).
+    const FenceDiagnostics pre_fence = compute_fence_diagnostics(
+        machine_.content_prefix() + machine_.held_tail(), std::string_view{});
+    parsed.diagnostics.fenced_markers_suppressed += pre_fence.suppressed_markers;
+    parsed.diagnostics.ended_in_unclosed_fence   |= pre_fence.ended_in_unclosed_fence;
     if (machine_.latched() && parsed.is_tool_call_response) {
         // The parser reports the held bytes before the accepted structured region, which are
         // the bytes after an earlier quoted marker that this decoder has not published yet.

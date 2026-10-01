@@ -330,6 +330,27 @@ OperationalRecord render_request_done(const RequestLogContext& context,
 std::optional<OperationalRecord> render_tool_call_fallback(const RequestLogContext& context,
                                                            const GenerationOutcome& outcome) {
     const ninfer::ToolCallParseFallbackReason reason = outcome.tool_call_parse.fallback_reason;
+    // R3-12: no tool call was produced, the fence suppressed markers, and the pre-latch bytes
+    // ended inside an unclosed fence: the model likely emitted an unbalanced fence block
+    // around its markup. Warn with a bounded single-line snippet of the fence start.
+    if (outcome.tool_calls.empty() && outcome.tool_call_parse.ended_in_unclosed_fence &&
+        outcome.tool_call_parse.fenced_markers_suppressed > 0) {
+        constexpr std::size_t kSnippetBytes = 80;
+        std::string snippet;
+        if (const std::size_t fence = outcome.text.find("```"); fence != std::string::npos) {
+            snippet = outcome.text.substr(fence, kSnippetBytes);
+            for (char& byte : snippet) {
+                if (byte == '\n' || byte == '\r' || byte == '\t') { byte = ' '; }
+            }
+        }
+        return OperationalRecord{
+            .severity = OperationalSeverity::Warning,
+            .message  = "req#" + std::to_string(context.id) +
+                        " tool-call fence left unclosed | fenced_markers_suppressed=" +
+                        std::to_string(outcome.tool_call_parse.fenced_markers_suppressed) +
+                        (snippet.empty() ? std::string{} : " | " + snippet),
+        };
+    }
     if (!outcome.tool_call_parse.marker_seen ||
         reason == ninfer::ToolCallParseFallbackReason::None) {
         return std::nullopt;
@@ -349,11 +370,19 @@ std::optional<OperationalRecord> render_tool_call_fallback(const RequestLogConte
         };
     }
     // The reason names the verdict; a bounded, single-line snippet of the returned markup shows
-    // what earned it. Text before the first marker never appears.
+    // what earned it, starting at the region's first marker of any family (R3-12: bare
+    // unwrapped regions log their markup too). Text before the first marker never appears.
     constexpr std::size_t kMarkupSnippetBytes = 240;
     std::string snippet;
-    if (const std::size_t marker = outcome.text.find("<tool_call>");
-        marker != std::string::npos) {
+    std::size_t marker = std::string::npos;
+    for (const std::string_view prefix : {std::string_view("<tool_call>"),
+                                          std::string_view("<function_calls>"),
+                                          std::string_view("<function="),
+                                          std::string_view("<invoke ")}) {
+        const std::size_t at = outcome.text.find(prefix);
+        if (at != std::string::npos && (marker == std::string::npos || at < marker)) { marker = at; }
+    }
+    if (marker != std::string::npos) {
         snippet = outcome.text.substr(marker, kMarkupSnippetBytes);
         if (outcome.text.size() - marker > kMarkupSnippetBytes) { snippet += "..."; }
         for (char& byte : snippet) {

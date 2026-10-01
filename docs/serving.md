@@ -256,33 +256,40 @@ case-insensitive boolean text is normalized to `true` or `false`. A nonempty sch
 a structured call: valid JSON retains its represented type and other text becomes a JSON string so
 the tool consumer can report the validation error and continue the agent loop. Schemas without a
 supported explicit type retain untyped inference. NInfer does not apply defaults, enforce required
-properties, or perform recursive JSON Schema validation. Grammar-constrained decoding of the tool
-wire syntax is available behind `--constrained-tool-decoding` (default `off`; with `off` the
-sampling path is unchanged), see [Tool-call parser](tool_call_parser.md#constrained-tool-decoding).
+properties, or perform recursive JSON Schema validation. NInfer does not implement grammar-
+constrained tool decoding yet: `--constrained-tool-decoding` accepts `off` only, and
+`tool-calls-only` is not implemented in this build and fails at startup (default `off`; with `off`
+the sampling path is unchanged), see [Tool-call parser](tool_call_parser.md#constrained-tool-decoding).
 
-String parameters preserve function/tool-call markers and balanced nested
-`<parameter=...>...</parameter>` text as value bytes. Marker recognition, the accepted header forms
-(short, attribute and bare openers with quote-aware names) and the value/closer rules come from a
-single wire grammar that one-shot and streaming parsing share ([Tool-call parser](tool_call_parser.md)).
-The Qwen wire format has no delimiter escape,
-so a standalone `</parameter>` ends a value only when whitespace and then another parameter, the
-function's closer, or the end of the output follow it; any other one is value text, such as a shell
-command that echoes the markup. An unmatched nested parameter opener, or a quoted closer that is
-followed by the next token, cannot be represented unambiguously and makes that tool-call region
-ordinary content. Later content is still examined:
-the first tool-call region (any accepted marker form) that parses becomes the structured turn, and any
-quoted markup before it stays ordinary content. Generated reasoning closes only at a `</think>`
-followed by a line break or the end of the turn, so a marker the model quotes while reasoning (followed
-by a space, punctuation or an escaped `
-`) stays in the reasoning channel.
+String parameters preserve function/tool-call markers and nested `<parameter=...>...</parameter>`
+text as value bytes. Marker recognition, the accepted header forms (short, attribute and bare
+openers with quote-aware names) and the value/closer rules come from a single wire grammar that
+one-shot and streaming parsing share ([Tool-call parser](tool_call_parser.md)). The Qwen wire
+format has no delimiter escape, so a standalone `</parameter>` ends a value only when its one-token
+continuation is the grammar's next structural token — a parameter opener, the function's closer, or
+the end of the output; any other continuation is value text, such as a shell command that echoes the
+markup. When the first (greedy) boundary choice leads the region into a definitive structural break,
+the parser re-parses the region with a consistent completion (Stage 2): an open value is closed at
+a boundary that stays balanced against nested openers of the same parameter family, and the first
+such completion that parses cleanly becomes the structured turn, so a quoted example that closes its
+own structure and then continues as prose is preserved byte-exact as the outer parameter's value.
+A region that fails both stages is ordinary content. Later content is still examined: retry entries
+skip markers inside a recognized code fence, and the first region that parses in either stage becomes
+the structured turn. Generated reasoning closes only at a `</think>` followed by a line break or the
+end of the turn, so a marker the model quotes while reasoning (followed by a space, punctuation or
+an escaped `\n`) stays in the reasoning channel.
 
-By default the parser keeps that all-or-nothing behaviour. With `--tolerant-tool-calls` the server
-recovers a call instead when the model adds a suffix after a complete call, a second call is
-malformed, a single final call is cut by the output budget before its closing tags, or the closing
-bracket after the function name is missing: the recovered call is reported structurally with a
-`truncated_tail` diagnostic (logged at Info severity) rather than demoted to text, and an
-undeclared tool name stays structured for the consumer to judge.
-
+By default the parser keeps that all-or-nothing behaviour. With `--tolerant-tool-calls` a region that
+fails the strict structure rules still produces structured calls when the completion is decisive — a
+suffix after a complete call, a broken region after complete calls, or a region completed by Stage 2
+— and the recovery decision depends on the finish reason: after a natural stop (`StopToken`, or no
+reported reason), the committed calls may be followed by trailing prose; after a cut
+(`OutputLimit`, `StopString`, `ContextCapacity`, `Cancelled`), a definitive break leaves nothing
+committable behind it, so a region with trailing content is returned as text and only a region whose
+completion is clean is committed. An undeclared tool name is never recovered, and a call of a
+declared tool with a repeated parameter name, or a non-declared name outside the first parameter of
+a tool with an unambiguous declared schema, is returned as text with the `ambiguous_structure`
+reason.
 Messages enter the selected template in their input order. The maintained Qwen templates keep
 system/developer messages at their original positions. A final assistant message is an assistant
 prefill: generation continues that turn in place instead of opening a new assistant turn. Because
@@ -1080,13 +1087,18 @@ unspecified. `enable_thinking` records whether the response starts in thinking m
 `request_done.result.tool_call_parse` records whether a complete marker was seen, the structured
 call count, empty non-string arguments omitted during normalization, schema-mismatched arguments
 preserved for consumer validation, `duplicate_parameters_repaired`, and a stable fallback reason.
-A parameter named more than once in one call keeps its last value, as in JSON object syntax, and
-counts once in `duplicate_parameters_repaired` for each repeat instead of demoting the call to text.
-Fallback reasons are `none`, `malformed_structure`, `invalid_tool_name`, `undeclared_tool`,
-`trailing_content`, and `truncated_tail`. `truncated_tail` occurs only with `--tolerant-tool-calls`:
-with a nonzero `structured_call_count` the recovered calls were returned structurally (a discarded
-suffix or a call cut at the region end), and with none the region was returned as text. These
-counters contain no tool arguments or generated text.
+The diagnostics also include `markup_tolerant_completion` (the region was resolved by the
+Stage-2 consistent completion instead of the greedy parse), `fenced_markers_suppressed`
+(complete markers a recognized code fence suppressed) and `ended_in_unclosed_fence`. Fallback
+reasons are `none`, `malformed_structure`, `invalid_tool_name`, `undeclared_tool`,
+`trailing_content`, `truncated_tail`, and `ambiguous_structure`. A call of a declared tool with a
+repeated parameter name, or with a non-declared name outside its first parameter when the declared
+schema is unambiguous, makes the region ambiguous: it is returned verbatim as text with
+`ambiguous_structure` (the legacy last-value merge, counted in `duplicate_parameters_repaired`,
+applies only to tools the contract does not declare). `truncated_tail` occurs only with
+`--tolerant-tool-calls`: with a nonzero `structured_call_count` the recovered calls were returned
+structurally, and with none the region was returned as text. An output without any marker records
+the reason `none`. These counters contain no tool arguments or generated text.
 
 `request_done.timings_seconds` contains `prepare`, `ttft`, `vision`, `prefill`, `decode`, and `total`
 as full-precision JSON numbers. Its `speculative` object contains `backend`, `draft_window`, `rounds`,

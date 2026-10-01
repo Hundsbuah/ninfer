@@ -100,7 +100,10 @@ ToolCallGrammarConstraint::advance(std::string_view decoded_bytes, ToolCallGramm
             }
             if (status == ToolMarkerStatus::NotMarker) {
                 // F8: a breaking '<' starts a fresh candidate (shared split rule).
-                state.marker_prefix_.resize(failed_marker_candidate_retained(state.marker_prefix_));
+                const std::size_t rescan_start = failed_marker_candidate_rescan_start(state.marker_prefix_);
+                state.marker_prefix_ = rescan_start == std::string_view::npos
+                                          ? std::string{}
+                                          : std::string(state.marker_prefix_.substr(rescan_start));
             }
             ++i;
         }

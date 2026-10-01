@@ -7,6 +7,7 @@
 #include <initializer_list>
 #include <iostream>
 #include <memory>
+#include <random>
 #include <span>
 #include <string>
 #include <string_view>
@@ -564,18 +565,20 @@ int test_unsupported_schema_uses_legacy_policy() {
                                                            Json{{"enum", Json::array({1, 2})}}})}}},
              {"mixed_composition", Json{{"anyOf", Json::array({Json{{"type", "boolean"}}})},
                                         {"oneOf", Json::array({Json{{"type", "null"}}})}}}});
-    const std::string text = tool_call("configure", {{"missing_type", "7"},
+    // R3-08: the first parameter position is outside the non-first undeclared rule, so the
+    // legacy inference still applies there and is emitted with its schema_mismatch count.
+    const std::string text = tool_call("configure", {{"undeclared", "{\"x\":1}"},
+                                                     {"missing_type", "7"},
                                                      {"alias", "8"},
                                                      {"invalid_type_array", "9"},
                                                      {"partial_anyof", "7.5"},
-                                                     {"mixed_composition", "True"},
-                                                     {"undeclared", "{\"x\":1}"}});
+                                                     {"mixed_composition", "True"}});
     const auto parsed      = fi::parse_qwen_tool_call_output(text, 64, contract);
 
     int failures = 0;
     failures += check(parsed.is_tool_call_response && parsed.tool_calls.size() == 1 &&
                           parsed.diagnostics.schema_mismatch_arguments == 1,
-                      "unsupported schema did not retain legacy policy");
+                      "first-position undeclared parameter lost legacy inference");
     if (parsed.tool_calls.size() != 1) { return failures; }
     const Json args = Json::parse(parsed.tool_calls.front().arguments_json);
     failures += check(args.at("missing_type") == 7 && args.at("alias") == 8 &&
@@ -585,6 +588,18 @@ int test_unsupported_schema_uses_legacy_policy() {
                       "unsupported composition was partially inferred");
     failures +=
         check(args.at("undeclared").at("x") == 1, "undeclared parameter legacy inference changed");
+
+    // A non-first undeclared parameter outside the declared schema is ambiguous: the
+    // region is returned verbatim (R3-08).
+    const std::string non_first_undeclared = tool_call(
+        "configure", {{"alias", "8"}, {"undeclared", "{\"x\":1}"}});
+    const auto parsed_ambiguous =
+        fi::parse_qwen_tool_call_output(non_first_undeclared, 64, contract);
+    failures += check(!parsed_ambiguous.is_tool_call_response &&
+                          parsed_ambiguous.content == non_first_undeclared &&
+                          parsed_ambiguous.diagnostics.fallback_reason ==
+                              ninfer::ToolCallParseFallbackReason::AmbiguousStructure,
+                      "non-first undeclared parameter was not rejected as ambiguous");
     return failures;
 }
 
@@ -693,15 +708,18 @@ int test_quoted_marker_before_real_call() {
     const auto parsed = fi::parse_qwen_tool_call_output(text, 64, contract);
 
     int failures = 0;
-    // R2-I1/CR1: the quoted broken wrapper is a failed open wrapper. Its scope cannot be
-    // proven exited from the wire bytes, so the failed wrapper owns the remaining ambiguous
-    // bytes and the whole region falls back to content — the real call after it stays
-    // non-executable (non-execution over recovery, R2-I7).
-    failures += check(!parsed.is_tool_call_response && parsed.tool_calls.empty() &&
-                          parsed.content == text && parsed.diagnostics.marker_seen &&
+    // R3-02: a quoted broken wrapper no longer keeps the real turn out of reach. The region
+    // breaks inside the quoted scope, but the real marker sits after the quoted wrapper's
+    // own close — a proven top-level position — so the retry commits the real call and the
+    // quoted example plus the prose remain ordinary content.
+    failures += check(parsed.is_tool_call_response && parsed.tool_calls.size() == 1 &&
+                          parsed.tool_calls.front().name == "bash" &&
+                          parsed.content == "explaining " + quoted + " then the real turn" &&
+                          parsed.diagnostics.marker_seen &&
+                          parsed.diagnostics.structured_call_count == 1 &&
                           parsed.diagnostics.fallback_reason ==
-                              ninfer::ToolCallParseFallbackReason::MalformedStructure,
-                      "a quoted broken wrapper before a real call was recovered (CR1)");
+                              ninfer::ToolCallParseFallbackReason::None,
+                      "the quoted broken wrapper still hides the real call after its close");
     return failures;
 }
 
@@ -740,14 +758,15 @@ int test_incremental_quoted_marker_preserves_bytes() {
     auto terminal = decoder.finish();
 
     int failures = 0;
-    failures += check(terminal.tool_calls.empty(),
-                      "a failed open wrapper's scope was re-entered during streaming (CR1)");
-    failures += check(visible + terminal.content == text,
+    failures += check(terminal.tool_calls.size() == 1 &&
+                          terminal.tool_calls.front().name == "bash",
+                      "the real call after a quoted broken wrapper was not committed (R3-02)");
+    failures += check(visible + terminal.content == "explaining " + quoted + " then the real turn",
                       "incremental quoted marker lost or duplicated bytes");
     failures += check(terminal.diagnostics.marker_seen &&
-                          terminal.diagnostics.structured_call_count == 0 &&
+                          terminal.diagnostics.structured_call_count == 1 &&
                           terminal.diagnostics.fallback_reason ==
-                              ninfer::ToolCallParseFallbackReason::MalformedStructure,
+                              ninfer::ToolCallParseFallbackReason::None,
                       "incremental quoted marker changed terminal diagnostics");
     return failures;
 }
@@ -897,40 +916,36 @@ int test_duplicate_parameters_keep_last_value() {
     const auto contract = contract_for("configure", Json{{"value", Json{{"type", "string"}}}});
     int failures        = 0;
 
-    // A repeated identical parameter is the common agent-harness case: the second write leaves the
-    // value alone, and the repair is still counted.
+    // R3-08: a declared parameter written twice makes the region ambiguous (the values
+    // cannot be reconciled without guessing which occurrence is authoritative): the region
+    // is returned verbatim as text with ambiguous_structure, in strict and tolerant alike.
     const std::string identical_dup =
         "<tool_call>\n<function=configure>\n<parameter=value>\nfirst\n</parameter>\n"
         "<parameter=value>\nfirst\n</parameter>\n</function>\n</tool_call>";
     const auto parsed_identical = fi::parse_qwen_tool_call_output(identical_dup, 64, contract);
-    failures += check(parsed_identical.is_tool_call_response &&
-                          parsed_identical.tool_calls.size() == 1,
-                      "duplicate identical parameter was not accepted");
-    if (parsed_identical.tool_calls.size() == 1) {
-        const Json args = Json::parse(parsed_identical.tool_calls.front().arguments_json);
-        failures += check(args.at("value") == "first",
-                          "repeated identical parameter value changed");
-    }
-    failures += check(parsed_identical.diagnostics.duplicate_parameters_repaired == 1,
-                      "identical duplicate parameter repair was not recorded");
+    failures += check(!parsed_identical.is_tool_call_response &&
+                          parsed_identical.content == identical_dup &&
+                          parsed_identical.tool_calls.empty() &&
+                          parsed_identical.diagnostics.fallback_reason ==
+                              ninfer::ToolCallParseFallbackReason::AmbiguousStructure,
+                      "identical duplicate parameter was not rejected as ambiguous");
 
-    // A conflicting repeat keeps the last value, matching the JSON-object rule the `=<name>`
-    // markup already follows.
+    // A conflicting repeat is ambiguous in the same way: last-wins is no longer a repair.
     const std::string conflicting_dup =
         "<tool_call>\n<function=configure>\n<parameter=value>\nfirst\n</parameter>\n"
         "<parameter=value>\nsecond\n</parameter>\n</function>\n</tool_call>";
     const auto parsed_conflicting = fi::parse_qwen_tool_call_output(conflicting_dup, 64, contract);
-    failures += check(parsed_conflicting.is_tool_call_response &&
-                          parsed_conflicting.tool_calls.size() == 1,
-                      "conflicting duplicate parameter fell back to text");
-    if (parsed_conflicting.tool_calls.size() == 1) {
-        const Json args = Json::parse(parsed_conflicting.tool_calls.front().arguments_json);
-        failures += check(args.at("value") == "second",
-                          "conflicting duplicate parameter did not keep the last value");
-    }
-    failures += check(parsed_conflicting.diagnostics.duplicate_parameters_repaired == 1,
-                      "conflicting duplicate parameter repair was not recorded");
+    failures += check(!parsed_conflicting.is_tool_call_response &&
+                          parsed_conflicting.content == conflicting_dup &&
+                          parsed_conflicting.diagnostics.fallback_reason ==
+                              ninfer::ToolCallParseFallbackReason::AmbiguousStructure,
+                      "conflicting duplicate parameter was not rejected as ambiguous");
 
+    // The legacy JSON-object rule (last wins, with the repair count) now applies only to
+    // tools the contract does not declare; the public entry enforces the same
+    // declared-name predicate in the state machine (CR5) that R3-08's lookup uses, so
+    // that branch is defensive (spec R3-08) and pinned by the stream-level tests below
+    // only when a contract can be built without declared-name enforcement.
     return failures;
 }
 
@@ -1677,6 +1692,61 @@ int check_round2_region(const std::string& text, const fi::ToolCallOutputContrac
     }
     return failures;
 }
+ // Round-3 per-reason assertion runner: like check_round2_region, but the expected outcome
+ // may differ between the natural stop (StopToken) and the cut reasons (StopString,
+ // OutputLimit, ContextCapacity, Cancelled) — R3-03 splits tolerant commits by finish
+ // reason.
+ struct Round3Outcome {
+     std::vector<std::string> names;
+     ninfer::ToolCallParseFallbackReason reason;
+ };
+ int check_round3_region(const std::string& text, const fi::ToolCallOutputContract& contract,
+                         bool tolerant, const Round3Outcome& natural, const Round3Outcome& cut,
+                         std::string_view message) {
+     using FinishReason = ninfer::FinishReason;
+     int failures = 0;
+     for (const FinishReason reason : {FinishReason::StopToken, FinishReason::StopString,
+                                       FinishReason::OutputLimit, FinishReason::ContextCapacity,
+                                       FinishReason::Cancelled}) {
+         const Round3Outcome& expected = reason == FinishReason::StopToken ? natural : cut;
+         const auto parsed =
+             fi::parse_qwen_tool_call_output(text, 64, contract, tolerant, reason);
+         failures += check(parsed.is_tool_call_response == !expected.names.empty(),
+                           (std::string("response flag: ") + std::string(message)).c_str());
+         failures += check(parsed.tool_calls.size() == expected.names.size(),
+                           (std::string("call count: ") + std::string(message)).c_str());
+         for (std::size_t i = 0; i < parsed.tool_calls.size() && i < expected.names.size(); ++i) {
+             failures += check(parsed.tool_calls[i].name == expected.names[i],
+                               (std::string("call name: ") + std::string(message)).c_str());
+         }
+         failures += check(parsed.diagnostics.fallback_reason == expected.reason,
+                           (std::string("fallback reason: ") + std::string(message)).c_str());
+         if (expected.names.empty()) {
+             failures += check(parsed.content == text,
+                               (std::string("verbatim fallback content: ") +
+                                std::string(message))
+                                   .c_str());
+         }
+         auto contract_ptr = std::make_shared<fi::ToolCallOutputContract>(contract);
+         for (const std::size_t chunk : {std::size_t{1}, std::size_t{2}, std::size_t{3},
+                                         std::size_t{5},  std::size_t{7}}) {
+             fi::ToolCallOutputDecoder decoder(contract_ptr, 64, tolerant);
+             std::string visible;
+             for (std::size_t offset = 0; offset < text.size(); offset += chunk) {
+                 visible += decoder.feed(std::string_view(text).substr(offset, chunk));
+             }
+             auto terminal = decoder.finish(reason);
+             failures += check(terminal.tool_calls.size() == parsed.tool_calls.size() &&
+                                   visible + terminal.content == parsed.content &&
+                                   terminal.diagnostics == parsed.diagnostics,
+                               (std::string("streaming diverged from one-shot: ") +
+                                std::string(message))
+                                   .c_str());
+         }
+     }
+     return failures;
+ }
+
 
 // CR1/R2-I1: a failed wrapper owns its still-unclosed scope. No marker located inside it
 // may become a recovery entry; the entire region falls back to content in strict and
@@ -1908,9 +1978,11 @@ int test_function_calls_close_then_remainder() {
     failures += check_round2_region(trailing, *contract, false, {},
                                     ninfer::ToolCallParseFallbackReason::TrailingContent,
                                     "CR3 trailing prose (strict)");
-    failures += check_round2_region(trailing, *contract, true, {"read"},
-                                    ninfer::ToolCallParseFallbackReason::TruncatedTail,
-                                    "CR3 trailing prose (tolerant)");
+    failures += check_round3_region(
+        trailing, *contract, true,
+        Round3Outcome{{"read"}, ninfer::ToolCallParseFallbackReason::TruncatedTail},
+        Round3Outcome{{}, ninfer::ToolCallParseFallbackReason::TrailingContent},
+        "CR3 trailing prose (tolerant)");
     failures += check_round2_region(whitespace, *contract, false, {"read"},
                                     ninfer::ToolCallParseFallbackReason::None,
                                     "CR3 trailing whitespace (strict)");
@@ -2062,9 +2134,11 @@ int test_tolerant_rejects_undeclared_tools() {
     failures += check_round2_region(mixed, *contract, false, {},
                                     ninfer::ToolCallParseFallbackReason::UndeclaredTool,
                                     "CR5 valid then undeclared (strict)");
-    failures += check_round2_region(mixed, *contract, true, {"read"},
-                                    ninfer::ToolCallParseFallbackReason::TruncatedTail,
-                                    "CR5 valid then undeclared (tolerant)");
+    failures += check_round3_region(
+        mixed, *contract, true,
+        Round3Outcome{{"read"}, ninfer::ToolCallParseFallbackReason::TruncatedTail},
+        Round3Outcome{{}, ninfer::ToolCallParseFallbackReason::UndeclaredTool},
+        "CR5 valid then undeclared (tolerant)");
     // A bare undeclared function (no wrapper).
     const std::string bare_undeclared =
         "<function=unknown>\n<parameter=x>\nv\n</parameter>\n</function>";
@@ -2192,26 +2266,26 @@ int test_fenced_content_never_latches() {
     // Backtick fence with an info string.
     const std::string backtick = "Example:\n\n```xml\n" + example_block + "\n```\n";
     failures += check_round2_region(backtick, *contract, false, {},
-                                    ninfer::ToolCallParseFallbackReason::MalformedStructure,
+                                    ninfer::ToolCallParseFallbackReason::None,
                                     "CR6 backtick fence (strict)");
     failures += check_round2_region(backtick, *contract, true, {},
-                                    ninfer::ToolCallParseFallbackReason::MalformedStructure,
+                                    ninfer::ToolCallParseFallbackReason::None,
                                     "CR6 backtick fence (tolerant)");
     // Tilde fence without an info string.
     const std::string tilde = "~~~~\n" + example_block + "\n~~~~\n";
     failures += check_round2_region(tilde, *contract, false, {},
-                                    ninfer::ToolCallParseFallbackReason::MalformedStructure,
+                                    ninfer::ToolCallParseFallbackReason::None,
                                     "CR6 tilde fence (strict)");
     failures += check_round2_region(tilde, *contract, true, {},
-                                    ninfer::ToolCallParseFallbackReason::MalformedStructure,
+                                    ninfer::ToolCallParseFallbackReason::None,
                                     "CR6 tilde fence (tolerant)");
     // An unclosed fence stays open through EOF: the marker inside is content.
     const std::string unclosed = "```xml\n" + example_block + "\n";
     failures += check_round2_region(unclosed, *contract, false, {},
-                                    ninfer::ToolCallParseFallbackReason::MalformedStructure,
+                                    ninfer::ToolCallParseFallbackReason::None,
                                     "CR6 unclosed fence (strict)");
     failures += check_round2_region(unclosed, *contract, true, {},
-                                    ninfer::ToolCallParseFallbackReason::MalformedStructure,
+                                    ninfer::ToolCallParseFallbackReason::None,
                                     "CR6 unclosed fence (tolerant)");
     // A real call immediately after the closing fence still executes; the fenced example
     // stays content.
@@ -2225,36 +2299,39 @@ int test_fenced_content_never_latches() {
     // A longer fence contains shorter backtick lines: the inner fences are content.
     const std::string nested_fence = "````\n```\n" + example_block + "\n```\n````\n";
     failures += check_round2_region(nested_fence, *contract, false, {},
-                                    ninfer::ToolCallParseFallbackReason::MalformedStructure,
+                                    ninfer::ToolCallParseFallbackReason::None,
                                     "CR6 longer fence contains shorter (strict)");
     failures += check_round2_region(nested_fence, *contract, true, {},
-                                    ninfer::ToolCallParseFallbackReason::MalformedStructure,
+                                    ninfer::ToolCallParseFallbackReason::None,
                                     "CR6 longer fence contains shorter (tolerant)");
     // The opening fence line's info string may carry a marker: it is content.
     const std::string info_string = "```xml <tool_call>\n" + example_block + "\n```\n";
     failures += check_round2_region(info_string, *contract, false, {},
-                                    ninfer::ToolCallParseFallbackReason::MalformedStructure,
+                                    ninfer::ToolCallParseFallbackReason::None,
                                     "CR6 fence info string (strict)");
     failures += check_round2_region(info_string, *contract, true, {},
-                                    ninfer::ToolCallParseFallbackReason::MalformedStructure,
+                                    ninfer::ToolCallParseFallbackReason::None,
                                     "CR6 fence info string (tolerant)");
     // CRLF line endings.
     const std::string crlf = "Example:\r\n\r\n```xml\r\n" + example_block + "\r\n```\r\n";
     failures += check_round2_region(crlf, *contract, false, {},
-                                    ninfer::ToolCallParseFallbackReason::MalformedStructure,
+                                    ninfer::ToolCallParseFallbackReason::None,
                                     "CR6 CRLF fence (strict)");
     failures += check_round2_region(crlf, *contract, true, {},
-                                    ninfer::ToolCallParseFallbackReason::MalformedStructure,
+                                    ninfer::ToolCallParseFallbackReason::None,
                                     "CR6 CRLF fence (tolerant)");
     // A complete call before a fence: the terminal policy decides (strict rejects the
-    // trailing fence block, tolerant retains the call with a truncation diagnostic).
+    // trailing fence block, tolerant retains the call only at a natural stop; a cut
+    // finish reason leaves nothing committable behind the definitive break, R3-03).
     const std::string before_fence = real_call + "\nExample:\n\n```\ncontent\n```\n";
     failures += check_round2_region(before_fence, *contract, false, {},
                                     ninfer::ToolCallParseFallbackReason::TrailingContent,
                                     "CR6 call before fence (strict)");
-    failures += check_round2_region(before_fence, *contract, true, {"bash"},
-                                    ninfer::ToolCallParseFallbackReason::TruncatedTail,
-                                    "CR6 call before fence (tolerant)");
+    failures += check_round3_region(
+        before_fence, *contract, true,
+        Round3Outcome{{"bash"}, ninfer::ToolCallParseFallbackReason::TruncatedTail},
+        Round3Outcome{{}, ninfer::ToolCallParseFallbackReason::TrailingContent},
+        "CR6 call before fence (tolerant)");
     return failures;
 }
 
@@ -2304,24 +2381,21 @@ int test_fence_split_at_every_byte() {
 } // namespace
 
 int test_duplicate_parameter_keeps_last_value() {
-    int failures = 0;
-    const fi::ToolCallOutputContract contract =
-        contract_for("configure", Json{{"value", Json{{"type", "string"}}}});
+    // R3-08 flip: a declared parameter written twice is ambiguous_structure, not a
+    // last-wins repair (identical or conflicting values alike).
+    const auto contract = contract_for("configure", Json{{"value", Json{{"type", "string"}}}});
+    int failures        = 0;
     const std::string duplicate = tool_call("configure", {{"value", "first"}, {"value", "second"}});
     const auto parsed = fi::parse_qwen_tool_call_output(duplicate, 64, contract);
 
-    failures += check(parsed.is_tool_call_response, "duplicate parameter still fell back to text");
-    failures += check(parsed.content.empty(), "duplicate parameter left prose behind");
-    failures += check(parsed.tool_calls.size() == 1, "duplicate parameter did not yield one call");
-    if (parsed.tool_calls.size() == 1) {
-        failures += check(parsed.tool_calls.front().arguments_json == R"({"value":"second"})",
-                          "duplicate parameter did not keep the last value");
-    }
+    failures += check(!parsed.is_tool_call_response,
+                      "duplicate declared parameter was still accepted");
+    failures += check(parsed.content == duplicate,
+                      "duplicate parameter region was not returned verbatim");
+    failures += check(parsed.tool_calls.empty(), "duplicate parameter still yielded a call");
     failures += check(parsed.diagnostics.fallback_reason ==
-                          ninfer::ToolCallParseFallbackReason::None,
-                      "duplicate parameter still reported a fallback reason");
-    failures += check(parsed.diagnostics.duplicate_parameters_repaired == 1,
-                      "duplicate parameter repair was not recorded in diagnostics");
+                          ninfer::ToolCallParseFallbackReason::AmbiguousStructure,
+                      "duplicate parameter did not report ambiguous_structure");
     return failures;
 }
 
@@ -2758,9 +2832,15 @@ int test_recovery_policy_phase3() {
                           "streaming committed a cut string value");
 
         const auto tail = fi::parse_qwen_tool_call_output(trailing, 64, *contract, true, reason);
-        failures += check(tail.is_tool_call_response && tail.tool_calls.size() == 1 &&
-                              tail.diagnostics.fallback_reason == Reason::TruncatedTail,
-                          "complete calls before trailing prose were not recovered");
+        if (reason == FinishReason::StopToken) {
+            failures += check(tail.is_tool_call_response && tail.tool_calls.size() == 1 &&
+                                  tail.diagnostics.fallback_reason == Reason::TruncatedTail,
+                              "complete calls before trailing prose were not recovered at a natural stop");
+        } else {
+            failures += check(!tail.is_tool_call_response && tail.tool_calls.empty() &&
+                                  tail.diagnostics.fallback_reason == Reason::TrailingContent,
+                              "tolerant committed trailing prose under a cut finish reason");
+        }
         const auto tail_strict = fi::parse_qwen_tool_call_output(trailing, 64, *contract);
         failures += check(!tail_strict.is_tool_call_response &&
                               tail_strict.diagnostics.fallback_reason == Reason::TrailingContent,
@@ -2910,6 +2990,342 @@ int test_function_calls_holds_call_sequence() {
     return failures;
 }
 
+std::string json_escape(const std::string& text) {
+    std::string out;
+    out.reserve(text.size() + 8);
+    for (const char ch : text) {
+        switch (ch) {
+            case '"': out += "\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\n': out += "\\n"; break;
+            case '\r': out += "\\r"; break;
+            case '\t': out += "\\t"; break;
+            default: out += ch;
+        }
+    }
+    return out;
+}
+
+// Round-3 §7 reproducer corpus (Appendix A): the R3-01 markup payload, the R3-04 retry
+// ownership matrix, the R3-08 synthetic-argument matrix, the R3-05/R3-06 header and fence
+// cases, and the R3-09 no-marker diagnostic.
+int test_round3_spec_corpus() {
+    using ninfer::FinishReason;
+    using Reason = ninfer::ToolCallParseFallbackReason;
+    const std::vector<std::string> defs = {
+        tool_definition("write",
+                        Json{{"path", Json{{"type", "string"}}},
+                             {"content", Json{{"type", "string"}}}}),
+        tool_definition("bash", Json{{"command", Json{{"type", "string"}}}}),
+        tool_definition("edit", Json{{"path", Json{{"type", "string"}}},
+                                     {"old_string", Json{{"type", "string"}}},
+                                     {"new_string", Json{{"type", "string"}}}}),
+        tool_definition("search", Json{{"a/b", Json{{"type", "string"}}}}),
+        tool_definition("read", Json{{"path", Json{{"type", "string"}}}})};
+    const auto contract = contract_from_definitions(defs);
+    const fi::ToolCallOutputContract& c = *contract;
+    int failures = 0;
+    const std::string E  = tool_call("bash", {{"command", "rm -rf x"}});
+    const std::string Ex = tool_call("bash", {{"command", "ls"}});
+
+    auto one_call = [&](const char* label, const fi::ParsedToolCallOutput& parsed,
+                        const std::string& name, const std::string& args) {
+        return check(parsed.is_tool_call_response && parsed.tool_calls.size() == 1 &&
+                         parsed.tool_calls.front().name == name &&
+                         parsed.tool_calls.front().arguments_json == args &&
+                         parsed.diagnostics.fallback_reason == Reason::None,
+                     label);
+    };
+    auto as_text = [&](const char* label, const fi::ParsedToolCallOutput& parsed,
+                       const std::string& text, Reason reason) {
+        return check(!parsed.is_tool_call_response && parsed.content == text &&
+                         parsed.tool_calls.empty() &&
+                         parsed.diagnostics.fallback_reason == reason,
+                     label);
+    };
+
+    // R3-01: a quoted example that closes its own structure stays byte-exact.
+    const std::string inner = tool_call("write", {{"path", "x"}, {"content", "hello"}});
+    const std::string p_h_text =
+        tool_call("write", {{"path", "d.md"}, {"content", inner}});
+    const std::string p_h_args =
+        "{\"path\":\"d.md\",\"content\":\"" + json_escape(inner) + "\"}";
+    {
+        const auto p_h = fi::parse_qwen_tool_call_output(p_h_text, 64, c);
+        failures += one_call("R3 P-H: the quoted example is the exact content", p_h, "write", p_h_args);
+        failures += check(p_h.diagnostics.markup_tolerant_completion,
+                          "R3 P-H: resolved by the Stage-2 consistent completion");
+    }
+    {
+        const std::string r4_text = tool_call("write", {{"path", "d.md"},
+                                                        {"content", "A:\n" + Ex + "\nB:\n" + Ex + "\nEnd."}});
+        const std::string r4_args =
+            "{\"path\":\"d.md\",\"content\":\"" + json_escape("A:\n" + Ex + "\nB:\n" + Ex + "\nEnd.") + "\"}";
+        const auto r4 = fi::parse_qwen_tool_call_output(r4_text, 64, c);
+        failures += one_call("R3 R4: two embedded examples stay byte-exact", r4, "write", r4_args);
+        std::string big;
+        for (int i = 0; i < 2000; ++i) { big += Ex + "\n"; }
+        const auto scale = fi::parse_qwen_tool_call_output(
+            tool_call("write", {{"path", "d.md"}, {"content", big}}), 64, c);
+        failures += check(scale.is_tool_call_response && scale.tool_calls.size() == 1 &&
+                              scale.tool_calls.front().name == "write" &&
+                              scale.tool_calls.front().arguments_json ==
+                                  "{\"path\":\"d.md\",\"content\":\"" + json_escape(big) + "\"}",
+                          "R3 scale: 2000 embedded examples round-trip byte-exact");
+    }
+    {
+        // TAIL: the value itself ends with the closer literal (LF and CRLF continuations).
+        for (const char* line : {"\n", "\r\n"}) {
+            const std::string value = std::string("x") + line + "</parameter>";
+            const std::string text = tool_call("write", {{"path", "d.md"}, {"content", value}});
+            const auto parsed = fi::parse_qwen_tool_call_output(text, 64, c);
+            failures += one_call(line == "\n" ? "R3 TAIL LF" : "R3 TAIL CRLF", parsed, "write",
+                                 std::string("{\"path\":\"d.md\",\"content\":\"") +
+                                     json_escape(value) + "\"}");
+        }
+    }
+    // R2: the first region is prose before the real turn; the retry finds the real one.
+    {
+        const std::string r2_text = "Example:\n" + Ex + "\nNow writing.\n" +
+                                   tool_call("write", {{"path", "d.md"}, {"content", "Doc\n" + Ex + "\nmore"}});
+        const std::string r2_args =
+            "{\"path\":\"d.md\",\"content\":\"" + json_escape("Doc\n" + Ex + "\nmore") + "\"}";
+        const auto r2 = fi::parse_qwen_tool_call_output(r2_text, 64, c);
+        failures += one_call("R3 R2: the real turn after a quoted example", r2, "write", r2_args);
+    }
+    // R6: a complete call plus a trailing closer echo is text.
+    {
+        const std::string r6_text = tool_call("bash", {{"command", "echo real"}}) +
+                                   "\nNote: calls end with </parameter>\n</function>\n</tool_call>";
+        const auto r6 = fi::parse_qwen_tool_call_output(r6_text, 64, c);
+        failures += as_text("R3 R6: the trailing closer echo keeps the region text",
+                            r6, r6_text, Reason::TrailingContent);
+    }
+    // R3-04: the natural-stop retry re-reads the quoted example; the cut never does.
+    {
+        const std::string p_a_text =
+            "<function=write>\n<parameter=path>\nd.md\n</parameter>\n<parameter=content>\nExample:\n" + E;
+        const std::string p_a_args = "{\"command\":\"rm -rf x\"}";
+        for (const bool tolerant : {false, true}) {
+            const auto st = fi::parse_qwen_tool_call_output(p_a_text, 64, c, tolerant,
+                                                            FinishReason::StopToken);
+            failures += one_call(tolerant ? "R3 P-A StopToken tolerant: the example call"
+                                          : "R3 P-A StopToken: the example call",
+                                 st, "bash", p_a_args);
+            const auto ol = fi::parse_qwen_tool_call_output(p_a_text, 64, c, tolerant,
+                                                            FinishReason::OutputLimit);
+            failures += as_text(tolerant ? "R3 P-A OutputLimit tolerant: text" : "R3 P-A OutputLimit: text",
+                                ol, p_a_text,
+                                tolerant ? Reason::TruncatedTail : Reason::MalformedStructure);
+        }
+    }
+    // P-A3: an embedded example inside a closed value never executes.
+    {
+        const std::string p_a3_text = "<function=write>\n<parameter=content>\nEx:\n" + E +
+                                      "\nDone.\n</parameter>\n";
+        for (const bool tolerant : {false, true}) {
+            for (const auto reason : {FinishReason::StopToken, FinishReason::OutputLimit}) {
+                const auto parsed = fi::parse_qwen_tool_call_output(p_a3_text, 64, c, tolerant, reason);
+                failures += as_text("R3 P-A3: the closed value keeps the example inert",
+                                    parsed, p_a3_text,
+                                    tolerant ? Reason::TruncatedTail : Reason::MalformedStructure);
+            }
+        }
+    }
+    // R3-08: synthetic arguments make a declared-tool call ambiguous; the legacy contract
+    // keeps last-value semantics.
+    {
+        const std::string e2_text = "<tool_call>\n<function=write>\n<parameter=path>\nd.md\n</parameter>\n"
+                                    "<parameter=content>\nIntro\n</parameter>\n<parameter=content>\ntail\n</parameter>\n"
+                                    "</function>\n</tool_call>";
+        for (const bool tolerant : {false, true}) {
+            const auto e2 = fi::parse_qwen_tool_call_output(e2_text, 64, c, tolerant);
+            failures += as_text(tolerant ? "R3 E2 tolerant: duplicate name is ambiguous"
+                                         : "R3 E2: duplicate name is ambiguous",
+                                e2, e2_text, Reason::AmbiguousStructure);
+        }
+        const auto e2_legacy = fi::parse_qwen_tool_call_output(e2_text, 64, kLegacyContract);
+        failures += one_call("R3 E2 legacy: the legacy contract keeps last value",
+                             e2_legacy, "write", "{\"path\":\"d.md\",\"content\":\"tail\"}");
+        failures += check(e2_legacy.diagnostics.duplicate_parameters_repaired == 1,
+                          "R3 E2 legacy: the duplicate is counted");
+        const std::string e1_text = "<tool_call>\n<function=edit>\n<parameter=path>\nd.md\n</parameter>\n"
+                                    "<parameter=old_string>\nx\n</parameter>\n<parameter=content>\nhello\n</parameter>\n"
+                                    "<parameter=new_string>\nNEW\n</parameter>\n</function>\n</tool_call>";
+        const auto e1 = fi::parse_qwen_tool_call_output(e1_text, 64, c);
+        failures += as_text("R3 E1: a non-declared name outside the first parameter is ambiguous",
+                            e1, e1_text, Reason::AmbiguousStructure);
+        const std::string e3_text = "<tool_call>\n<function=edit>\n<parameter=path>\nd.md\n</parameter>\n"
+                                    "<parameter=old_string>\nx\n</parameter>\n<parameter=mode>\nhello\n</parameter>\n"
+                                    "<parameter=new_string>\nNEW\n</parameter>\n</function>\n</tool_call>";
+        const auto e3 = fi::parse_qwen_tool_call_output(e3_text, 64, c);
+        failures += as_text("R3 E3: a placeholder name instead of the declared one is ambiguous",
+                            e3, e3_text, Reason::AmbiguousStructure);
+    }
+    // R3-05: a quoted '>' does not break the header; the '/' stays part of the parameter name.
+    {
+        const std::string s5b_text = "<tool_call>\n<function=search>\n<parameter=a/b>\nx\n</parameter>\n"
+                                     "</function>\n</tool_call>";
+        const auto s5b = fi::parse_qwen_tool_call_output(s5b_text, 64, c);
+        failures += one_call("R3 S5b: the '/' keeps the declared parameter name",
+                             s5b, "search", "{\"a/b\":\"x\"}");
+        const std::string p_b_text =
+            tool_call("bash", {{"command", "grep '</parameter><parameter name=\"' file"}});
+        const auto p_b = fi::parse_qwen_tool_call_output(p_b_text, 64, c);
+        failures += one_call("R3 P-B: the echoed markup stays the exact command",
+                             p_b, "bash",
+                             "{\"command\":\"grep '</parameter><parameter name=\\\"' file\"}");
+    }
+    // R3-09: an output without any marker records the reason none.
+    {
+        const auto s4 = fi::parse_qwen_tool_call_output("Just an answer.", 64, c);
+        failures += as_text("R3 S4: no marker records the reason none", s4, "Just an answer.",
+                            Reason::None);
+    }
+    // R3-02: a quoted broken wrapper no longer hides the real turn.
+    {
+        const std::string s2_text = "I will emit a <tool_call> block now.\n" +
+                                   tool_call("write", {{"path", "d.md"}, {"content", "Doc"}});
+        const auto s2 = fi::parse_qwen_tool_call_output(s2_text, 64, c);
+        failures += one_call("R3 S2: the real call after quoted prose", s2, "write",
+                             "{\"path\":\"d.md\",\"content\":\"Doc\"}");
+        const std::string p_d_text = "For example:\n" + tool_call("read", {{"path", "ex.txt"}}) +
+                                     "\nNow the real one.\n" +
+                                     tool_call("bash", {{"command", "echo real"}});
+        for (const bool tolerant : {false, true}) {
+            const auto p_d = fi::parse_qwen_tool_call_output(p_d_text, 64, c, tolerant);
+            failures += one_call(tolerant ? "R3 P-D tolerant: the later complete call" : "R3 P-D strict: the later complete call",
+                                 p_d, "bash", "{\"command\":\"echo real\"}");
+        }
+    }
+    // R3-06: fence variants that must not suppress the following real marker.
+    {
+        const std::string f2_text = "```x``` is inline code\n" +
+                                   tool_call("write", {{"path", "d.md"}, {"content", "Doc"}});
+        const auto f2 = fi::parse_qwen_tool_call_output(f2_text, 64, c);
+        failures += one_call("R3 F2: inline backticks are not a fence", f2, "write",
+                             "{\"path\":\"d.md\",\"content\":\"Doc\"}");
+        const std::string f3_text = "- step:\n  ```bash\n  make\n    ```\nNow calling.\n" +
+                                   tool_call("write", {{"path", "d.md"}, {"content", "Doc"}});
+        const auto f3 = fi::parse_qwen_tool_call_output(f3_text, 64, c);
+        failures += one_call("R3 F3: a list-indented closed fence releases the marker",
+                             f3, "write", "{\"path\":\"d.md\",\"content\":\"Doc\"}");
+        const std::string s3_text = "Here is code:\n```python\nprint(1)\n\n" +
+                                   tool_call("write", {{"path", "d.md"}, {"content", "Doc"}});
+        const auto s3 = fi::parse_qwen_tool_call_output(s3_text, 64, c);
+        failures += as_text("R3 S3: an unclosed fence keeps the region text",
+                            s3, s3_text, Reason::None);
+        failures += check(s3.diagnostics.ended_in_unclosed_fence,
+                          "R3 S3: the unclosed fence is diagnosed");
+        failures += check(s3.diagnostics.fenced_markers_suppressed == 2,
+                          "R3 S3: the fenced markers are counted as suppressed");
+    }
+    return failures;
+}
+
+// R3-07: streaming equivalence fuzz over the §10.3 fragment corpus — one-shot parsing and
+// streamed parsing (full feed and byte-at-a-time) must agree on every text.
+int test_round3_streaming_equivalence_fuzz() {
+    using ninfer::FinishReason;
+    const std::vector<std::string> frags = {
+        "<tool_call>\n", "</tool_call>\n", "<function=write>\n", "<function=bash>\n", "</function>\n",
+        "<parameter=path>\n", "<parameter=content>\n", "<parameter=command>\n", "</parameter>\n",
+        "text ", "x\n", "```\n", "```xml\n", "~~~\n", "  ```\n", "<", ">", "\"", "'", "\r\n",
+        "<function name=\"", "<invoke=bash>", "</invoke>", "<param=command>", "</param>",
+        "<function_calls>\n", "</function_calls>\n", "echo '</parameter>'\n", "<tool_c", "<function",
+        "prose. ", "\n"};
+    const std::string tail =
+        "<tool_call>\n<function=bash>\n<parameter=command>\nls\n</parameter>\n</function>\n</tool_call>";
+    const std::vector<std::string> defs = {
+        tool_definition("write",
+                        Json{{"path", Json{{"type", "string"}}},
+                             {"content", Json{{"type", "string"}}}}),
+        tool_definition("bash", Json{{"command", Json{{"type", "string"}}}})};
+    const auto contract = contract_from_definitions(defs);
+    const fi::ToolCallOutputContract& c = *contract;
+    std::mt19937 rng(20260930);
+    int failures = 0;
+    for (int t = 0; t < 512; ++t) {
+        std::string text;
+        const int count = 2 + int(rng() % 14);
+        for (int i = 0; i < count; ++i) { text += frags[rng() % frags.size()]; }
+        if (rng() % 3 == 0) { text += tail; }
+        const auto one = fi::parse_qwen_tool_call_output(text, 64, c);
+        fi::ToolCallOutputDecoder decoder(std::make_shared<fi::ToolCallOutputContract>(c), 64,
+                                          false);
+        std::string visible;
+        if (t < 256) {
+            for (std::size_t i = 0; i < text.size(); ++i) { visible += decoder.feed(text.substr(i, 1)); }
+        } else {
+            visible += decoder.feed(std::string_view(text));
+        }
+        const auto terminal = decoder.finish(FinishReason::StopToken);
+        std::string total = visible + terminal.content;
+        if (one.is_tool_call_response) {
+            // the one-shot entry rtrims the pre-region format whitespace; the streaming
+            // surface keeps it in the published visible bytes.
+            while (!total.empty() && fi::is_tool_format_whitespace(total.back())) { total.pop_back(); }
+        }
+        bool match = total == one.content &&
+                           one.is_tool_call_response == !terminal.tool_calls.empty() &&
+                           one.tool_calls.size() == terminal.tool_calls.size() &&
+                           one.diagnostics.fallback_reason == terminal.diagnostics.fallback_reason;
+        std::string first_mismatch;
+        for (std::size_t i = 0; match && i < one.tool_calls.size(); ++i) {
+            match = one.tool_calls[i].name == terminal.tool_calls[i].name &&
+                    one.tool_calls[i].arguments_json == terminal.tool_calls[i].arguments_json;
+            if (!match) { first_mismatch = "call " + std::to_string(i); }
+        }
+        failures += check(match, first_mismatch.empty()
+                                     ? ("R3 fuzz " + std::to_string(t) +
+                                        ": one-shot and streaming disagree")
+                                     : ("R3 fuzz " + std::to_string(t) + " mismatches at " + first_mismatch));
+    }
+    return failures;
+}
+
+// R3-14: deterministic work bounds (step counters, not wall-clock): 4000 bare open regions
+// leave Stage 2 uncharged; a 40 KB unterminated quoted header bounds the pre-latch rescan;
+// 2000 closer triples bound the Stage-2 steps.
+int test_round3_work_bounds() {
+    using ninfer::FinishReason;
+    fi::ToolCallParsePolicy policy;
+    policy.max_name_length = 64;
+    int failures = 0;
+    {
+        std::string text;
+        text.reserve(4000 * 34);
+        for (int i = 0; i < 4000; ++i) { text += "<function=write>\n<parameter=content>\n"; }
+        fi::ToolCallStreamParser machine(policy);
+        machine.feed(std::string_view(text));
+        const auto term = machine.finish(FinishReason::StopToken);
+        failures += check(term.status == fi::ToolCallStreamStatus::Invalid && term.stage2_steps == 0,
+                          "R3-14: 4000 bare open regions reject with Stage 2 uncharged");
+    }
+    {
+        std::string header = "<parameter name=\"";
+        header.append(40 * 1024, 'x');
+        fi::ToolCallStreamParser machine(policy);
+        machine.feed(std::string_view(header));
+        const auto term = machine.finish(FinishReason::OutputLimit);
+        failures += check(term.rescan_steps < 512,
+                          "R3-14: a 40 KB unterminated quoted header bounds the rescan");
+    }
+    {
+        std::string text = "<function=write>\n";
+        for (int i = 0; i < 2000; ++i) {
+            text += "<parameter=p>\nv\n</parameter>\n</parameter>\n</parameter>\n";
+        }
+        fi::ToolCallStreamParser machine(policy);
+        machine.feed(std::string_view(text));
+        const auto term = machine.finish(FinishReason::OutputLimit);
+        failures += check(term.stage2_steps < 4096,
+                          "R3-14: 2000 closer triples bound the Stage-2 steps");
+    }
+    return failures;
+}
+
+
 int main() {
     int failures = 0;
     failures += test_duplicate_parameter_keeps_last_value();
@@ -2975,6 +3391,9 @@ int main() {
     failures += test_placeholder_function_name_is_not_executable();
     failures += test_fenced_content_never_latches();
     failures += test_fence_split_at_every_byte();
+    failures += test_round3_spec_corpus();
+    failures += test_round3_streaming_equivalence_fuzz();
+    failures += test_round3_work_bounds();
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }

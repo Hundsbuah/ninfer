@@ -101,12 +101,16 @@ directly, so parser and constraint cannot drift.
 ### D2 — lazy trigger
 
 No restriction before a complete marker trigger (ordinary prose and reasoning blocks stay
-free, matching the Qwen3-Coder reference's trigger choice). The inactive scan mirrors the
-parser machine's feed rule byte for byte for the marker candidate: a `<` starts a candidate
-only when none is held; every further byte — including `<` — is appended and classified; a
-`NotMarker` classification flushes the whole candidate as prose and the breaking byte is
-consumed (it never starts a new candidate). The first trigger is therefore exactly the
-parser's latch: `<tool_call>`, `<function_calls>`, or a complete function/invoke opener
+free, matching the Qwen3-Coder reference's trigger choice). The inactive scan is a
+**superset approximation** of the parser's pre-latch machine, not a byte-for-byte mirror
+(R3-11, verified by probe2 P-F): since CR6 the parser runs a line-oriented fence tracker
+over the pre-latch bytes (a complete marker inside a recognized fence never latches), and
+since R3-05 its `NotMarker` handling publishes the failed candidate head and re-feeds the
+bytes from the next `<` (a deterministic rescan) — the inactive scan runs neither, so it
+can trigger where the parser does not latch (e.g. a `<tool_call>` inside a ```` ``` ````
+fence).
+The first trigger is the parser's latch **modulo the fence**: `<tool_call>`,
+`<function_calls>`, or a complete function/invoke opener
 (`classify_tool_marker_prefix == Complete`). After a region closes, a later complete marker
 retriggers (the parser's region parse accepts a flat call sequence; its retry re-reads a
 failed slice at a later `<tool_call>` wrapper). The rescan after a close is a deliberate
@@ -133,9 +137,13 @@ tokens (tokenizer detokenization) before calling the state.
   or close).
 - `Rejected`: the bytes cause a **definitive** structural break (`MalformedStructure` /
   `InvalidToolName`) at a position where a legal continuation existed before the candidate.
-  `TrailingContent` (a non-marker byte after a complete call) is *not* a break: the region
-  closed earlier and the remaining bytes are unconstrained prose (the state deactivates and
-  re-enters marker tracking).
+  `TrailingContent` (a non-marker byte after a complete call inside the latched region) is
+  *not* a break for the constraint: the region closed earlier and the remaining bytes are
+  unconstrained prose (the state deactivates and re-enters marker tracking). Note the
+  asymmetry (R3-11): in **strict** mode the parser rejects the whole region as
+  `TrailingContent` — the constraint's `Allowed` verdict does not prevent that failure
+  (tolerant mode commits the complete calls). The parser remains the final authority;
+  `Allowed` only guides masking.
 - `NeedMore`: the candidate ends inside a marker trigger; the grammar cannot decide yet (the
   bytes are legal so far; masking treats the candidate as allowed, the state stays pending).
 
@@ -238,7 +246,7 @@ defaulted off).
 | CPU grammar-state core (`ToolCallGrammarConstraint`) | implemented, pure CPU, deterministic |
 | CPU grammar logic (P4.12 matrix) | verified by `ninfer_tool_call_grammar_state_test` (16 test groups incl. every-byte-split property, checkpoint/restore, draft accept/rollback/correction) |
 | Parser grammar as source of truth | verified: the constraint consumes `classify_tool_marker_prefix` + `parse_tool_call_region` directly; no second wire grammar |
-| Lazy trigger | tested (partial marker → `NeedMore`; prose never rejects; the inactive scan mirrors the machine's feed rule byte for byte — second-`<` flush and a quoted `<` in a header included) |
+| Lazy trigger | tested (partial marker → `NeedMore`; prose never rejects) — the inactive scan is a superset approximation of the parser's pre-latch machine (no fence tracker, no R3-05 rescan; R3-11), not a byte-for-byte mirror |
 | Checkpoint/rollback (P4.8) | tested (value semantics; restore reproduces fresh-state behavior) |
 | Speculative semantics | documented (D7); CPU state semantics tested; GPU runtime flow build-verified only, **not verified** |
 | CUDA integration compiles | the flag, the option, and the constraint core compile into the CUDA build (`ninfer_model_runtime`); the sampling pipeline is unchanged when the flag is off |

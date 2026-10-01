@@ -22,8 +22,12 @@ namespace ninfer::models::qwen3_5::frontend {
 //   attribute    := attr-name ws* "=" ws* value
 //   attr-name    := name-char+
 //   value        := quoted | unquoted
-//   quoted       := '"' any* '"' | "'" any* "'"                  (no escape; ">" may appear)
-//   unquoted     := char+ excluding format whitespace, ">", "/"  (empty is invalid)
+//   quoted       := '"' line* '"' | "'" line* "'"                  (no escape; ">" may appear;
+//                                                           a CR or LF inside is Invalid — a
+//                                                           header is single-line)
+//   unquoted     := char+ excluding format whitespace, ">", "/"
+//                  (empty is invalid; "/" is admitted in the short form of parameter/param
+//                  names only — R3-10)
 //
 // After an attribute value or the short value, only format whitespace or ">" may follow.
 // A quoted value ends only at the matching quote; the first unquoted ">" ends the header.
@@ -107,16 +111,22 @@ struct ToolOpenTag {
     return kind == ToolTagKind::Parameter || kind == ToolTagKind::Param;
 }
 
-// F8 marker progression: a held marker candidate that the grammar classified as
-// definitively NotMarker is split at its breaking (last) byte. A breaking '<' becomes the
-// start of a fresh candidate; the failed bytes before it are ordinary content. Any other
-// breaking byte flushes the whole candidate. The grammar decision is final: a '<' that the
-// header grammar still accepts (a quoted value) keeps the candidate NeedMore and never
+// R3-05 (F8): the maximal header size (bytes after the keyword). A header whose terminating '>'
+// is not reached inside the bound is Invalid instead of NeedMore: prose carrying a truncated
+// or unterminated header cannot hold the candidate machine (and the NotMarker rescan) in
+// quadratic work. A marker is never truncated by the bound: a valid header longer than the
+// bound is rejected, which is the documented (extreme) limit.
+inline constexpr std::size_t kMaxToolHeaderBytes = 1024;
+// R3-05/R3-13: the single NotMarker split shared by the pre-latch feed and the Phase-4
+// constraint core: the rescan start is the first '<' after position 0 of the failed
+// candidate (the breaking byte when it is a '<'); npos flushes the whole candidate. A '<'
+// the header grammar still accepts (a quoted value) keeps the candidate NeedMore and never
 // reaches this split.
 [[nodiscard]] constexpr std::size_t
-failed_marker_candidate_retained(std::string_view candidate) noexcept {
-    return candidate.size() >= 2 && candidate.back() == '<' ? 1 : 0;
+failed_marker_candidate_rescan_start(std::string_view candidate) noexcept {
+    return candidate.find('<', 1);
 }
+
 
 // Parse the opener at `text[0] == '<'` for one family. Wrapper families match the exact literal
 // (a strict prefix is NeedMore). Tag families parse the header; a quoted value may contain '>'
@@ -147,10 +157,8 @@ parse_tool_header_after_keyword(std::string_view text, ToolTagKind kind, ToolOpe
 classify_tool_marker_prefix(std::string_view text, ToolOpenTag& out) noexcept;
 
 // First position at or after `search_from` at which a complete top-level marker starts,
-// or npos. With `wrapper_only`, only the wrapper literals qualify: recovery entries after
-// a failed region that broke with a wrapper open (F7 entry-marker policy).
-[[nodiscard]] std::size_t find_tool_marker(std::string_view text, std::size_t search_from = 0,
-                                           bool wrapper_only = false)
+// or npos.
+[[nodiscard]] std::size_t find_tool_marker(std::string_view text, std::size_t search_from = 0)
     noexcept;
 
 // R2-I4 (CR4): the single top-level entry classification. The region parser's Top state and the
