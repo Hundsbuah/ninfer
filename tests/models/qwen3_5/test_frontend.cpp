@@ -2213,6 +2213,7 @@ int test_finish_reason_sensitive_tool_parsing() {
 // Content byte even under RequireToolAtContentStart. A content preamble after the close
 // locks the gate (the hardened mode then rejects the later call).
 int test_reasoning_before_tool_call_keeps_intent_gate_open() {
+    int failures = 0;
     const Frontend frontend = make_frontend(resources());
 
     ninfer::ChatMessage message;
@@ -2229,87 +2230,97 @@ int test_reasoning_before_tool_call_keeps_intent_gate_open() {
     auto prompt = frontend.prepare(std::move(input));
     const std::string tool_call_text = "<tool_call>\n<function=bash>\n<parameter=command>\n"
                                        "echo example\n</parameter>\n</function>\n</tool_call>";
-    int failures = 0;
 
     const auto hardened_options = ninfer::OutputOptions{
         .tool_name_max_length = 64,
         .tolerant_tool_calls  = false,
         .tool_call_intent     = ninfer::ToolCallIntentPolicy::RequireToolAtContentStart};
-
-    // 1. Reasoning text, then a content-start tool call: the hardened mode commits the
     //    call (reasoning bytes do not close the Content gate).
     {
         auto session = frontend.make_output_session(prompt, {}, hardened_options);
         const auto reasoning_tokens =
-            fixture_tokenizer().encode("I should inspect the repo\n\n\n");
+            fixture_tokenizer().encode("I should inspect the repo\n\074/think>\n\n");
         const auto first = session.preview_model(
             reasoning_tokens, static_cast<std::uint32_t>(reasoning_tokens.size()) + 1,
             ninfer::FinishReason::OutputLimit);
         failures += check(!first.finished(),
                           "the reasoning-close round must stay non-terminal");
-        (void)session.commit_preview();
+        const auto first_output = session.commit_preview();
         failures += check(session.take_tool_calls().empty(),
                           "the reasoning round must not commit a call");
 
         const auto call_tokens = fixture_tokenizer().encode(tool_call_text);
         const auto second = session.preview_model(
             call_tokens, static_cast<std::uint32_t>(call_tokens.size()),
-            ninfer::FinishReason::StopToken);
+            ninfer::FinishReason::OutputLimit);
         failures += check(second.finished() &&
-                              second.finish_reason == ninfer::FinishReason::StopToken,
-                          "the tool-call round must terminalize on the stop token");
+                              second.finish_reason == ninfer::FinishReason::OutputLimit,
+                          "the tool-call round must terminalize on the stored budget cut");
         const auto output = session.commit_preview();
         const auto calls = session.take_tool_calls();
         failures += check(calls.size() == 1 && calls.front().name == "bash" &&
                               calls.front().arguments_json == "{\"command\":\"echo example\"}",
                           "a content-start call after reasoning must commit under the hardened mode");
         failures += check(
-            channel_text(output, ninfer::OutputChannel::Reasoning) == "I should inspect the repo",
+            channel_text(first_output, ninfer::OutputChannel::Reasoning) == "I should inspect the repo\n",
             "the reasoning text must route to the reasoning channel, not the Content gate");
     }
-    // 2. Reasoning text, then a visible Content preamble, then the tool call: the hardened
+    // 2. Reasoning close, then a visible Content preamble, then the tool call: the hardened
     //    mode locks to text (the Content preamble closes the gate).
     {
         auto session = frontend.make_output_session(prompt, {}, hardened_options);
-        const auto preamble_tokens =
-            fixture_tokenizer().encode("I should inspect the repo\n\n\nI will inspect it.\n");
+        const auto reasoning_tokens =
+            fixture_tokenizer().encode("I should inspect the repo\n\074/think>\n\n");
         const auto first = session.preview_model(
+            reasoning_tokens, static_cast<std::uint32_t>(reasoning_tokens.size()) + 1,
+            ninfer::FinishReason::OutputLimit);
+        failures += check(!first.finished(),
+                          "the reasoning-close round must stay non-terminal");
+        (void)session.commit_preview();
+        const auto preamble_tokens = fixture_tokenizer().encode("I will inspect it.\n");
+        const auto second = session.preview_model(
             preamble_tokens, static_cast<std::uint32_t>(preamble_tokens.size()) + 1,
             ninfer::FinishReason::OutputLimit);
-        failures += check(!first.finished(), "the preamble round must stay non-terminal");
+        failures += check(!second.finished(), "the preamble round must stay non-terminal");
         (void)session.commit_preview();
 
         const auto call_tokens = fixture_tokenizer().encode(tool_call_text);
-        const auto second = session.preview_model(
+        const auto third = session.preview_model(
             call_tokens, static_cast<std::uint32_t>(call_tokens.size()),
-            ninfer::FinishReason::StopToken);
-        (void)second;
+            ninfer::FinishReason::OutputLimit);
+        (void)third;
         const auto output = session.commit_preview();
         const auto calls = session.take_tool_calls();
         failures += check(calls.empty(),
                           "a content preamble after reasoning must lock the hardened mode to text");
-        failures += check(channel_text(output, ninfer::OutputChannel::Content) == tool_call_text,
-                          "the locked tool markup must return as verbatim content");
+        failures += check(channel_text(output, ninfer::OutputChannel::Content) ==
+                              std::string("\n") + tool_call_text,
+                          "the locked tool markup must return as verbatim content (plus the held separator)");
     }
-    // 3. Control: the same prose-prefixed stream under TemplateCompatible commits the call.
+    // 3. Control: the same close-preamble-call stream under TemplateCompatible commits the call.
     {
         const ninfer::OutputOptions compatible_options = {
             .tool_name_max_length = 64,
-            .tolerant_tool_calls  = false,
             .tool_call_intent     = ninfer::ToolCallIntentPolicy::TemplateCompatible};
         auto session = frontend.make_output_session(prompt, {}, compatible_options);
-        const auto preamble_tokens =
-            fixture_tokenizer().encode("I should inspect the repo\n\n\nI will inspect it.\n");
+        const auto reasoning_tokens =
+            fixture_tokenizer().encode("I should inspect the repo\n\074/think>\n\n");
         const auto first = session.preview_model(
-            preamble_tokens, static_cast<std::uint32_t>(preamble_tokens.size()) + 1,
+            reasoning_tokens, static_cast<std::uint32_t>(reasoning_tokens.size()) + 1,
             ninfer::FinishReason::OutputLimit);
         (void)first;
         (void)session.commit_preview();
-        const auto call_tokens = fixture_tokenizer().encode(tool_call_text);
+        const auto preamble_tokens = fixture_tokenizer().encode("I will inspect it.\n");
         const auto second = session.preview_model(
-            call_tokens, static_cast<std::uint32_t>(call_tokens.size()),
-            ninfer::FinishReason::StopToken);
+            preamble_tokens, static_cast<std::uint32_t>(preamble_tokens.size()) + 1,
+            ninfer::FinishReason::OutputLimit);
         (void)second;
+        (void)session.commit_preview();
+        const auto call_tokens = fixture_tokenizer().encode(tool_call_text);
+        const auto third = session.preview_model(
+            call_tokens, static_cast<std::uint32_t>(call_tokens.size()),
+            ninfer::FinishReason::OutputLimit);
+        (void)third;
         (void)session.commit_preview();
         const auto calls = session.take_tool_calls();
         failures += check(calls.size() == 1 && calls.front().name == "bash",
