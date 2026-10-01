@@ -2071,6 +2071,143 @@ int test_preview_terminal_reason_transaction() {
     return failures;
 }
 
+// R5-01/R5-02 (spec 7.1-7.3, Appendix A): the finish reason the tool-call parser observes
+// through the OutputSession transaction must equal the one a direct parser call observes.
+// The R3 S8-cut residual fixture (pinned in test_tool_call_parser.cpp) is the reason-sensitive
+// case: a tolerant natural stop commits the truncated call, while every cut reason commits
+// nothing. Before Round 5 these commits terminalized the parser with FinishReason::None and
+// wrongly committed the cut cases.
+int test_finish_reason_sensitive_tool_parsing() {
+    const Frontend frontend = make_frontend(resources());
+
+    ninfer::ChatMessage message;
+    message.role = ninfer::ChatRole::User;
+    message.parts.push_back(
+        ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text, .text = "x", .media = {}});
+    ninfer::PromptInput input;
+    input.messages.push_back(std::move(message));
+    input.options.enable_thinking = false;
+    const std::string bash_tool =
+        R"({"type":"function","function":{"name":"bash","parameters":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}}})";
+    input.options.tool_jsons.push_back(bash_tool);
+    auto prompt = frontend.prepare(std::move(input));
+    const std::vector<std::string> tool_jsons = {bash_tool};
+    const auto contract = fi::build_tool_call_output_contract(
+        std::span<const std::string>(tool_jsons.data(), tool_jsons.size()), true);
+    const ninfer::OutputOptions options = {
+        .tool_name_max_length = 64, .tolerant_tool_calls = true};
+
+    // R3 S8-cut: the real closer is cut after the here-doc's final EOF line.
+    const std::string s8_cut = "<tool_call>\n<function=bash>\n<parameter=command>\ncat <<EOF\n"
+                               "</parameter>\n</function>\n</tool_call>\nEOF";
+    const std::vector<ninfer::TokenId> tokens = fixture_tokenizer().encode(s8_cut);
+    int failures = 0;
+
+    auto tolerant_session = [&]() {
+        return frontend.make_output_session(
+            prompt, ninfer::StopPolicy{.include_model_defaults = false}, options);
+    };
+    auto match_direct = [&](ninfer::models::qwen3_5::OutputSession& session, const char* label,
+                            const std::string& text, ninfer::FinishReason reason, bool expect_call) {
+        const auto direct = fi::parse_qwen_tool_call_output(text, 64, *contract, true, reason);
+        const auto calls = session.take_tool_calls();
+        const bool calls_ok = expect_call
+                                 ? (calls.size() == 1 && calls.front().name == "bash" &&
+                                    calls.front().arguments_json == "{\"command\":\"cat <<EOF\"}")
+                                 : calls.empty();
+        failures += check(calls_ok && direct.tool_calls.size() == calls.size(), label);
+        failures += check(session.tool_call_parse_diagnostics() == direct.diagnostics, label);
+    };
+
+    // OutputLimit: a budget-exhausting round over the cut residual commits nothing.
+    {
+        auto session = tolerant_session();
+        const auto decision =
+            session.preview_model(tokens, static_cast<std::uint32_t>(tokens.size()),
+                                  ninfer::FinishReason::OutputLimit);
+        failures += check(decision.finished() &&
+                              decision.finish_reason == ninfer::FinishReason::OutputLimit,
+                          "the OutputLimit round must terminalize with the budget reason");
+        const auto output = session.commit_preview();
+        failures += check(channel_text(output, ninfer::OutputChannel::Content) == s8_cut,
+                          "the OutputLimit commit must return the cut region as text");
+        match_direct(session, "OutputLimit must reach the parser as a cut", s8_cut,
+                     ninfer::FinishReason::OutputLimit, false);
+    }
+    // ContextCapacity: the same residual under the context-capacity cut.
+    {
+        auto session = tolerant_session();
+        (void)session.preview_model(tokens, static_cast<std::uint32_t>(tokens.size()),
+                                    ninfer::FinishReason::ContextCapacity);
+        const auto output = session.commit_preview();
+        failures += check(channel_text(output, ninfer::OutputChannel::Content) == s8_cut,
+                          "the ContextCapacity commit must return the cut region as text");
+        match_direct(session, "ContextCapacity must reach the parser as a cut", s8_cut,
+                     ninfer::FinishReason::ContextCapacity, false);
+    }
+    // Cancelled: a between-round cancellation over the buffered residual.
+    {
+        auto session = tolerant_session();
+        (void)session.preview_model(tokens, static_cast<std::uint32_t>(tokens.size()) + 1,
+                                    ninfer::FinishReason::OutputLimit);
+        (void)session.commit_preview();
+        (void)session.preview_terminal(ninfer::FinishReason::Cancelled);
+        const auto output = session.commit_preview();
+        failures += check(channel_text(output, ninfer::OutputChannel::Content) == s8_cut,
+                          "the cancelled commit must return the buffered region as text");
+        match_direct(session, "Cancelled must reach the parser as a cut", s8_cut,
+                     ninfer::FinishReason::Cancelled, false);
+    }
+    // StopToken: the natural stop still commits the pinned residual (R3-03 behavior).
+    {
+        ninfer::StopPolicy stop = {.include_model_defaults = false};
+        stop.token_ids.push_back(1);
+        auto session = frontend.make_output_session(prompt, stop, options);
+        std::vector<ninfer::TokenId> with_stop(tokens.begin(), tokens.end());
+        with_stop.push_back(1);
+        const auto decision = session.preview_model(
+            with_stop, static_cast<std::uint32_t>(with_stop.size()),
+            ninfer::FinishReason::OutputLimit);
+        failures += check(decision.finished() &&
+                              decision.finish_reason == ninfer::FinishReason::StopToken,
+                          "the stop token must terminalize the round");
+        const auto output = session.commit_preview();
+        failures += check(channel_text(output, ninfer::OutputChannel::Content).empty(),
+                          "the stop-token commit must not leak the region to content");
+        match_direct(session, "StopToken keeps the natural-stop residual commit", s8_cut,
+                     ninfer::FinishReason::StopToken, true);
+    }
+    // StopString: a stop-string cut over the residual commits nothing.
+    {
+        ninfer::StopPolicy stop = {.include_model_defaults = false};
+        stop.strings.push_back(ninfer::StopString{.text = "STOP"});
+        auto session = frontend.make_output_session(prompt, stop, options);
+        const std::string text = s8_cut + "\nSTOP";
+        const std::vector<ninfer::TokenId> stop_tokens = fixture_tokenizer().encode(text);
+        const auto decision = session.preview_model(
+            stop_tokens, static_cast<std::uint32_t>(stop_tokens.size()),
+            ninfer::FinishReason::OutputLimit);
+        failures += check(decision.finished() &&
+                              decision.finish_reason == ninfer::FinishReason::StopString,
+                          "the stop string must terminalize the round");
+        const auto output = session.commit_preview();
+        const auto content = channel_text(output, ninfer::OutputChannel::Content);
+        failures += check(content.find(s8_cut) != std::string::npos &&
+                              content.size() <= s8_cut.size() + 1,
+                          "the stop-string commit must return the region as text");
+        const auto direct = fi::parse_qwen_tool_call_output(
+            s8_cut, 64, *contract, true, ninfer::FinishReason::StopString);
+        const auto calls = session.take_tool_calls();
+        failures += check(calls.empty() && direct.tool_calls.empty(),
+                          "StopString must reach the parser as a cut");
+        failures += check(
+            session.tool_call_parse_diagnostics().fallback_reason ==
+                direct.diagnostics.fallback_reason,
+            "the StopString commit must carry the cut fallback reason");
+    }
+    return failures;
+}
+
 int test_reasoning_split(const Frontend& frontend) {
     ninfer::ChatMessage message;
     message.role = ninfer::ChatRole::User;
@@ -2938,6 +3075,7 @@ int main() {
     failures += test_terminal_flush(frontend);
     failures += test_structured_tool_output();
     failures += test_preview_terminal_reason_transaction();
+    failures += test_finish_reason_sensitive_tool_parsing();
     failures += test_tool_marker_after_quoted_marker();
     failures += test_reasoning_split(frontend);
     failures += test_reasoning_close_requires_boundary(frontend);
