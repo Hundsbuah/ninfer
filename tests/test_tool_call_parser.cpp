@@ -3274,6 +3274,27 @@ int test_round3_spec_corpus() {
                                  json_escape(tool_call("edit", {{"path", "a"}, {"old_string", "b"}})) + "\"}");
         failures += stream_equals_one_shot("R3 S1g streaming", s1g, false, true);
     }
+    // S1-short: the R3-01 class in the short parameter family. The Stage-2 work-bound skip
+    // must check both closer families: a short-only region carries no '</parameter>' literal,
+    // and skipping the consistent completion there rejects a region with a unique consistent
+    // parse (before the fix: text, TrailingContent).
+    {
+        const std::string ex_short =
+            "<function=bash>\n<param=command>\nrm -rf x\n</param>\n</function>\n</tool_call>";
+        const std::string s1_short =
+            std::string("<tool_call>\n<function=write>\n<param=path>\ndocs/x.md\n</param>\n<param=content>\n") +
+            "# Example\n" + ex_short + "\nDone.\n</param>\n</function>\n</tool_call>";
+        const std::string content = "# Example\n" + ex_short + "\nDone.";
+        const auto parsed = fi::parse_qwen_tool_call_output(s1_short, 64, c);
+        failures += one_call("R3 S1-short: the short-family embedded example is the exact content",
+                             parsed, "write",
+                             std::string("{\"path\":\"docs/x.md\",\"content\":\"") +
+                                 json_escape(content) + "\"}");
+        failures += check(parsed.diagnostics.markup_tolerant_completion,
+                          "R3 S1-short: the Stage-2 acceptance flag is set");
+        failures += stream_equals_one_shot("R3 S1-short streaming", s1_short, false, true);
+    }
+
     // S8: the here-doc that carries the closer lines commits in all modes (the real closer
     // terminates the value); the cut variant after the final EOF line is the R3-03 residual.
     const std::string s8_value = "cat <<EOF\n</parameter>\n</function>\n</tool_call>\nEOF";

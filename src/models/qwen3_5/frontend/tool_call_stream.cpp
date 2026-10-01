@@ -248,8 +248,10 @@ struct ConsistentCompleter {
     ToolCallParseProgress select_value(RegionState& s) noexcept {
         const std::string_view required_close = tool_close_literal(s.param_family);
         // Candidate census: every closer occurrence and the balanced subset (depth 0, same
-        // family only). A complete same-family opener inside the value consumes the next
-        // closer; a partial opener at the value end cannot decide depth yet and is ignored.
+        // family only, R3-01): a complete same-family opener inside the value consumes the next
+        // closer of that family; a cross-family opener (the other parameter family) is closed by
+        // its own closer and never consumes this family's closers. A partial opener at the
+        // value end cannot decide depth yet and is ignored.
         std::vector<std::size_t> all;
         std::vector<std::size_t> balanced;
         {
@@ -265,7 +267,7 @@ struct ConsistentCompleter {
                 }
                 ToolOpenTag opener = {};
                 if (parse_tool_parameter_open(text.substr(i), opener) == ToolHeaderStatus::Complete) {
-                    ++depth;
+                    if (opener.kind == s.param_family) { ++depth; }
                     i += opener.consumed;
                     continue;
                 }
@@ -1121,10 +1123,14 @@ ToolCallStreamResult ToolCallStreamParser::finish(FinishReason finish_reason) co
     };
     std::vector<Stage2Result> stage2;
     for (const Attempt& attempt : chain) {
-        // R3-14: without a parameter closer literal there is no consistent value boundary,
-        // so the consistent parse degenerates to the greedy one; skip it (steps stay 0).
+        // R3-14: without a parameter closer literal of either family there is no consistent
+        // value boundary, so the consistent parse degenerates to the greedy one; skip it
+        // (steps stay 0). Both family forms must be checked: a short-family region carries only
+        // '</param>', and skipping it would silently disable Stage 2 for that family.
         if (region_.find(tool_close_literal(ToolTagKind::Parameter), attempt.base) ==
-            std::string_view::npos) {
+                std::string_view::npos &&
+            region_.find(tool_close_literal(ToolTagKind::Param), attempt.base) ==
+                std::string_view::npos) {
             continue;
         }
         ConsistentCompleter cc;

@@ -199,3 +199,52 @@ step being split out.
 Not committed (user-local worktree adaptations, preserved): `CMakeLists.txt`,
 `build_native.bat`, `src/runtime/engine/context_cache/materialization_budget.h`,
 `src/runtime/engine/kv_capacity.cpp`.
+
+## Session 3 delta (2026-10-01) — deep review of the committed round-3 tree
+
+Full re-review of the round-3 implementation and its Zusammenspiel (grammar, stream
+machine, Stage 1/2/3, entry boundary, decoder, engine/serve consumers, tests). The
+one-shot/streaming equivalence was re-verified over all finish reasons and chunk sizes
+1/2/3/5/7 for a mixed corpus (complete, truncated, tolerant, prose-prefixed, fenced,
+two-call): zero divergence. Two residual spec deviations were found and fixed:
+
+1. **Stage-2 work-bound skip was long-family only** (`tool_call_stream.cpp`, Stage-2 loop).
+   The skip fired when the region carried no `</parameter>` literal, which silently
+   disabled the R3-01 consistent completion for short-family regions (closer `</param>`
+   only). A short-family S1-class region with a unique consistent parse was rejected as
+   text (`TrailingContent`) instead of committed. Fix: the skip now requires the absence of
+   **both** closer literals. Evidence (probe, before/after the fix): the short-family S1
+   analog goes from `is_call=0, fallback=TrailingContent` to `is_call=1, exact content,
+   markup_tolerant_completion=1`; one-shot and streaming agree. Regression test `R3
+   S1-short` added to `test_round3_spec_corpus` (byte-exact content, acceptance flag,
+   streaming equality).
+2. **Stage-2 census depth counted both opener families** (`ConsistentCompleter::select_value`).
+   The R3-01 reference algorithm specifies the balanced pass as "depth counting, same family
+   only"; the census incremented depth for a complete parameter opener of **either** family,
+   so a cross-family nested opener (e.g. `<param=x>` inside a `<parameter=content>` value)
+   stuck the depth and could drop the real same-family closer from the balanced set.
+   Fix: depth increments only for `opener.kind == s.param_family`. Cross-family nesting now
+   resolves through the documented balanced/lazy passes; the lazy pass otherwise
+   compensates, so no previously accepted input changes (verified: the cross-family probe
+   keeps its exact content, and the long-family corpus is byte-identical).
+
+Verification (Release, `build-new-parser`, 16 compile threads, no GPU): target suites
+`ninfer_tool_call_parser_test`, `ninfer_tool_call_grammar_test`,
+`ninfer_tool_call_grammar_state_test`, `ninfer_qwen3_5_frontend_test`,
+`ninfer_request_log_test`, `ninfer_pretty_logging_test`, `ninfer_serve_options_test`,
+`ninfer_engine_options_validation_test` — all pass. The existing R3-14 work-bound
+assertions are unaffected: the 4000-bare-region case carries no closer of either family
+(skip still exact, `stage2_steps == 0`), and the 2000-closer-triple case is long-family
+(census unchanged).
+
+Not executable here: an AddressSanitizer build of the parser suite — the MSVC ASan
+runtime fails at process start in this environment (a trivial ASan hello-world exits 53
+with no report), an environment/tooling limitation, not a code finding. Both session-3
+changes are logic-only (no new allocations, views, pointers, or lifetimes), so no
+sanitizer is required for them; the full-CPU rule-conformant suite result from session 2
+remains the memory-safety evidence for the round-3 tree.
+
+Files changed (this session): `src/models/qwen3_5/frontend/tool_call_stream.cpp` (the two
+fixes), `tests/test_tool_call_parser.cpp` (`R3 S1-short` regression),
+`docs/NInfer_new_parser_design_round3_bugfix_progress.md` (this section). The review probe
+`review_probe.cpp` (repo root) is the diagnostic harness for this session's evidence.
