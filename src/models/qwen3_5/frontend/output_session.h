@@ -75,7 +75,11 @@ public:
                                                           std::uint32_t total_budget_remaining);
     void validate_generation_capacity(std::uint32_t effective_output_tokens) const;
     [[nodiscard]] runtime::OutputDecision preview_terminal(FinishReason reason);
-    [[nodiscard]] PublishedOutput commit_preview(FinishReason finish_reason = FinishReason::None);
+    // Commits the pending preview. A terminal preview finalizes the tool-call decoder with the
+    // terminal FinishReason the preview stored (preview_model, preview_control, preview_terminal);
+    // callers cannot supply or substitute a reason, so a known engine terminal commit can never
+    // silently degrade to FinishReason::None.
+    [[nodiscard]] PublishedOutput commit_preview();
     [[nodiscard]] std::vector<GeneratedToolCall> take_tool_calls() noexcept;
     [[nodiscard]] ToolCallParseDiagnostics tool_call_parse_diagnostics() const noexcept;
     [[nodiscard]] std::uint32_t reasoning_tokens() const noexcept;

@@ -410,6 +410,12 @@ public:
     std::vector<GeneratedToolCall> tool_calls;
     ToolCallParseDiagnostics tool_call_parse;
     bool preview_ready = false;
+    // Terminal decision produced by the pending preview, stored with the preview transaction.
+    // commit_preview() terminalizes the tool-call decoder with this stored reason, so a known
+    // engine terminal commit can never silently degrade to FinishReason::None. Replaced by every
+    // preview method, cleared by commit.
+    bool preview_terminal_reason_valid = false;
+    FinishReason preview_terminal_reason = FinishReason::None;
 };
 
 PublishedOutput::PublishedOutput(PublishedOutput&& other) noexcept
@@ -482,7 +488,9 @@ runtime::OutputDecision OutputSession::preview_model(std::span<const TokenId> to
         if (impl_->preview_execution_split_after && *impl_->preview_execution_split_after > count) {
             throw std::logic_error("prefix execution split exceeds the accepted token prefix");
         }
-        impl_->preview_ready = true;
+        impl_->preview_ready                  = true;
+        impl_->preview_terminal_reason_valid  = reason != FinishReason::None;
+        impl_->preview_terminal_reason        = reason;
         return runtime::OutputDecision{
             .accepted_tokens              = count,
             .finish_reason                = reason,
@@ -631,6 +639,8 @@ runtime::OutputDecision OutputSession::preview_control(std::span<const TokenId> 
     impl_->preview_semantic.applied         = true;
     impl_->preview_semantic.injected_tokens = static_cast<std::uint32_t>(tokens.size());
     impl_->preview_ready                    = true;
+    impl_->preview_terminal_reason_valid    = false;
+    impl_->preview_terminal_reason          = FinishReason::None;
     return runtime::OutputDecision{
         .accepted_tokens              = static_cast<std::uint32_t>(tokens.size()),
         .prefix_execution_split_after = impl_->preview_execution_split_after,
@@ -669,11 +679,13 @@ runtime::OutputDecision OutputSession::preview_terminal(FinishReason reason) {
     impl_->preview_semantic.control_pending = false;
     impl_->preview_output.clear();
     terminalize(impl_->preview_state, impl_->policy, impl_->preview_output, 0);
-    impl_->preview_ready = true;
+    impl_->preview_ready                 = true;
+    impl_->preview_terminal_reason_valid = true;
+    impl_->preview_terminal_reason       = reason;
     return runtime::OutputDecision{.accepted_tokens = 0, .finish_reason = reason};
 }
 
-PublishedOutput OutputSession::commit_preview(FinishReason finish_reason) {
+PublishedOutput OutputSession::commit_preview() {
     if (impl_ == nullptr || !impl_->preview_ready) { std::terminate(); }
     using std::swap;
     swap(impl_->state, impl_->preview_state);
@@ -689,6 +701,15 @@ PublishedOutput OutputSession::commit_preview(FinishReason finish_reason) {
         }
     }
     if (impl_->state.terminal) {
+        // The terminal reason belongs to the preview transaction: preview_model records the
+        // StopString/StopToken/budget reason that made the preview terminal, and
+        // preview_terminal records a between-round terminal reason. A known engine terminal
+        // commit must never terminalize the tool-call decoder with FinishReason::None.
+        if (!impl_->preview_terminal_reason_valid ||
+            impl_->preview_terminal_reason == FinishReason::None) {
+            std::terminate();
+        }
+        const FinishReason finish_reason = impl_->preview_terminal_reason;
         fi::ToolCallOutputDecoder::Terminal terminal = impl_->tool_call_output.finish(finish_reason);
         impl_->tool_calls                            = std::move(terminal.tool_calls);
         impl_->tool_call_parse                       = terminal.diagnostics;
@@ -705,6 +726,8 @@ PublishedOutput OutputSession::commit_preview(FinishReason finish_reason) {
             }
         }
     }
+    impl_->preview_terminal_reason_valid = false;
+    impl_->preview_terminal_reason       = FinishReason::None;
     return output;
 }
 

@@ -7,6 +7,7 @@
 #include "models/qwen3_5/frontend/processor.h"
 #include "models/qwen3_5/frontend/test_access.h"
 #include "models/qwen3_5/frontend/tokenizer.h"
+#include "models/qwen3_5/frontend/tool_call_parser.h"
 #include "runtime/prefix_cache/block_hash.h"
 #include "text/unicode.h"
 
@@ -1981,6 +1982,95 @@ int test_structured_tool_output() {
     return failures;
 }
 
+// R5-01/R5-02: the terminal FinishReason belongs to the OutputSession preview transaction.
+// preview_model/preview_control/preview_terminal store it together with the preview, and
+// commit_preview() terminalizes the tool-call decoder with the stored reason; the caller cannot
+// supply or substitute one. The post-merge regression replaced every engine cut with
+// FinishReason::None before the parser could observe it.
+int test_preview_terminal_reason_transaction() {
+    const Frontend frontend = make_frontend(resources());
+
+    ninfer::ChatMessage message;
+    message.role = ninfer::ChatRole::User;
+    message.parts.push_back(
+        ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text, .text = "x", .media = {}});
+    ninfer::PromptInput input;
+    input.messages.push_back(std::move(message));
+    input.options.enable_thinking = false;
+    const std::string bash_tool =
+        R"({"type":"function","function":{"name":"bash","parameters":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}}})";
+    input.options.tool_jsons.push_back(bash_tool);
+    auto prompt = frontend.prepare(std::move(input));
+    const std::vector<std::string> tool_jsons = {bash_tool};
+    const auto contract = fi::build_tool_call_output_contract(
+        std::span<const std::string>(tool_jsons.data(), tool_jsons.size()), true);
+    const ninfer::OutputOptions options = {
+        .tool_name_max_length = 64, .tolerant_tool_calls = false};
+
+    int failures = 0;
+    // 1. A non-terminal commit must not terminalize the tool-call decoder.
+    // 2. A later terminal commit terminalizes it with the reason its preview stored; a budget
+    //    cut must not erase a call that is already complete.
+    {
+        auto session = frontend.make_output_session(prompt, {}, options);
+        const std::string open = "<tool_call>\n<function=bash>\n<parameter=command>\nls -la";
+        const std::vector<ninfer::TokenId> open_tokens = fixture_tokenizer().encode(open);
+        const auto first = session.preview_model(
+            open_tokens, static_cast<std::uint32_t>(open_tokens.size()) + 1,
+            ninfer::FinishReason::OutputLimit);
+        failures += check(!first.finished(),
+                          "an open-value round under budget must stay non-terminal");
+        (void)session.commit_preview();
+        failures += check(session.take_tool_calls().empty(),
+                          "a non-terminal commit must not terminalize the tool parser");
+        failures += check(session.tool_call_parse_diagnostics() ==
+                              ninfer::ToolCallParseDiagnostics{},
+                          "a non-terminal commit must not publish terminal diagnostics");
+
+        const std::string close = "\n</parameter>\n</function>\n</tool_call>";
+        const std::vector<ninfer::TokenId> close_tokens = fixture_tokenizer().encode(close);
+        const auto second = session.preview_model(
+            close_tokens, static_cast<std::uint32_t>(close_tokens.size()),
+            ninfer::FinishReason::OutputLimit);
+        failures += check(second.finished() &&
+                              second.finish_reason == ninfer::FinishReason::OutputLimit,
+                          "the terminal preview must store its budget reason");
+        (void)session.commit_preview();
+        const auto calls = session.take_tool_calls();
+        failures += check(calls.size() == 1 && calls.front().name == "bash" &&
+                              calls.front().arguments_json == "{\"command\":\"ls -la\"}",
+                          "the terminal commit must commit the complete call under the stored cut");
+    }
+    // 3. A new preview replaces the previous preview's terminal metadata.
+    // 4. preview_terminal(Cancelled) records Cancelled; the commit must deliver it to the
+    //    decoder, and no call may be recovered that the direct parser rejects.
+    {
+        auto session = frontend.make_output_session(prompt, {}, options);
+        const std::string partial =
+            "<tool_call>\n<function=bash>\n<parameter=command>\ncat <<EOF\n";
+        const std::vector<ninfer::TokenId> tokens = fixture_tokenizer().encode(partial);
+        const auto first = session.preview_model(tokens, static_cast<std::uint32_t>(tokens.size()) + 1,
+                                                 ninfer::FinishReason::OutputLimit);
+        failures += check(!first.finished(), "the partial round must stay non-terminal");
+        (void)session.commit_preview();
+
+        const auto cancel = session.preview_terminal(ninfer::FinishReason::Cancelled);
+        failures += check(
+            cancel.finished() && cancel.finish_reason == ninfer::FinishReason::Cancelled,
+            "preview_terminal must record the cancelled reason");
+        const auto output = session.commit_preview();
+        const auto direct = fi::parse_qwen_tool_call_output(
+            partial, 64, *contract, false, ninfer::FinishReason::Cancelled);
+        failures += check(session.take_tool_calls().empty() && !direct.is_tool_call_response,
+                          "cancellation must not recover a call the direct parser rejects");
+        failures += check(channel_text(output, ninfer::OutputChannel::Content) == partial,
+                          "the cancelled commit must return the buffered region as text");
+        failures += check(session.tool_call_parse_diagnostics() == direct.diagnostics,
+                          "the cancelled commit must match the direct parser diagnostics");
+    }
+    return failures;
+}
+
 int test_reasoning_split(const Frontend& frontend) {
     ninfer::ChatMessage message;
     message.role = ninfer::ChatRole::User;
@@ -2847,6 +2937,7 @@ int main() {
     failures += test_same_token_stop_priority(frontend);
     failures += test_terminal_flush(frontend);
     failures += test_structured_tool_output();
+    failures += test_preview_terminal_reason_transaction();
     failures += test_tool_marker_after_quoted_marker();
     failures += test_reasoning_split(frontend);
     failures += test_reasoning_close_requires_boundary(frontend);
