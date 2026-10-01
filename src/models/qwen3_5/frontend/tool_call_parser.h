@@ -85,7 +85,9 @@ parse_qwen_tool_call_output(const std::string& text, std::size_t max_tool_name_l
                             FinishReason finish_reason = FinishReason::None,
                             ToolCallSyntaxMode syntax = ToolCallSyntaxMode::Compatibility,
                             ToolCallAmbiguityPolicy ambiguity =
-                                ToolCallAmbiguityPolicy::PayloadFidelity);
+                                ToolCallAmbiguityPolicy::PayloadFidelity,
+                            ToolCallIntentPolicy intent =
+                                ToolCallIntentPolicy::TemplateCompatible);
 
 // Incrementally publishes bytes that are provably outside a possible terminal Qwen tool-call
 // suffix. At terminal time, valid calls are retained structurally; malformed output is restored
@@ -103,7 +105,9 @@ public:
                           std::size_t max_tool_name_length, bool tolerant = false,
                           ToolCallSyntaxMode syntax = ToolCallSyntaxMode::Compatibility,
                           ToolCallAmbiguityPolicy ambiguity =
-                              ToolCallAmbiguityPolicy::PayloadFidelity);
+                              ToolCallAmbiguityPolicy::PayloadFidelity,
+                          ToolCallIntentPolicy intent =
+                              ToolCallIntentPolicy::TemplateCompatible);
 
     [[nodiscard]] std::string feed(std::string_view text);
     // R6-03: the terminal reason is explicit — there is no implicit None default. A caller
@@ -114,13 +118,17 @@ public:
 private:
     std::shared_ptr<const ToolCallOutputContract> contract_;
     // Pre-marker scan and region buffering delegate to the incremental machine (one feed
-    // rule, no duplicated marker-scan state). The machine's policy is unused here: the
+    // rule, no duplicated marker-scan state). The machine carries the syntax, ambiguity,
+    // and intent policies so the pre-latch gate matches the finish-path re-parse; the
     // finish path re-parses the latched region with the contract-aware policy.
     ToolCallStreamParser machine_{ToolCallParsePolicy{}};
     std::size_t max_tool_name_length_ = 0;
     bool tolerant_                    = false;
     ToolCallSyntaxMode syntax_           = ToolCallSyntaxMode::Compatibility;
     ToolCallAmbiguityPolicy ambiguity_   = ToolCallAmbiguityPolicy::PayloadFidelity;
+    // R6-05: the intent policy; the pre-latch machine carries it so one-shot and streaming
+    // share the same tool-entry gate.
+    ToolCallIntentPolicy intent_        = ToolCallIntentPolicy::TemplateCompatible;
     bool finished_                    = false;
 };
 

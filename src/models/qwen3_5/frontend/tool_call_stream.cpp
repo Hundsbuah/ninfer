@@ -961,6 +961,20 @@ ToolCallStreamParser::FenceTracker::consume(char byte) noexcept {
 void ToolCallStreamParser::publish(std::string_view bytes, std::string& visible) {
     content_.append(bytes);
     visible.append(bytes);
+    // R6-05 intent gate: once a visible (non-formatting-whitespace) content byte is
+    // committed before a latch, the turn locks to text under RequireToolAtContentStart.
+    // publish() is the single funnel for pre-latch visible content (ordinary marker-byte
+    // bytes, failed-candidate heads, and fence Content bytes), so this is the only lock
+    // point. Formatting whitespace (' ', '\t', '\r', '\n') never locks; form feed is not
+    // format whitespace here, so it locks like any other visible byte.
+    if (policy_.intent == ToolCallIntentPolicy::RequireToolAtContentStart && !latched_) {
+        for (const char byte : bytes) {
+            if (!is_tool_format_whitespace(byte)) {
+                entry_locked_ = true;
+                break;
+            }
+        }
+    }
 }
 
 void ToolCallStreamParser::latch(std::string_view marker) {
@@ -981,6 +995,19 @@ bool ToolCallStreamParser::marker_byte(char byte, std::string& visible) {
         const ToolMarkerStatus state = classify_tool_marker_prefix(marker_prefix_, marker,
                                                                   policy_.syntax);
         if (state == ToolMarkerStatus::Complete) {
+            if (policy_.intent == ToolCallIntentPolicy::RequireToolAtContentStart &&
+                entry_locked_) {
+                // R6-05: visible content was committed before this marker: the policy
+                // locks the turn to text. The complete marker is ordinary content and can
+                // never latch. A failed marker-like prefix cannot bypass the gate: the
+                // NotMarker path publishes the candidate head through the same funnel,
+                // which already locked the gate.
+                publish(pending_ws_, visible);
+                pending_ws_.clear();
+                publish(marker_prefix_, visible);
+                marker_prefix_.clear();
+                return false;
+            }
             latch(marker_prefix_);
             return true;
         }

@@ -235,6 +235,13 @@ std::string serve_usage_text(const char* argv0) {
            "                             closer chain that already formed a complete call) or\n"
            "                             payload-fidelity (the payload interpretation wins; the\n"
            "                             R1 phantom-acceptance class stays executable)\n"
+           "  --tool-call-intent MODE    tool-call intent policy: template-compatible (default;\n"
+           "                             a tool region may latch after any content, as the\n"
+           "                             upstream Qwen template permits) or start-of-content\n"
+           "                             (agent-hardening: a tool region may latch only while\n"
+           "                             every emitted Content byte is formatting whitespace;\n"
+           "                             once visible content commits, the turn is locked to\n"
+           "                             text; reasoning-channel bytes do not count)\n"
            "\n"
            "NETWORKING & RESOURCES\n"
            "  --host H                   listen address (default 127.0.0.1)\n"
@@ -604,6 +611,16 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             } else {
                 throw std::invalid_argument(
                     "--tool-call-ambiguity must be fail-closed or payload-fidelity");
+            }
+        } else if (arg == "--tool-call-intent") {
+            const std::string value = require_value("--tool-call-intent");
+            if (value == "template-compatible") {
+                options.tool_call_intent = ToolCallIntentPolicy::TemplateCompatible;
+            } else if (value == "start-of-content") {
+                options.tool_call_intent = ToolCallIntentPolicy::RequireToolAtContentStart;
+            } else {
+                throw std::invalid_argument(
+                    "--tool-call-intent must be template-compatible or start-of-content");
             }
         } else if (arg == "--cors") {
             options.enable_cors = true;

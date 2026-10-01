@@ -469,7 +469,8 @@ ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text,
                                                  bool tolerant,
                                                  FinishReason finish_reason,
                                                  ToolCallSyntaxMode syntax,
-                                                 ToolCallAmbiguityPolicy ambiguity) {
+                                                 ToolCallAmbiguityPolicy ambiguity,
+                                                 ToolCallIntentPolicy intent) {
     ToolCallParsePolicy policy;
     policy.max_name_length        = max_tool_name_length;
     policy.tolerant               = tolerant;
@@ -479,6 +480,7 @@ ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text,
     policy.parameter_plausible    = declared_parameter_plausible;
     policy.syntax                 = syntax;
     policy.ambiguity              = ambiguity;
+    policy.intent                 = intent;
 
     // One-shot and streaming share the same incremental parser: this feeds the whole output
     // and finishes once; the streaming decoder feeds chunks of the same machine.
@@ -600,12 +602,14 @@ ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text,
 ToolCallOutputDecoder::ToolCallOutputDecoder(std::shared_ptr<const ToolCallOutputContract> contract,
                                              std::size_t max_tool_name_length, bool tolerant,
                                              ToolCallSyntaxMode syntax,
-                                             ToolCallAmbiguityPolicy ambiguity)
+                                             ToolCallAmbiguityPolicy ambiguity,
+                                             ToolCallIntentPolicy intent)
     : contract_(std::move(contract)), max_tool_name_length_(max_tool_name_length),
-      tolerant_(tolerant), syntax_(syntax), ambiguity_(ambiguity) {
+      tolerant_(tolerant), syntax_(syntax), ambiguity_(ambiguity), intent_(intent) {
     ToolCallParsePolicy machine_policy;
     machine_policy.syntax = syntax_;
     machine_policy.ambiguity = ambiguity_;
+    machine_policy.intent    = intent_;
     machine_ = ToolCallStreamParser(machine_policy);
 }
 

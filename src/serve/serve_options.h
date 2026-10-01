@@ -69,6 +69,13 @@ struct ServeOptions {
     // payload-fidelity keeps the historical behavior (the payload interpretation wins, and the
     // R1 phantom-acceptance class stays executable).
     ToolCallAmbiguityPolicy tool_call_ambiguity = ToolCallAmbiguityPolicy::FailClosed;
+    // R6-05: --tool-call-intent template-compatible|start-of-content: the tool-call intent
+    // policy. template-compatible (default) keeps the upstream Qwen wire behavior; a tool
+    // region may latch after any content. start-of-content is the agent-hardening mode: a
+    // tool region may latch only while every emitted Content byte is formatting whitespace
+    // (reasoning-channel text does not count); once visible content commits, the turn is
+    // locked to text. It is a separate dimension from syntax, tolerance, and ambiguity.
+    ToolCallIntentPolicy tool_call_intent = ToolCallIntentPolicy::TemplateCompatible;
     std::optional<std::uint32_t> default_thinking_budget;
     // End-of-thinking message fed to the model when it hits the thinking budget; empty
     // preserves the model's built-in control suffix.

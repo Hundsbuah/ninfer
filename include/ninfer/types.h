@@ -423,6 +423,18 @@ enum class ToolCallAmbiguityPolicy : std::uint8_t {
     PayloadFidelity, // current round-4 behavior: the payload interpretation wins
     FailClosed,      // refuse the ambiguous completion (ambiguous_structure, region as text)
 };
+// R6-05: the intent policy for tool-call entry. TemplateCompatible keeps the upstream Qwen3.8
+// wire behavior (a top-level tool region may latch after any content — the official template
+// permits natural-language reasoning before a function call). RequireToolAtContentStart is an
+// explicit NInfer agent-hardening mode, stricter than the upstream template contract: a top
+// level tool region may latch only while every previously emitted byte of the assistant
+// Content channel is formatting whitespace; once any visible content byte is committed,
+// later tool markers are content (reasoning-channel bytes do not count: they never flow
+// through the tool-call content scanner).
+enum class ToolCallIntentPolicy : std::uint8_t {
+    TemplateCompatible,
+    RequireToolAtContentStart,
+};
 
 
 struct OutputOptions {
@@ -444,6 +456,10 @@ struct OutputOptions {
     // chain that already formed a complete call, and returns the region as text with the
     // ambiguous_structure reason. The production Qwen3.8 default is FailClosed.
     ToolCallAmbiguityPolicy tool_call_ambiguity = ToolCallAmbiguityPolicy::FailClosed;
+    // R6-05: the tool-call intent policy. TemplateCompatible is the compatibility default
+    // (upstream Qwen behavior); RequireToolAtContentStart is the optional agent-hardening
+    // mode (a tool call must be the first non-whitespace content of the turn).
+    ToolCallIntentPolicy tool_call_intent = ToolCallIntentPolicy::TemplateCompatible;
 };
 
 struct NgramSessionHints {

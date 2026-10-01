@@ -92,6 +92,11 @@ struct ToolCallParsePolicy {
     // boundary (OutputOptions) defaults to FailClosed; this internal default keeps the
     // historical payload-fidelity behavior for existing callers.
     ToolCallAmbiguityPolicy ambiguity = ToolCallAmbiguityPolicy::PayloadFidelity;
+    // R6-05: the tool-call intent policy (ToolCallIntentPolicy). TemplateCompatible keeps
+    // the upstream Qwen behavior (a region may latch after any content); RequireToolAtContentStart
+    // locks the turn to text once any visible (non-formatting-whitespace) Content byte has
+    // been committed before a latch (reasoning-channel bytes never reach this scanner).
+    ToolCallIntentPolicy intent = ToolCallIntentPolicy::TemplateCompatible;
 };
 // Objective parse outcome of one tool region (P3.1): what was safely recognized, where the
 // input ended, which state was complete and which was incomplete. It carries no policy
@@ -381,6 +386,10 @@ public:
     std::string pending_ws_;    // whitespace since the last published byte (held: may precede a marker)
     std::string marker_prefix_; // held bytes that may become a top-level marker
     bool latched_    = false;
+    // R6-05 intent gate: a visible content byte was committed before any latch; under
+    // RequireToolAtContentStart no later marker may latch. Set by publish() (the single
+    // pre-latch visible-content funnel); irrelevant once latched (region bytes bypass it).
+    bool entry_locked_ = false;
     std::string region_;
     bool marker_seen_ = false;
 };
