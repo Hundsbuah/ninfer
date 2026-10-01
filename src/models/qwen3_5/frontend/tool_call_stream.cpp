@@ -58,6 +58,26 @@ struct RegionState {
     std::size_t value_begin = 0;
 };
 
+// Absolute positions of every parameter value closer in the region text, ascending.
+// "</param>" is not a substring of "</parameter>", so the two lists are disjoint.
+struct RegionIndex {
+    std::vector<std::size_t> parameter_closes; // "</parameter>"
+    std::vector<std::size_t> param_closes;     // "</param>"
+    // First closer of `family` at or after `from`, or npos.
+    [[nodiscard]] std::size_t next_close(ToolTagKind family, std::size_t from) const noexcept {
+        const std::vector<std::size_t>* list =
+            (family == ToolTagKind::Parameter) ? &parameter_closes : &param_closes;
+        const auto it = std::lower_bound(list->begin(), list->end(), from);
+        return (it == list->end()) ? std::size_t(-1) : *it;
+    }
+    // True when a closer of either family starts at or after `from`.
+    [[nodiscard]] bool has_close_at_or_after(std::size_t from) const noexcept {
+        return std::lower_bound(parameter_closes.begin(), parameter_closes.end(), from) !=
+                   parameter_closes.end() ||
+               std::lower_bound(param_closes.begin(), param_closes.end(), from) != param_closes.end();
+    }
+};
+
 
 // What may legally follow a consumed function/invoke close, per the surrounding wrapper
 // state (F4). The answer decides whether the close was a structural boundary or quoted
@@ -162,17 +182,21 @@ enum class BoundaryMode : std::uint8_t {
 struct ConsistentCompleter;
 
 // The region machine with a selectable value-boundary policy and an entry machine state.
-// `cc` (non-null only for Consistent mode) charges the deterministic step budget, memoizes
-// proven-Definitive states, and selects the value boundaries.
+// `s` is the machine state (by reference; positions are absolute within `text`). `cc`
+// (non-null only for Consistent mode) charges the deterministic step budget, memoizes
+// proven-Definitive states, and selects the value boundaries. `index` (non-null only for
+// Stage-1 lookups) supplies absolute closer positions; a null index falls back to a linear scan.
 ToolCallParseProgress parse_region_at(std::string_view text, const ToolCallParsePolicy& policy,
-                                      RegionState s, BoundaryMode mode, ConsistentCompleter* cc);
+                                      RegionState& s, BoundaryMode mode, ConsistentCompleter* cc,
+                                      const RegionIndex* index);
 
 // Deterministic parse of a complete tool-region slice (Stage 1). The slice always starts at a
 // marker (the latched marker or a <tool_call> wrapper found by the retry loop). Every
 // transition is byte-driven, so the outcome is independent of how the bytes were chunked
 // upstream.
 ToolCallParseProgress parse_region(std::string_view text, const ToolCallParsePolicy& policy) {
-    return parse_region_at(text, policy, RegionState{}, BoundaryMode::Greedy, nullptr);
+    RegionState s;
+    return parse_region_at(text, policy, s, BoundaryMode::Greedy, nullptr, nullptr);
 }
 
 // Stage 2 — ConsistentCompleter (R3-01): the only mechanism that makes a truncated region
@@ -330,7 +354,8 @@ struct ConsistentCompleter {
                     break;
                 } else {
                     ++depth;
-                    r = parse_region_at(text, policy, after_state, BoundaryMode::Consistent, this);
+                    r = parse_region_at(text, policy, after_state, BoundaryMode::Consistent, this,
+                                        nullptr);
                     --depth;
                     if (r.termination == ToolCallRegionTermination::Definitive) {
                         memo.emplace(key, true);
@@ -366,8 +391,8 @@ struct ConsistentCompleter {
 };
 
 ToolCallParseProgress parse_region_at(std::string_view text, const ToolCallParsePolicy& policy,
-                                      RegionState s, BoundaryMode mode,
-                                      ConsistentCompleter* cc) {
+                                      RegionState& s, BoundaryMode mode, ConsistentCompleter* cc,
+                                      const RegionIndex* index) {
     // R3-01: Stage 2 parses the canonical grammar — tolerant header repairs and the tolerant
     // NoEntry repair entry are Stage-1 mechanisms and do not run in the Consistent parse.
     ToolCallParsePolicy effective = policy;
@@ -708,7 +733,9 @@ ToolCallParseProgress parse_region_at(std::string_view text, const ToolCallParse
             const std::string_view required_close = tool_close_literal(s.param_family);
             std::size_t scan = s.value_begin;
             for (;;) {
-                const std::size_t candidate = text.find(required_close, scan);
+                const std::size_t candidate =
+                    (index != nullptr) ? index->next_close(s.param_family, scan)
+                                       : text.find(required_close, scan);
                 if (candidate == std::string_view::npos) {
                     // The region ends inside the value: a cut parameter value is never
                     // committed — its bytes may still grow into a different value. The
@@ -1057,6 +1084,22 @@ ToolCallStreamResult ToolCallStreamParser::finish(FinishReason finish_reason) co
     // R3-06: the retry search skips markers inside a recognized fence (the fence state is
     // computed over the region bytes, independent of how they were chunked).
     const std::vector<char> fenced = fence_mask(region_);
+    // Region index: absolute parameter-closer positions, used by the Stage-1 Greedy value scan
+    // (a null index in parse_region_at falls back to a linear scan).
+    RegionIndex index;
+    {
+        auto scan = [&](std::string_view lit, std::vector<std::size_t>& out) {
+            std::size_t pos = 0;
+            while (true) {
+                const std::size_t found = region_.find(lit, pos);
+                if (found == std::string::npos) { break; }
+                out.push_back(found);
+                pos = found + lit.size();
+            }
+        };
+        scan(tool_close_literal(ToolTagKind::Parameter), index.parameter_closes);
+        scan(tool_close_literal(ToolTagKind::Param), index.param_closes);
+    }
     const bool natural_stop =
         finish_reason == FinishReason::StopToken || finish_reason == FinishReason::None;
 
@@ -1071,7 +1114,10 @@ ToolCallStreamResult ToolCallStreamParser::finish(FinishReason finish_reason) co
     std::vector<Attempt> chain;
     std::size_t base = 0;
     for (std::size_t attempts = 0; attempts < kMaxChainAttempts; ++attempts) {
-        ToolCallParseProgress progress = parse_region(std::string_view(region_).substr(base), policy_);
+        RegionState s{};
+        s.pos = base;
+        ToolCallParseProgress progress =
+            parse_region_at(region_, policy_, s, BoundaryMode::Greedy, nullptr, &index);
         if (progress.termination == ToolCallRegionTermination::Complete) {
             // Stage 1 accepts: the result is final (R3-I2), subject only to R3-08 at the
             // parse entry.
@@ -1100,12 +1146,12 @@ ToolCallStreamResult ToolCallStreamParser::finish(FinishReason finish_reason) co
         // the break byte when the break proved itself deeper in the structure.
         ToolOpenTag entry_marker = {};
         const ToolMarkerStatus entry_status =
-            classify_tool_marker_prefix(region_.substr(base), entry_marker);
+            classify_tool_marker_prefix(std::string_view(region_).substr(base), entry_marker);
         const std::size_t entry_end =
             base + (entry_status == ToolMarkerStatus::Complete ? entry_marker.consumed : 1);
         // R3-04: never base + 1 — EndOfInput retries from the break offset (the open
         // value's start when a value is open, the input-end position otherwise).
-        const std::size_t from = std::max(base + last.progress.break_offset, entry_end);
+        const std::size_t from = std::max(last.progress.break_offset, entry_end);
         std::size_t next = find_tool_marker(region_, from);
         while (next != std::string_view::npos && fenced[next]) {
             next = find_tool_marker(region_, next + 1); // R3-06: skip fenced markers
@@ -1134,13 +1180,15 @@ ToolCallStreamResult ToolCallStreamParser::finish(FinishReason finish_reason) co
             continue;
         }
         ConsistentCompleter cc;
-        cc.text   = std::string_view(region_).substr(attempt.base);
+        cc.text   = region_; // the whole region (absolute positions, §2.1)
         cc.policy = policy_;
         cc.budget = policy_.stage2_step_budget != 0
                         ? policy_.stage2_step_budget
                         : std::max<std::uint64_t>(200000, 32 * cc.text.size());
+        RegionState s{};
+        s.pos = attempt.base;
         const ToolCallParseProgress r =
-            parse_region_at(cc.text, cc.policy, RegionState{}, BoundaryMode::Consistent, &cc);
+            parse_region_at(cc.text, cc.policy, s, BoundaryMode::Consistent, &cc, nullptr);
         result.stage2_steps += cc.steps;
         stage2.push_back(Stage2Result{attempt.base, r});
     }
@@ -1189,7 +1237,7 @@ ToolCallStreamResult ToolCallStreamParser::finish(FinishReason finish_reason) co
         // '</parameter>' — so each is checked separately. A wrapper or function closer
         // does not extend a value and is not counted (a stray '</tool_call>' after a
         // complete call stays recoverable).
-        const std::size_t tail_begin = attempt.base + attempt.progress.break_offset;
+        const std::size_t tail_begin = attempt.progress.break_offset;
         const bool tail_has_value_closer =
             region_.find(tool_close_literal(ToolTagKind::Parameter), tail_begin) !=
                 std::string::npos ||

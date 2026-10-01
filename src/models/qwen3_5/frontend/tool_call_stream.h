@@ -105,9 +105,10 @@ struct ToolCallParseProgress {
     // A break the wire format does not forgive (an empty <function_calls> wrapper): no call
     // may be committed, even by tolerant recovery.
     bool unrecoverable_break = false;
-    // A definitive break: the region-relative offset of the first byte that proved the break.
-    // The recovery retry may re-enter at or after this byte (the bytes before it were consumed
-    // as the failed region's structure or payload). Zero for a non-definitive outcome.
+    // A definitive break: the offset in the text passed to the parse of the first byte that
+    // proved the break. The recovery retry may re-enter at or after this byte (the bytes before
+    // it were consumed as the failed region's structure or payload). Zero for a non-definitive
+    // outcome.
     std::size_t break_offset = 0;
     // The wrapper state at the break (or at the input end for EndOfInput). A break that
     // leaves a wrapper open is never eligible for a recovery retry: the failed wrapper owns
