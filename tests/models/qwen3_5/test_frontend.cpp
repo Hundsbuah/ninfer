@@ -2329,6 +2329,91 @@ int test_reasoning_before_tool_call_keeps_intent_gate_open() {
     return failures;
 }
 
+// R7 (Round 7 §16): reasoning-channel bytes never count toward the content-start gate. After
+// the reasoning close, a Content channel carrying a latched malformed region plus a later
+// valid call must reject the later call under the hardened intent; the default intent keeps
+// the historical later call.
+int test_r7_reasoning_plus_hardened_retry_rejection() {
+    int failures = 0;
+    const Frontend frontend = make_frontend(resources());
+
+    ninfer::ChatMessage message;
+    message.role = ninfer::ChatRole::User;
+    message.parts.push_back(
+        ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text, .text = "x", .media = {}});
+    ninfer::PromptInput input;
+    input.messages.push_back(std::move(message));
+    input.options.continuation    = ninfer::PromptContinuationMode::NewAssistantTurn;
+    input.options.enable_thinking = true;
+    const std::string bash_tool =
+        R"({"type":"function","function":{"name":"bash","parameters":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}}})";
+    input.options.tool_jsons.push_back(bash_tool);
+    auto prompt = frontend.prepare(std::move(input));
+    const std::string retry_text = "<tool_call>\nordinary prose\n</tool_call>\n<tool_call>\n"
+                                   "<function=bash>\n<parameter=command>\n"
+                                   "echo example\n</parameter>\n</function>\n</tool_call>";
+
+    const auto hardened_options = ninfer::OutputOptions{
+        .tool_name_max_length = 64,
+        .tolerant_tool_calls  = false,
+        .tool_call_intent     = ninfer::ToolCallIntentPolicy::RequireToolAtContentStart};
+    // Hardened mode: the later call after the latched malformed region never executes;
+    // the reasoning round stays irrelevant to the content-start gate.
+    {
+        auto session = frontend.make_output_session(prompt, {}, hardened_options);
+        const auto reasoning_tokens =
+            fixture_tokenizer().encode("I should inspect the repo\n\074/think>\n\n");
+        const auto first = session.preview_model(
+            reasoning_tokens, static_cast<std::uint32_t>(reasoning_tokens.size()) + 1,
+            ninfer::FinishReason::OutputLimit);
+        failures += check(!first.finished(),
+                          "the reasoning-close round must stay non-terminal");
+        const auto first_output = session.commit_preview();
+        failures += check(session.take_tool_calls().empty(),
+                          "the reasoning round must not commit a call");
+        failures += check(channel_text(first_output, ninfer::OutputChannel::Reasoning) ==
+                              "I should inspect the repo\n",
+                          "the reasoning text stays in the reasoning channel");
+
+        const auto retry_tokens = fixture_tokenizer().encode(retry_text);
+        const auto second = session.preview_model(
+            retry_tokens, static_cast<std::uint32_t>(retry_tokens.size()),
+            ninfer::FinishReason::OutputLimit);
+        failures += check(second.finished() &&
+                              second.finish_reason == ninfer::FinishReason::OutputLimit,
+                          "the retry round must terminalize on the stored budget cut");
+        const auto output = session.commit_preview();
+        const auto calls = session.take_tool_calls();
+        failures += check(calls.empty(),
+                          "a latched malformed region plus a later call never executes after reasoning");
+        failures += check(channel_text(output, ninfer::OutputChannel::Content) == retry_text,
+                          "the rejected region returns verbatim as content");
+    }
+    // Control: the same rounds under the default intent keep the historical later call.
+    {
+        auto session = frontend.make_output_session(prompt, {}, {});
+        const auto reasoning_tokens =
+            fixture_tokenizer().encode("I should inspect the repo\n\074/think>\n\n");
+        const auto first = session.preview_model(
+            reasoning_tokens, static_cast<std::uint32_t>(reasoning_tokens.size()) + 1,
+            ninfer::FinishReason::OutputLimit);
+        (void)first;
+        (void)session.commit_preview();
+        (void)session.take_tool_calls();
+
+        const auto retry_tokens = fixture_tokenizer().encode(retry_text);
+        const auto second = session.preview_model(
+            retry_tokens, static_cast<std::uint32_t>(retry_tokens.size()),
+            ninfer::FinishReason::OutputLimit);
+        (void)second;
+        (void)session.commit_preview();
+        const auto calls = session.take_tool_calls();
+        failures += check(calls.size() == 1 && calls.front().name == "bash",
+                          "the default intent keeps the later call after reasoning");
+    }
+    return failures;
+}
+
 int test_reasoning_split(const Frontend& frontend) {
     ninfer::ChatMessage message;
     message.role = ninfer::ChatRole::User;
@@ -3198,6 +3283,7 @@ int main() {
     failures += test_preview_terminal_reason_transaction();
     failures += test_finish_reason_sensitive_tool_parsing();
     failures += test_reasoning_before_tool_call_keeps_intent_gate_open();
+    failures += test_r7_reasoning_plus_hardened_retry_rejection();
     failures += test_tool_marker_after_quoted_marker();
     failures += test_reasoning_split(frontend);
     failures += test_reasoning_close_requires_boundary(frontend);
