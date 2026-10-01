@@ -4196,6 +4196,86 @@ int test_r5_ambiguity_policy_write_payload() {
                       "call executes");
     return failures;
 }
+// R6-04 (Round 6 §6): pinned semantic quotation residual — a documented residual, NOT a global
+// safety proof. A complete declared canonical unfenced <tool_call> at EOF that is
+// byte-identical to a genuine call is still committed under the production policies
+// (QwenWrappedNative + FailClosed + strict): the bytes carry no contradictory structure
+// (no fence, no competing boundary, no undeclared name, no malformed tail), so a byte parser
+// cannot infer whether the preceding prose is explanatory or the natural-language preamble
+// the Qwen3.8 template explicitly allows before a function call. FailClosed is not invoked:
+// a clean Stage-1 completion never reaches Stage 2. This test makes the residual
+// executable/test-visible so documentation cannot later claim FailClosed "eliminates
+// phantom calls" while these fixtures keep committing.
+int test_r6_complete_unfenced_in_set_example_residual() {
+    const std::shared_ptr<const fi::ToolCallOutputContract> contract = contract_from_definitions(
+        {tool_definition("bash", Json{{"command", Json{{"type", "string"}}}})});
+    const std::string call = tool_call("bash", {{"command", "echo example"}});
+    int failures = 0;
+
+    const auto parse_production = [&](const std::string& text) {
+        return fi::parse_qwen_tool_call_output(
+            text, 64, *contract, false, ninfer::FinishReason::StopToken,
+            ninfer::ToolCallSyntaxMode::QwenWrappedNative,
+            ninfer::ToolCallAmbiguityPolicy::FailClosed);
+    };
+
+    // Fixture A: example label + complete call + EOF — structured (documented residual).
+    {
+        const auto parsed = parse_production("Example:\n" + call);
+        failures += check(parsed.is_tool_call_response, "R6-04 A: prose + complete example commits (residual)");
+        failures += check(parsed.tool_calls.size() == 1, "R6-04 A: one structured bash call");
+        if (parsed.tool_calls.size() == 1) {
+            failures += check(parsed.tool_calls.front().name == "bash", "R6-04 A: call name");
+            failures += check(Json::parse(parsed.tool_calls.front().arguments_json).at("command") ==
+                                  "echo example",
+                              "R6-04 A: argument preserved");
+        }
+        failures += check(parsed.content == "Example:", "R6-04 A: prose preserved as content");
+    }
+    // Fixture B: explanatory prose + complete call + EOF — structured.
+    {
+        const auto parsed = parse_production("Here is the syntax:\n" + call);
+        failures += check(parsed.is_tool_call_response && parsed.tool_calls.size() == 1,
+                          "R6-04 B: prose + complete example commits (residual)");
+        failures += check(parsed.content == "Here is the syntax:", "R6-04 B: prose preserved");
+    }
+    // Fixture C: complete call only (positive control; genuinely indistinguishable) — structured.
+    {
+        const auto parsed = parse_production(call);
+        failures += check(parsed.is_tool_call_response && parsed.tool_calls.size() == 1,
+                          "R6-04 C: example-only output commits (indistinguishable)");
+        failures += check(parsed.content.empty(), "R6-04 C: no content");
+    }
+    // Fixture D: fenced version of the same call — text / no calls (the fence guard covers
+    // this sub-class; the residue is the UNFENCED class).
+    {
+        const std::string fenced = "```xml\n" + call + "\n```\n";
+        const auto parsed = parse_production(fenced);
+        failures += check(!parsed.is_tool_call_response && parsed.tool_calls.empty(),
+                          "R6-04 D: fenced example stays text");
+        failures += check(parsed.content == fenced, "R6-04 D: fenced bytes preserved verbatim");
+        failures += check(!parsed.diagnostics.marker_seen, "R6-04 D: no marker latch inside fence");
+    }
+    // §12.3: undeclared complete call — non-executable (declared-tool enforcement).
+    {
+        const std::string undeclared = tool_call("other", {{"payload", "x"}});
+        const auto parsed = parse_production(undeclared);
+        failures += check(!parsed.is_tool_call_response && parsed.tool_calls.empty(),
+                          "R6-04 E: undeclared complete call non-executable");
+        failures += check(
+            parsed.diagnostics.fallback_reason == ninfer::ToolCallParseFallbackReason::UndeclaredTool,
+            "R6-04 E: undeclared reason recorded");
+    }
+    // §12.3: compatibility-only bare entry under Native — non-executable (R5-07 entry set).
+    {
+        const std::string bare = "<function=bash>\n<parameter=command>\necho example\n</parameter>\n"
+                                "</function>";
+        const auto parsed = parse_production(bare);
+        failures += check(!parsed.is_tool_call_response && parsed.tool_calls.empty(),
+                          "R6-04 F: compat-only bare entry stays text under Native");
+    }
+    return failures;
+}
 int main() {
     int failures = 0;
     failures += test_r5_syntax_mode_native_vs_compatibility();
@@ -4272,6 +4352,7 @@ int main() {
     failures += test_round4_same_family_balance();
     failures += test_round4_fence_diagnostics_scope();
     failures += test_round4_r1_residual_pinned();
+    failures += test_r6_complete_unfenced_in_set_example_residual();
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }
