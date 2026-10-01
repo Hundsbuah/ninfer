@@ -627,9 +627,11 @@ ToolCallOutputDecoder::Terminal ToolCallOutputDecoder::finish(FinishReason finis
 
     std::string region;
     if (machine_.latched()) { region.assign(machine_.latched_region()); }
+    // R7-01b: the terminal re-parse must carry the same intent policy as the live machine;
+    // no default may silently substitute TemplateCompatible.
     ParsedToolCallOutput parsed = parse_qwen_tool_call_output(region, max_tool_name_length_,
                                                               *contract_, tolerant_, finish_reason,
-                                                              syntax_, ambiguity_);
+                                                              syntax_, ambiguity_, intent_);
     // R3-06: the entry re-parse sees only the region; the pre-latch fence diagnostic comes
     // from this machine (the same pre-latch bytes, deterministic over the byte stream).
     // N-06: apply the same latch rule as the one-shot entry — a latch only happens outside a
