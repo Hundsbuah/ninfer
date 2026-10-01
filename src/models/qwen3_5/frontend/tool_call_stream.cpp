@@ -1138,10 +1138,12 @@ ToolCallStreamResult ToolCallStreamParser::finish(FinishReason finish_reason) co
         std::size_t base;
         ToolCallParseProgress progress;
     };
-    constexpr std::size_t kMaxChainAttempts = 256; // R3-04: the bounded chain
+    // N-03: no attempt bound — the chain terminates naturally (Complete, an owned/open-value
+    // break, or no further admissible marker). base strictly increases each iteration, so the
+    // chain is bounded by the number of markers.
     std::vector<Attempt> chain;
     std::size_t base = 0;
-    for (std::size_t attempts = 0; attempts < kMaxChainAttempts; ++attempts) {
+    for (;;) {
         RegionState s{};
         s.pos = base;
         ToolCallParseProgress progress =
@@ -1267,11 +1269,7 @@ ToolCallStreamResult ToolCallStreamParser::finish(FinishReason finish_reason) co
         // does not extend a value and is not counted (a stray '</tool_call>' after a
         // complete call stays recoverable).
         const std::size_t tail_begin = attempt.progress.break_offset;
-        const bool tail_has_value_closer =
-            region_.find(tool_close_literal(ToolTagKind::Parameter), tail_begin) !=
-                std::string::npos ||
-            region_.find(tool_close_literal(ToolTagKind::Param), tail_begin) !=
-                std::string::npos;
+        const bool tail_has_value_closer = index.has_close_at_or_after(tail_begin);
         const ToolCallRecoveryPolicy decision_policy{
             policy_.tolerant,
             finish_reason,
