@@ -3770,6 +3770,109 @@ int test_round4_work_bounds() {
     }
     return failures;
 }
+// Section-7 streaming guard: the streamed decode (chunk sizes 1/2/3/5/7, every split for
+// fixtures below 512 bytes) must equal the one-shot entry (content under the documented
+// pre-region rtrim rule, calls, arguments, fallback reason).
+int stream_matches_one_shot(const std::string& text,
+                            const std::shared_ptr<const fi::ToolCallOutputContract>& contract,
+                            bool tolerant, ninfer::FinishReason reason, const char* label) {
+    const auto one = fi::parse_qwen_tool_call_output(text, 64, *contract, tolerant, reason);
+    auto compare = [&](const std::vector<std::size_t>& points) -> bool {
+        fi::ToolCallOutputDecoder dec(contract, 64, tolerant);
+        std::string_view sv = text;
+        std::size_t from = 0;
+        std::string visible;
+        for (const std::size_t pt : points) { visible += dec.feed(sv.substr(from, pt - from)); from = pt; }
+        if (from < text.size()) { visible += dec.feed(sv.substr(from)); }
+        const auto term = dec.finish(reason);
+        std::string total = visible + term.content;
+        if (one.is_tool_call_response) {
+            while (!total.empty() && fi::is_tool_format_whitespace(total.back())) { total.pop_back(); }
+        }
+        bool same_calls = one.tool_calls.size() == term.tool_calls.size();
+        for (std::size_t i = 0; same_calls && i < one.tool_calls.size(); ++i) {
+            same_calls = one.tool_calls[i].name == term.tool_calls[i].name &&
+                         one.tool_calls[i].arguments_json == term.tool_calls[i].arguments_json;
+        }
+        return total == one.content && same_calls &&
+               one.diagnostics.fallback_reason == term.diagnostics.fallback_reason;
+    };
+    if (text.size() < 512) {
+        for (std::size_t k = 0; k <= text.size(); ++k) {
+            if (!compare({k})) { std::printf("fail %s: streaming split %zu diverges\n", label, k); return 1; }
+        }
+    } else {
+        for (const int chunk : {1, 2, 3, 5, 7}) {
+            std::vector<std::size_t> points;
+            for (std::size_t k = 0; k < text.size(); k += std::size_t(chunk)) { points.push_back(k); }
+            if (!compare(points)) { std::printf("fail %s: streaming chunk %d diverges\n", label, chunk); return 1; }
+        }
+    }
+    return 0;
+}
+
+// N-02: a Stage-2 base whose values use the `<param>`/`</param>` family must not be skipped
+// (the old skip tested only `</parameter>`). The reproducer completes via Stage 2.
+int test_round4_param_family_stage2() {
+    using ninfer::FinishReason;
+    using ninfer::ToolCallParseFallbackReason;
+    const std::string text =
+        "<tool_call>\n<function=write>\n<param=path>\ndocs/x.md\n</param>\n<param=content>\n# Example\n"
+        "<tool_call>\n<function=read>\n<param=path>\nfoo.cpp\n</param>\n</function>\n</tool_call>\nDone.\n"
+        "</param>\n</function>\n</tool_call>";
+    int failures = 0;
+    Json write_props = Json::object();
+    write_props["path"]    = Json{{"type", "string"}};
+    write_props["content"] = Json{{"type", "string"}};
+    Json read_props = Json::object();
+    read_props["path"] = Json{{"type", "string"}};
+    const std::vector<std::string> definitions = {tool_definition("write", write_props),
+                                                  tool_definition("read", read_props)};
+    const auto shared = contract_from_definitions(definitions);
+    for (const bool tolerant : {false, true}) {
+        const auto parsed = fi::parse_qwen_tool_call_output(text, 64, *shared, tolerant,
+                                                            FinishReason::StopToken);
+        failures += check(parsed.is_tool_call_response && parsed.tool_calls.size() == 1 &&
+                              parsed.tool_calls[0].name == "write" &&
+                              parsed.diagnostics.markup_tolerant_completion &&
+                              parsed.diagnostics.fallback_reason == ToolCallParseFallbackReason::None,
+                          "N-02: a <param>-family write completes via Stage 2");
+    }
+    failures += stream_matches_one_shot(text, shared, false, FinishReason::StopToken, "N-02 streaming");
+    return failures;
+}
+
+// N-05: the balance census counts only same-family openers. A cross-family `<param>` opener
+// inside a `<parameter>` value is ordinary bytes, not a nesting opener.
+int test_round4_same_family_balance() {
+    using ninfer::FinishReason;
+    using ninfer::ToolCallParseFallbackReason;
+    Json write_props = Json::object();
+    write_props["path"]    = Json{{"type", "string"}};
+    write_props["content"] = Json{{"type", "string"}};
+    Json bash_props = Json::object();
+    bash_props["command"] = Json{{"type", "string"}};
+    const std::vector<std::string> definitions = {tool_definition("write", write_props),
+                                                  tool_definition("bash", bash_props)};
+    const auto shared = contract_from_definitions(definitions);
+    const std::string ex      = tool_call("bash", {{"command", "ls"}});
+    const std::string content = "Doc <param=x> marker\n" + ex + "\nmore";
+    const std::string text    = "Example:\n" + ex + "\nNow writing.\n" +
+                                tool_call("write", {{"path", "d.md"}, {"content", content}});
+    const auto parsed = fi::parse_qwen_tool_call_output(text, 64, *shared, false,
+                                                        FinishReason::StopToken);
+    int failures = check(parsed.is_tool_call_response && parsed.tool_calls.size() == 1 &&
+                             parsed.tool_calls[0].name == "write" &&
+                             parsed.diagnostics.fallback_reason == ToolCallParseFallbackReason::None,
+                         "N-05: a cross-family <param> opener stays content (write completes)");
+    if (parsed.is_tool_call_response && parsed.tool_calls.size() == 1) {
+        const Json args = Json::parse(parsed.tool_calls[0].arguments_json);
+        failures += check(args["content"].get<std::string>() == content,
+                          "N-05: the write content is byte-exact (cross-family opener is content)");
+    }
+    failures += stream_matches_one_shot(text, shared, false, FinishReason::StopToken, "N-05 streaming");
+    return failures;
+}
 
 
 int main() {
@@ -3841,6 +3944,8 @@ int main() {
     failures += test_round3_work_bounds();
     failures += test_round4_stage2_many_values();
     failures += test_round4_work_bounds();
+    failures += test_round4_param_family_stage2();
+    failures += test_round4_same_family_balance();
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }
