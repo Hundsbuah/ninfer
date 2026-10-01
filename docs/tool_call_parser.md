@@ -160,10 +160,11 @@ The top-level entry syntax is the output contract's `ToolCallSyntaxMode` (servin
   regions.
 
 The mode is a single grammar decision shared by the streaming pre-latch scan, the marker
-retry search, and the top-level entry transitions after a closed wrapper; the Phase-4
-constraint core tracks the compatibility superset. It is an explicit configuration choice,
-never inferred from template filenames or other metadata substrings, and a canonical wrapped
-Qwen3.8 call parses identically in both modes.
+retry search, the top-level entry transitions after a closed wrapper, and the Phase-4
+constraint core (Round-6 R6-01: the constraint constructor takes the same `ToolCallSyntaxMode`,
+so the CPU constraint state can never latch an entry the parser would treat as prose). It is
+an explicit configuration choice, never inferred from template filenames or other metadata
+substrings, and a canonical wrapped Qwen3.8 call parses identically in both modes.
 
 ## Ambiguous byte protocol
 
@@ -192,6 +193,35 @@ byte-exact. `FailClosed` refuses only the unbalanced class (an early complete cl
 prose plus the outer closer chain, with no matching openers), which includes some legitimate
 but structurally ambiguous `write.content` payloads. Choosing `PayloadFidelity` knowingly is
 valid; claiming phantom-call elimination under it is not.
+
+## Semantic quotation residual
+
+The `ToolCallAmbiguityPolicy` above controls one specific structural ambiguity: a Stage-2 value
+boundary whose closer chain stands while an earlier candidate's closer chain had already formed
+a complete call. It is not an intent oracle, and it must not be described as one.
+
+A different, older class remains: a **complete, declared, canonical, unfenced** `<tool_call>`
+example whose bytes are identical to a genuine action. When the byte sequence itself contains
+no contradictory structure, a byte parser cannot distinguish "show this example" from
+"execute this":
+
+- code fences are handled: a marker inside a recognized fence never latches;
+- undeclared names are handled: declared-tool enforcement returns the region as text;
+- compatibility-only top-level markers are excluded in native mode;
+- but a fully valid, declared, canonical `<tool_call>` in ordinary unfenced content is still
+  indistinguishable from an actual action;
+- `FailClosed` is not invoked for such a region: a clean Stage-1 completion never reaches
+  Stage 2, so no ambiguity policy can refuse it;
+- the official Qwen3.8 template explicitly permits natural-language reasoning before a
+  function call, so a prose prefix is not by itself evidence of quotation.
+
+This is a documented residual of the native wire protocol, not an implementation bug. The
+pinned fixture `test_r6_complete_unfenced_in_set_example_residual` records the current verdict
+under the production policies: prose-prefixed and example-only outputs commit their complete
+unfenced call; only the fenced equivalent stays text. The optional Round-6 hardening mode
+(`--tool-call-intent start-of-content`) reduces the prose-prefixed quotation class; the
+example-only byte-identical output remains fundamentally ambiguous and can only be eliminated
+by a TEXT-vs-TOOL intent channel (`tool_call_intent_channel_design.md`).
 
 ## Constrained tool decoding
 
