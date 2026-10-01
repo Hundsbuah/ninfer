@@ -463,7 +463,7 @@ void test_r6_constraint_parser_entry_cross_check() {
     for (const Mode mode : {Mode::QwenWrappedNative, Mode::Compatibility}) {
         for (const Entry& entry : entries) {
             const auto parsed = ninfer::models::qwen3_5::frontend::parse_qwen_tool_call_output(
-                entry.region, 64, contract, false, ninfer::FinishReason::StopToken, mode,
+                std::string(entry.region), 64, contract, false, ninfer::FinishReason::StopToken, mode,
                 ninfer::ToolCallAmbiguityPolicy::PayloadFidelity);
             ToolCallGrammarConstraint constraint(64, mode);
             constraint.commit(entry.marker);
