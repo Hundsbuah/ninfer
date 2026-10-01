@@ -770,6 +770,26 @@ int main() {
                       "R5-06: an unknown --tool-call-ambiguity value must be rejected");
     failures += check(tolerant_help.find("--tool-call-ambiguity") != std::string::npos,
                       "R5-06: the serve help must document --tool-call-ambiguity");
+    // R6-05: --tool-call-intent template-compatible|start-of-content.
+    failures += check(parse({"ninfer-serve", "model.ninfer"}).tool_call_intent ==
+                          ninfer::ToolCallIntentPolicy::TemplateCompatible,
+                      "R6-05: the serving intent policy must default to template-compatible");
+    const auto hardened_intent =
+        parse({"ninfer-serve", "model.ninfer", "--tool-call-intent", "start-of-content"});
+    failures += check(hardened_intent.tool_call_intent ==
+                          ninfer::ToolCallIntentPolicy::RequireToolAtContentStart,
+                      "R6-05: --tool-call-intent start-of-content must reach serving options");
+    bool bad_intent_rejected = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--tool-call-intent", "auto"});
+    } catch (const std::invalid_argument&) {
+        bad_intent_rejected = true;
+    }
+    failures += check(bad_intent_rejected,
+                      "R6-05: an unknown --tool-call-intent value must be rejected");
+    failures += check(tolerant_help.find("--tool-call-intent") != std::string::npos,
+                      "R6-05: the serve help must document --tool-call-intent");
+
 
     const ServeOptions inherited = parse(
         {"ninfer-serve", "model.ninfer", "--max-context", "16384", "--use-original-prefix-caching"});

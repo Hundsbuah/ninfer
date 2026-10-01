@@ -4276,6 +4276,147 @@ int test_r6_complete_unfenced_in_set_example_residual() {
     }
     return failures;
 }
+// R6-05 (Round 6 §7/§12.4/§13): the optional tool-call intent policy. TemplateCompatible
+// keeps the upstream Qwen behavior (a tool region may latch after any content);
+// RequireToolAtContentStart locks the turn to text once any visible
+// (non-formatting-whitespace) Content byte commits. The gate lives in the pre-latch machine,
+// so one-shot and streaming share it (the bytewise decoder leg below proves the equality).
+// This is a mitigation: the example-only byte-identical case stays executable under both
+// modes (pinned by test_r6_complete_unfenced_in_set_example_residual).
+int test_r6_intent_policy_matrix() {
+    const auto contract = contract_from_definitions(
+        {tool_definition("bash", Json{{"command", Json{{"type", "string"}}}})});
+    const std::string call = tool_call("bash", {{"command", "echo example"}});
+    int failures = 0;
+
+    const auto parse_intent = [&](const std::string& text, ninfer::ToolCallIntentPolicy intent) {
+        return fi::parse_qwen_tool_call_output(
+            text, 64, *contract, false, ninfer::FinishReason::StopToken,
+            ninfer::ToolCallSyntaxMode::QwenWrappedNative,
+            ninfer::ToolCallAmbiguityPolicy::FailClosed, intent);
+    };
+    const auto streaming_intent = [&](const std::string& text, ninfer::ToolCallIntentPolicy intent) {
+        fi::ToolCallOutputDecoder decoder(
+            contract, 64, false, ninfer::ToolCallSyntaxMode::QwenWrappedNative,
+            ninfer::ToolCallAmbiguityPolicy::FailClosed, intent);
+        std::string visible;
+        for (const char byte : text) { visible += decoder.feed(std::string_view(&byte, 1)); }
+        const auto terminal = decoder.finish(ninfer::FinishReason::StopToken);
+        return fi::ParsedToolCallOutput{.is_tool_call_response = !terminal.tool_calls.empty(),
+                                    .content              = visible + terminal.content,
+                                    .tool_calls           = terminal.tool_calls,
+                                    .diagnostics          = terminal.diagnostics};
+    };
+    const std::array<ninfer::ToolCallIntentPolicy, 2> both_intents = {
+        ninfer::ToolCallIntentPolicy::TemplateCompatible,
+        ninfer::ToolCallIntentPolicy::RequireToolAtContentStart};
+
+    // Case A — plain intended call: both modes → call.
+    for (const auto intent : both_intents) {
+        const auto parsed = parse_intent(call, intent);
+        failures += check(parsed.is_tool_call_response && parsed.tool_calls.size() == 1,
+                          "R6-05 A: plain call commits under both intent modes");
+    }
+    // Case B — whitespace before call: both → call (formatting whitespace never locks).
+    {
+        const std::string text = "\n  \t" + call;
+        for (const auto intent : both_intents) {
+            const auto parsed = parse_intent(text, intent);
+            failures += check(parsed.is_tool_call_response && parsed.tool_calls.size() == 1,
+                              "R6-05 B: whitespace-prefixed call commits under both modes");
+            failures += check(parsed.content.empty(), "R6-05 B: no residual content");
+        }
+    }
+    // Case C — prose before call: TemplateCompatible → call; RequireToolAtContentStart → text.
+    {
+        const std::string text = "I'll inspect it.\n" + call;
+        const auto tc = parse_intent(text, ninfer::ToolCallIntentPolicy::TemplateCompatible);
+        const auto soc = parse_intent(text, ninfer::ToolCallIntentPolicy::RequireToolAtContentStart);
+        failures += check(tc.is_tool_call_response && tc.tool_calls.size() == 1,
+                          "R6-05 C: TemplateCompatible keeps the prose-prefixed call");
+        failures += check(!soc.is_tool_call_response && soc.tool_calls.empty(),
+                          "R6-05 C: the hardened mode locks the turn to text");
+        failures += check(soc.content == text, "R6-05 C: the locked bytes return verbatim");
+        failures += check(!soc.diagnostics.marker_seen,
+                          "R6-05 C: the locked marker never latches");
+    }
+    // Case D — explicit example prose: TemplateCompatible → call (documented residual);
+    // RequireToolAtContentStart → text / 0 calls.
+    {
+        const std::string text = "Example:\n" + call;
+        const auto tc = parse_intent(text, ninfer::ToolCallIntentPolicy::TemplateCompatible);
+        const auto soc = parse_intent(text, ninfer::ToolCallIntentPolicy::RequireToolAtContentStart);
+        failures += check(tc.is_tool_call_response && tc.tool_calls.size() == 1,
+                          "R6-05 D: TemplateCompatible keeps the example (residual)");
+        failures += check(!soc.is_tool_call_response && soc.tool_calls.empty(),
+                          "R6-05 D: the hardened mode rejects the example prose class");
+    }
+    // Case E — marker-like failed prefix, then a real call: the hardened mode stays text;
+    // a failed marker-like prefix cannot bypass the gate.
+    {
+        const std::string text = "<tool_x>\n" + call;
+        const auto soc = parse_intent(text, ninfer::ToolCallIntentPolicy::RequireToolAtContentStart);
+        failures += check(!soc.is_tool_call_response && soc.tool_calls.empty(),
+                          "R6-05 E: a failed marker candidate closes the entry gate");
+        const auto tc = parse_intent(text, ninfer::ToolCallIntentPolicy::TemplateCompatible);
+        failures += check(tc.is_tool_call_response && tc.tool_calls.size() == 1,
+                          "R6-05 E: TemplateCompatible still latches the later marker");
+    }
+    // Case F — fenced example: 0 calls in both modes.
+    {
+        const std::string text = "```xml\n" + call + "\n```\n";
+        for (const auto intent : both_intents) {
+            const auto parsed = parse_intent(text, intent);
+            failures += check(!parsed.is_tool_call_response && parsed.tool_calls.empty(),
+                              "R6-05 F: the fenced example stays text under both modes");
+        }
+    }
+    // §13B — leading HTML comment: the hardened mode stays text (no HTML special-case).
+    {
+        const std::string text = "<!-- example -->\n" + call;
+        const auto soc = parse_intent(text, ninfer::ToolCallIntentPolicy::RequireToolAtContentStart);
+        failures += check(!soc.is_tool_call_response && soc.tool_calls.empty(),
+                          "R6-05 13B: a leading comment locks the turn to text");
+    }
+    // §13C — unicode prose: the first UTF-8 non-whitespace byte locks text.
+    {
+        const std::string text = "Beispiel:\n" + call;
+        const auto soc = parse_intent(text, ninfer::ToolCallIntentPolicy::RequireToolAtContentStart);
+        failures += check(!soc.is_tool_call_response && soc.tool_calls.empty(),
+                          "R6-05 13C: unicode prose locks the turn to text");
+    }
+    // §7.9 — multiple consecutive valid calls at content start remain unchanged.
+    {
+        const std::string text = call + "\n" + tool_call("bash", {{"command", "pwd"}});
+        for (const auto intent : both_intents) {
+            const auto parsed = parse_intent(text, intent);
+            failures += check(parsed.is_tool_call_response && parsed.tool_calls.size() == 2,
+                              "R6-05 7.9: consecutive wrappers keep their calls");
+        }
+    }
+    // §12.5 — streaming invariance: bytewise streaming equals one-shot for the
+    // intent-sensitive fixtures under both modes.
+    {
+        const std::vector<std::string> fixtures = {
+            "\n  \t" + call,
+            "I'll inspect it.\n" + call,
+            "Example:\n" + call,
+            "<tool_x>\n" + call,
+            "```xml\n" + call + "\n```\n",
+        };
+        for (const auto& text : fixtures) {
+            for (const auto intent : both_intents) {
+                const auto one_shot = parse_intent(text, intent);
+                const auto streamed = streaming_intent(text, intent);
+                failures += check(
+                    streamed.content == one_shot.content &&
+                        streamed.tool_calls.size() == one_shot.tool_calls.size(),
+                    "R6-05 12.5: bytewise streaming equals one-shot under the intent policy");
+            }
+        }
+    }
+    return failures;
+}
 int main() {
     int failures = 0;
     failures += test_r5_syntax_mode_native_vs_compatibility();
@@ -4353,6 +4494,7 @@ int main() {
     failures += test_round4_fence_diagnostics_scope();
     failures += test_round4_r1_residual_pinned();
     failures += test_r6_complete_unfenced_in_set_example_residual();
+    failures += test_r6_intent_policy_matrix();
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }
