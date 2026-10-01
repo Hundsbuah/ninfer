@@ -534,11 +534,15 @@ int main() {
     normalized_tool_outcome.tool_calls.push_back(
         ninfer::GeneratedToolCall{.name = "Edit", .arguments_json = R"({"file_path":"x"})"});
     normalized_tool_outcome.tool_call_parse = {
-        .marker_seen               = true,
-        .structured_call_count     = 1,
-        .empty_arguments_omitted   = 1,
-        .schema_mismatch_arguments = 2,
-        .fallback_reason           = ninfer::ToolCallParseFallbackReason::None,
+        .marker_seen                = true,
+        .structured_call_count      = 1,
+        .empty_arguments_omitted    = 1,
+        .schema_mismatch_arguments  = 2,
+        .markup_tolerant_completion = true,
+        .fenced_markers_suppressed  = 3,
+        .ended_in_unclosed_fence    = true,
+        .parse_budget_exhausted     = true,
+        .fallback_reason            = ninfer::ToolCallParseFallbackReason::None,
     };
     const Json normalized_tool_done =
         Json::parse(format_request_done_json("serve-test", 3002, context, normalized_tool_outcome));
@@ -553,6 +557,15 @@ int main() {
                     .at("schema_mismatch_arguments") == 2 &&
             normalized_tool_done.at("result").at("tool_call_parse").at("fallback_reason") ==
                 "none" &&
+            normalized_tool_done.at("result").at("tool_call_parse")
+                    .at("markup_tolerant_completion") == true &&
+            normalized_tool_done.at("result")
+                    .at("tool_call_parse")
+                    .at("fenced_markers_suppressed") == 3 &&
+            normalized_tool_done.at("result").at("tool_call_parse")
+                    .at("ended_in_unclosed_fence") == true &&
+            normalized_tool_done.at("result").at("tool_call_parse")
+                    .at("parse_budget_exhausted") == true &&
             !render_tool_call_fallback(context, normalized_tool_outcome),
         "successful tool-call normalization diagnostics are incomplete or noisy");
 
@@ -591,6 +604,46 @@ int main() {
                           snippet_warning->message.find("sentinel-answer-text") ==
                               std::string::npos,
                       "tool-call fallback snippet is unbounded, multi-line or leaks prior text");
+    // N-06 item 2: the fence part and budget part in the text-fallback warning.
+    GenerationOutcome fence_outcome = outcome;
+    fence_outcome.tool_call_parse = {
+        .marker_seen               = true,
+        .structured_call_count     = 0,
+        .fenced_markers_suppressed = 2,
+        .ended_in_unclosed_fence   = true,
+        .fallback_reason           = ninfer::ToolCallParseFallbackReason::TrailingContent,
+    };
+    fence_outcome.text = "";
+    const std::optional<OperationalRecord> fence_rec =
+        render_tool_call_fallback(context, fence_outcome);
+    failures += check(fence_rec && fence_rec->message ==
+                          "req#7 tool markup returned as text | trailing content | "
+                          "fenced_markers_suppressed=2",
+                      "N-06: the fence part precedes the snippet in the warning");
+    // (ii) no marker seen, no calls, unclosed fence: the separate fence warning.
+    GenerationOutcome no_marker_outcome = outcome;
+    no_marker_outcome.tool_call_parse = {
+        .marker_seen               = false,
+        .structured_call_count     = 0,
+        .fenced_markers_suppressed = 2,
+        .ended_in_unclosed_fence   = true,
+        .fallback_reason           = ninfer::ToolCallParseFallbackReason::None,
+    };
+    no_marker_outcome.text = "```xml\n<tool_call>\n";
+    const std::optional<OperationalRecord> unclosed_rec =
+        render_tool_call_fallback(context, no_marker_outcome);
+    failures += check(unclosed_rec &&
+                          unclosed_rec->message.find("tool-call fence left unclosed") !=
+                              std::string::npos,
+                      "N-06: the no-marker unclosed fence warning is emitted");
+    // (iii) parse_budget_exhausted adds the budget part after the fence part.
+    fence_outcome.tool_call_parse.parse_budget_exhausted = true;
+    const std::optional<OperationalRecord> budget_rec =
+        render_tool_call_fallback(context, fence_outcome);
+    failures += check(budget_rec && budget_rec->message ==
+                          "req#7 tool markup returned as text | trailing content | "
+                          "fenced_markers_suppressed=2 | parse budget exhausted",
+                      "N-07: the budget part follows the fence part");
 
     const Json error =
         Json::parse(format_request_error_json("serve-test", 4000, context, "generation failed"));

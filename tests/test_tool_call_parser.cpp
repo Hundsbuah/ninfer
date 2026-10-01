@@ -2268,6 +2268,14 @@ int test_fenced_content_never_latches() {
     const auto contract = contract_from_definitions({
         tool_definition("bash", Json{{"command", Json{{"type", "string"}}}})});
     int failures = 0;
+    // N-09 f: the fence suppressed the marker, so the fence fields are visible. The closed-
+    // fence fixtures report ended_in_unclosed_fence false; the unclosed one reports true.
+    auto check_fence = [&](const std::string& text, bool expect_unclosed, const char* label) {
+        const auto o = fi::parse_qwen_tool_call_output(text, 64, *contract);
+        return check(o.diagnostics.fenced_markers_suppressed >= 1 &&
+                        o.diagnostics.ended_in_unclosed_fence == expect_unclosed,
+                     std::string(label));
+    };
     const std::string example_block =
         "<tool_call>\n"
         "<function=bash>\n"
@@ -2283,6 +2291,7 @@ int test_fenced_content_never_latches() {
     failures += check_round2_region(backtick, *contract, true, {},
                                     ninfer::ToolCallParseFallbackReason::None,
                                     "CR6 backtick fence (tolerant)");
+    failures += check_fence(backtick, false, "CR6 backtick fence: markers suppressed, fence closed");
     // Tilde fence without an info string.
     const std::string tilde = "~~~~\n" + example_block + "\n~~~~\n";
     failures += check_round2_region(tilde, *contract, false, {},
@@ -2291,6 +2300,7 @@ int test_fenced_content_never_latches() {
     failures += check_round2_region(tilde, *contract, true, {},
                                     ninfer::ToolCallParseFallbackReason::None,
                                     "CR6 tilde fence (tolerant)");
+    failures += check_fence(tilde, false, "CR6 tilde fence: markers suppressed, fence closed");
     // An unclosed fence stays open through EOF: the marker inside is content.
     const std::string unclosed = "```xml\n" + example_block + "\n";
     failures += check_round2_region(unclosed, *contract, false, {},
@@ -2299,6 +2309,7 @@ int test_fenced_content_never_latches() {
     failures += check_round2_region(unclosed, *contract, true, {},
                                     ninfer::ToolCallParseFallbackReason::None,
                                     "CR6 unclosed fence (tolerant)");
+    failures += check_fence(unclosed, true, "CR6 unclosed fence: markers suppressed, fence open");
     // A real call immediately after the closing fence still executes; the fenced example
     // stays content.
     const std::string after_fence = "```xml\n" + example_block + "\n```\n" + real_call;
@@ -2308,6 +2319,7 @@ int test_fenced_content_never_latches() {
     failures += check_round2_region(after_fence, *contract, true, {"bash"},
                                     ninfer::ToolCallParseFallbackReason::None,
                                     "CR6 real call after closed fence (tolerant)");
+    failures += check_fence(after_fence, false, "CR6 after closed fence: markers suppressed, fence closed");
     // A longer fence contains shorter backtick lines: the inner fences are content.
     const std::string nested_fence = "````\n```\n" + example_block + "\n```\n````\n";
     failures += check_round2_region(nested_fence, *contract, false, {},
@@ -2316,6 +2328,7 @@ int test_fenced_content_never_latches() {
     failures += check_round2_region(nested_fence, *contract, true, {},
                                     ninfer::ToolCallParseFallbackReason::None,
                                     "CR6 longer fence contains shorter (tolerant)");
+    failures += check_fence(nested_fence, false, "CR6 nested fence: markers suppressed, fence closed");
     // The opening fence line's info string may carry a marker: it is content.
     const std::string info_string = "```xml <tool_call>\n" + example_block + "\n```\n";
     failures += check_round2_region(info_string, *contract, false, {},
@@ -2324,6 +2337,7 @@ int test_fenced_content_never_latches() {
     failures += check_round2_region(info_string, *contract, true, {},
                                     ninfer::ToolCallParseFallbackReason::None,
                                     "CR6 fence info string (tolerant)");
+    failures += check_fence(info_string, false, "CR6 fence info string: markers suppressed, fence closed");
     // CRLF line endings.
     const std::string crlf = "Example:\r\n\r\n```xml\r\n" + example_block + "\r\n```\r\n";
     failures += check_round2_region(crlf, *contract, false, {},
@@ -2332,6 +2346,7 @@ int test_fenced_content_never_latches() {
     failures += check_round2_region(crlf, *contract, true, {},
                                     ninfer::ToolCallParseFallbackReason::None,
                                     "CR6 CRLF fence (tolerant)");
+    failures += check_fence(crlf, false, "CR6 CRLF fence: markers suppressed, fence closed");
     // A complete call before a fence: the terminal policy decides (strict rejects the
     // trailing fence block, tolerant retains the call only at a natural stop; a cut
     // finish reason leaves nothing committable behind the definitive break, R3-03).
@@ -3354,20 +3369,20 @@ int test_round3_spec_corpus() {
                                  json_escape(value) + "\"}");
         failures += stream_equals_one_shot("R3 R5 streaming", r5, false, true);
     }
-    // R1 (section 9 residual): an unfenced complete example followed by prose ending with
-    // the canonical closer lines. The normative Stage-2/Stage-3 rules reject the region
-    // (the value-swallowing candidate ends at EndOfInput, and the natural-stop commit is
-    // blocked by the </parameter> literal in the tail); the section-9 phantom acceptance is
-    // not implemented. The observed verdict is pinned so a future change is intentional.
+    // R1-inline (inline closer note): the example is followed by a note line that carries an
+    // inline </parameter> (not a standalone closer line). The canonical-framing rule rejects
+    // an inline closer, so this is not the Round-3 section-9 phantom acceptance (see
+    // test_round4_r1_residual_pinned for the real R1 residual); the observed verdict is pinned
+    // so a future change is intentional.
     {
         const std::string r1 = "Example:\n" + tool_call("read", {{"path", "ex.txt"}}) +
                                "\nNote: </parameter>\n</function>\n</tool_call>";
         const auto strict = fi::parse_qwen_tool_call_output(r1, 64, c);
-        failures += as_text("R3 R1 strict: the prose closer tail keeps the region text", strict,
+        failures += as_text("R3 R1-inline strict: the inline closer note keeps the region text", strict,
                             r1, Reason::TrailingContent);
         const auto tol_stop = fi::parse_qwen_tool_call_output(r1, 64, c, true,
                                                               FinishReason::StopToken);
-        failures += as_text("R3 R1 tolerant StopToken: the value closer in the tail blocks the commit",
+        failures += as_text("R3 R1-inline tolerant StopToken: the value closer in the tail blocks the commit",
                             tol_stop, r1, Reason::TrailingContent);
         failures += stream_equals_one_shot("R3 R1 streaming", r1, true, true);
     }
@@ -3562,6 +3577,7 @@ int test_round3_spec_corpus() {
 // streamed parsing (full feed and byte-at-a-time) must agree on every text.
 int test_round3_streaming_equivalence_fuzz() {
     using ninfer::FinishReason;
+    // Round-3 section-10.3 fragment corpus; the same tail rule as before.
     const std::vector<std::string> frags = {
         "<tool_call>\n", "</tool_call>\n", "<function=write>\n", "<function=bash>\n", "</function>\n",
         "<parameter=path>\n", "<parameter=content>\n", "<parameter=command>\n", "</parameter>\n",
@@ -3580,41 +3596,70 @@ int test_round3_streaming_equivalence_fuzz() {
     const fi::ToolCallOutputContract& c = *contract;
     std::mt19937 rng(20260930);
     int failures = 0;
-    for (int t = 0; t < 512; ++t) {
+    // Compare the streamed result against the one-shot exactly (no rtrim): the content, the
+    // calls, and the full diagnostics must be identical.
+    auto stream_matches = [&](const char* partition, const std::string& visible,
+                              const fi::ToolCallOutputDecoder::Terminal& term,
+                              const fi::ParsedToolCallOutput& one, int t, bool tolerant,
+                              FinishReason reason) {
+        const std::string total = visible + term.content;
+        bool match = total == one.content && one.tool_calls.size() == term.tool_calls.size() &&
+                     term.diagnostics == one.diagnostics;
+        std::string first;
+        for (std::size_t i = 0; match && i < one.tool_calls.size(); ++i) {
+            match = one.tool_calls[i].name == term.tool_calls[i].name &&
+                    one.tool_calls[i].arguments_json == term.tool_calls[i].arguments_json;
+            if (!match) { first = "call " + std::to_string(i); }
+        }
+        if (!match) {
+            std::cout << "FAIL fuzz " << t << " " << partition << " tolerant=" << (int)tolerant
+                      << " reason=" << (reason == FinishReason::StopToken ? "stop" : "limit")
+                      << (first.empty() ? "" : " (mismatch at " + first + ")") << std::endl;
+        }
+        return match ? 0 : 1;
+    };
+    for (int t = 0; t < 2000; ++t) {
         std::string text;
         const int count = 2 + int(rng() % 14);
         for (int i = 0; i < count; ++i) { text += frags[rng() % frags.size()]; }
         if (rng() % 3 == 0) { text += tail; }
-        const auto one = fi::parse_qwen_tool_call_output(text, 64, c);
-        fi::ToolCallOutputDecoder decoder(std::make_shared<fi::ToolCallOutputContract>(c), 64,
-                                          false);
-        std::string visible;
-        if (t < 256) {
-            for (std::size_t i = 0; i < text.size(); ++i) { visible += decoder.feed(text.substr(i, 1)); }
-        } else {
-            visible += decoder.feed(std::string_view(text));
+        for (const bool tolerant : {false, true}) {
+            for (const FinishReason reason : {FinishReason::StopToken, FinishReason::OutputLimit}) {
+                const auto one = fi::parse_qwen_tool_call_output(text, 64, c, tolerant, reason);
+                // whole text
+                {
+                    fi::ToolCallOutputDecoder dec(contract, 64, tolerant);
+                    const std::string visible = dec.feed(text);
+                    const auto term = dec.finish(reason);
+                    failures += stream_matches("whole", visible, term, one, t, tolerant, reason);
+                }
+                // byte-wise
+                {
+                    fi::ToolCallOutputDecoder dec(contract, 64, tolerant);
+                    std::string visible;
+                    for (std::size_t i = 0; i < text.size(); ++i) {
+                        visible += dec.feed(text.substr(i, 1));
+                    }
+                    const auto term = dec.finish(reason);
+                    failures += stream_matches("byte", visible, term, one, t, tolerant, reason);
+                }
+                // random chunk sizes 1..7 seeded with the text index
+                {
+                    std::mt19937 chunk_rng(t);
+                    fi::ToolCallOutputDecoder dec(contract, 64, tolerant);
+                    std::string visible;
+                    std::size_t offset = 0;
+                    while (offset < text.size()) {
+                        const std::size_t n =
+                            std::min<std::size_t>(1 + chunk_rng() % 7, text.size() - offset);
+                        visible += dec.feed(text.substr(offset, n));
+                        offset += n;
+                    }
+                    const auto term = dec.finish(reason);
+                    failures += stream_matches("chunk", visible, term, one, t, tolerant, reason);
+                }
+            }
         }
-        const auto terminal = decoder.finish(FinishReason::StopToken);
-        std::string total = visible + terminal.content;
-        if (one.is_tool_call_response) {
-            // the one-shot entry rtrims the pre-region format whitespace; the streaming
-            // surface keeps it in the published visible bytes.
-            while (!total.empty() && fi::is_tool_format_whitespace(total.back())) { total.pop_back(); }
-        }
-        bool match = total == one.content &&
-                           one.is_tool_call_response == !terminal.tool_calls.empty() &&
-                           one.tool_calls.size() == terminal.tool_calls.size() &&
-                           one.diagnostics.fallback_reason == terminal.diagnostics.fallback_reason;
-        std::string first_mismatch;
-        for (std::size_t i = 0; match && i < one.tool_calls.size(); ++i) {
-            match = one.tool_calls[i].name == terminal.tool_calls[i].name &&
-                    one.tool_calls[i].arguments_json == terminal.tool_calls[i].arguments_json;
-            if (!match) { first_mismatch = "call " + std::to_string(i); }
-        }
-        failures += check(match, first_mismatch.empty()
-                                     ? ("R3 fuzz " + std::to_string(t) +
-                                        ": one-shot and streaming disagree")
-                                     : ("R3 fuzz " + std::to_string(t) + " mismatches at " + first_mismatch));
     }
     return failures;
 }
@@ -3955,6 +4000,41 @@ int test_round4_fence_diagnostics_scope() {
     return failures;
 }
 
+int test_round4_r1_residual_pinned() {
+    using ninfer::FinishReason;
+    Json bash_props = Json::object();
+    bash_props["command"] = Json{{"type", "string"}};
+    const std::vector<std::string> definitions = {tool_definition("bash", bash_props)};
+    const auto shared = contract_from_definitions(definitions);
+    // Documented Round-3 section-9 residual R1 (phantom acceptance): an unfenced complete
+    // example is followed by prose ending with the canonical closer lines. The Stage-1
+    // value-swallowing candidate commits the example and swallows the closer lines and the
+    // trailing prose into the bash command. This is a documented residual, not a bug; any
+    // change to this verdict must be deliberate.
+    const std::string text = "Example:\n" + tool_call("bash", {{"command", "ls"}}) +
+                             "\nThen close with\n</parameter>\n</function>\n</tool_call>";
+    const std::string expected_args =
+        std::string("{\"command\":\"ls\\n</parameter>\\n</function>\\n</tool_call>\\nThen close with\"}");
+    int failures = 0;
+    const auto strict = fi::parse_qwen_tool_call_output(text, 64, *shared, false,
+                                                        FinishReason::StopToken);
+    failures += check(strict.is_tool_call_response && strict.tool_calls.size() == 1 &&
+                          strict.tool_calls[0].name == "bash" &&
+                          strict.tool_calls[0].arguments_json == expected_args &&
+                          strict.content == "Example:" && strict.diagnostics.markup_tolerant_completion,
+                      "R4 R1 residual: strict commits the phantom bash call (documented)");
+    const auto tol = fi::parse_qwen_tool_call_output(text, 64, *shared, true,
+                                                     FinishReason::StopToken);
+    failures += check(tol.is_tool_call_response && tol.tool_calls.size() == 1 &&
+                          tol.tool_calls[0].name == "bash" &&
+                          tol.tool_calls[0].arguments_json == expected_args &&
+                          tol.content == "Example:" && tol.diagnostics.markup_tolerant_completion,
+                      "R4 R1 residual: tolerant StopToken commits the phantom bash call (documented)");
+    failures += stream_matches_one_shot(text, shared, false, FinishReason::StopToken,
+                                        "R4 R1 residual streaming");
+    return failures;
+}
+
 
 int main() {
     int failures = 0;
@@ -3968,6 +4048,7 @@ int main() {
     failures += test_boolean_boundary();
     failures += test_exact_integer_boundary();
     failures += test_empty_declared_non_string_is_omitted();
+    failures += test_composed_schema_types(); // N-09 a: re-registered
     failures += test_schema_mismatches_remain_structured();
     failures += test_unsupported_schema_uses_legacy_policy();
     failures += test_strict_structure_and_active_tool_set();
@@ -4028,6 +4109,7 @@ int main() {
     failures += test_round4_param_family_stage2();
     failures += test_round4_same_family_balance();
     failures += test_round4_fence_diagnostics_scope();
+    failures += test_round4_r1_residual_pinned();
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }
