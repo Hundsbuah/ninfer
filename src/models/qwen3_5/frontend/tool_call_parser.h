@@ -106,7 +106,10 @@ public:
                               ToolCallAmbiguityPolicy::PayloadFidelity);
 
     [[nodiscard]] std::string feed(std::string_view text);
-    [[nodiscard]] Terminal finish(FinishReason finish_reason = FinishReason::None);
+    // R6-03: the terminal reason is explicit — there is no implicit None default. A caller
+    // whose end reason is genuinely unknown must write finish(FinishReason::None), which
+    // keeps the terminal policy review grep-able and prevents accidental policy drift.
+    [[nodiscard]] Terminal finish(FinishReason finish_reason);
 
 private:
     std::shared_ptr<const ToolCallOutputContract> contract_;

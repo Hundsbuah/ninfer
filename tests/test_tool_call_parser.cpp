@@ -492,7 +492,7 @@ int test_empty_declared_non_string_is_omitted() {
         fi::ToolCallOutputDecoder decoder(contract, 128);
         std::string visible = decoder.feed(std::string_view(text).substr(0, split));
         visible += decoder.feed(std::string_view(text).substr(split));
-        auto terminal = decoder.finish();
+        auto terminal = decoder.finish(ninfer::FinishReason::None);
         if (visible != "I need one more check." || !terminal.content.empty() ||
             terminal.tool_calls.size() != 1 ||
             terminal.tool_calls.front().arguments_json !=
@@ -508,7 +508,7 @@ int test_empty_declared_non_string_is_omitted() {
     fi::ToolCallOutputDecoder bytewise(contract, 128);
     std::string bytewise_visible;
     for (const char byte : text) { bytewise_visible += bytewise.feed(std::string_view(&byte, 1)); }
-    auto bytewise_terminal = bytewise.finish();
+    auto bytewise_terminal = bytewise.finish(ninfer::FinishReason::None);
     failures +=
         check(bytewise_visible == "I need one more check." && bytewise_terminal.content.empty() &&
                   bytewise_terminal.tool_calls.size() == 1 &&
@@ -755,7 +755,7 @@ int test_incremental_quoted_marker_preserves_bytes() {
     for (std::size_t offset = 0; offset < text.size(); offset += kChunk) {
         visible += decoder.feed(std::string_view(text).substr(offset, kChunk));
     }
-    auto terminal = decoder.finish();
+    auto terminal = decoder.finish(ninfer::FinishReason::None);
 
     int failures = 0;
     failures += check(terminal.tool_calls.size() == 1 &&
@@ -777,7 +777,7 @@ int test_incremental_valid_and_boolean() {
     visible += legacy.feed("Calling weather.  \n<tool_");
     visible += legacy.feed("call>\n<function=get_weather>");
     visible += legacy.feed("\n</function>\n</tool_call>");
-    auto legacy_terminal = legacy.finish();
+    auto legacy_terminal = legacy.finish(ninfer::FinishReason::None);
     visible += legacy_terminal.content;
 
     auto bool_contract =
@@ -787,7 +787,7 @@ int test_incremental_valid_and_boolean() {
     boolean_visible += boolean.feed("<tool_call>\n<function=configure>\n<parameter=enabled>\nT");
     boolean_visible += boolean.feed("r");
     boolean_visible += boolean.feed("ue\n</parameter>\n</function>\n</tool_call>");
-    auto boolean_terminal = boolean.finish();
+    auto boolean_terminal = boolean.finish(ninfer::FinishReason::None);
 
     int failures = 0;
     failures += check(visible == "Calling weather." && legacy_terminal.tool_calls.size() == 1,
@@ -809,20 +809,20 @@ int test_incremental_fallback_preserves_bytes() {
     std::string restored;
     restored += malformed.feed(original.substr(0, 10));
     restored += malformed.feed(original.substr(10));
-    auto malformed_terminal = malformed.finish();
+    auto malformed_terminal = malformed.finish(ninfer::FinishReason::None);
     restored += malformed_terminal.content;
 
     fi::ToolCallOutputDecoder ordinary(std::make_shared<fi::ToolCallOutputContract>(), 64);
     std::string ordinary_text;
     ordinary_text += ordinary.feed("ordinary text  ");
-    ordinary_text += ordinary.finish().content;
+    ordinary_text += ordinary.finish(ninfer::FinishReason::None).content;
 
     const std::string partial_original = "  <tool_x then <tool_";
     fi::ToolCallOutputDecoder partial(std::make_shared<fi::ToolCallOutputContract>(), 64);
     std::string partial_restored;
     partial_restored += partial.feed("  <too");
     partial_restored += partial.feed("l_x then <tool_");
-    partial_restored += partial.finish().content;
+    partial_restored += partial.finish(ninfer::FinishReason::None).content;
 
     int failures = 0;
     failures += check(restored == original && malformed_terminal.diagnostics.marker_seen &&
@@ -848,7 +848,7 @@ int test_incremental_embedded_parameter_markup() {
     for (std::size_t offset = 0; offset < text.size(); offset += kChunk) {
         visible += decoder.feed(std::string_view(text).substr(offset, kChunk));
     }
-    auto terminal = decoder.finish();
+    auto terminal = decoder.finish(ninfer::FinishReason::None);
 
     int failures = 0;
     failures +=
@@ -1094,7 +1094,7 @@ int check_payload_round_trip(const fi::ToolCallOutputContract& contract, std::st
         for (std::size_t offset = 0; offset < text.size(); offset += chunk) {
             visible += decoder.feed(std::string_view(text).substr(offset, chunk));
         }
-        auto terminal = decoder.finish();
+        auto terminal = decoder.finish(ninfer::FinishReason::None);
         failures += check(visible.empty() && terminal.content.empty() &&
                               terminal.tool_calls.size() == 1 &&
                               Json::parse(terminal.tool_calls.front().arguments_json)
@@ -1624,7 +1624,7 @@ int test_marker_breaking_angle_restarts_candidate() {
     std::string visible = decoder.feed("prefix <function<");
     visible += decoder.feed(
         "tool_call>\n<function=read>\n<parameter=path>x</parameter>\n</function>\n</tool_call>");
-    auto terminal = decoder.finish();
+    auto terminal = decoder.finish(ninfer::FinishReason::None);
     int failures = 0;
     failures += check(visible == "prefix <function",
                       "the failed marker candidate was not published without the breaking '<'");
@@ -1937,7 +1937,7 @@ int test_recovery_only_restarts_after_proven_scope() {
             std::make_shared<fi::ToolCallOutputContract>(*contract), 64);
         std::string visible = decoder.feed(std::string_view(nested).substr(0, split));
         visible += decoder.feed(std::string_view(nested).substr(split));
-        auto terminal = decoder.finish();
+        auto terminal = decoder.finish(ninfer::FinishReason::None);
         every_split_matches = terminal.tool_calls.empty() && !terminal.content.empty() &&
                               visible + terminal.content == one_shot.content &&
                               terminal.diagnostics == one_shot.diagnostics;
@@ -2229,7 +2229,7 @@ int test_output_normalization_cannot_emit_out_of_set_name() {
             for (std::size_t i = 0; i < text.size(); ++i) {
                 visible += decoder.feed(std::string_view(text).substr(i, 1));
             }
-            for (const auto& call : decoder.finish().tool_calls) {
+            for (const auto& call : decoder.finish(ninfer::FinishReason::None).tool_calls) {
                 failures += check(call.name == "read",
                                   (std::string("CR5 streamed out-of-set name emitted: ") + name)
                                       .c_str());
@@ -2390,7 +2390,7 @@ int test_fence_split_at_every_byte() {
             std::make_shared<fi::ToolCallOutputContract>(*contract), 64);
         std::string visible = decoder.feed(std::string_view(text).substr(0, split));
         visible += decoder.feed(std::string_view(text).substr(split));
-        auto terminal = decoder.finish();
+        auto terminal = decoder.finish(ninfer::FinishReason::None);
         failures += check(
             terminal.tool_calls.size() == one_shot.tool_calls.size() &&
                 visible + terminal.content == one_shot.content &&
@@ -2461,7 +2461,7 @@ int test_tolerant_recovery() {
     for (std::size_t offset = 0; offset < suffixed.size(); offset += kChunk) {
         visible += decoder.feed(std::string_view(suffixed).substr(offset, kChunk));
     }
-    auto terminal = decoder.finish();
+    auto terminal = decoder.finish(ninfer::FinishReason::None);
     failures += check(visible.empty() && terminal.content.empty(),
                       "tolerant increment leaked recovered bytes to visible content");
     failures += check(terminal.tool_calls.size() == 1,
@@ -2677,7 +2677,7 @@ int test_streaming_recognizes_grammar_markers() {
         for (std::size_t i = 0; i < text.size(); ++i) {
             visible += decoder.feed(text.substr(i, 1));
         }
-        auto terminal = decoder.finish();
+        auto terminal = decoder.finish(ninfer::FinishReason::None);
         failures += check(visible == "Creating task." && terminal.content.empty() &&
                               terminal.tool_calls.size() == 1 &&
                               terminal.tool_calls.front().name == long_name &&
@@ -3007,7 +3007,7 @@ int test_function_calls_holds_call_sequence() {
             visible += decoder.feed(two_calls.substr(at, take));
             at += take;
         }
-        const auto terminal = decoder.finish();
+        const auto terminal = decoder.finish(ninfer::FinishReason::None);
         failures += check(terminal.tool_calls.size() == 2 && visible.empty() &&
                               terminal.content.empty() &&
                               terminal.diagnostics.fallback_reason == Reason::None,
