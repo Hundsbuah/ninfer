@@ -206,6 +206,16 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
                 }
 
                 lifecycle->done(outcome);
+                // The stream starts when Engine admits the request, so a cancelled outcome
+                // without a start is a request cancelled while queued. A streaming request is
+                // cancelled only through its transport: the client is gone and there is no
+                // stream to finish, which is a disconnect rather than an internal error.
+                if (!encoder->started() &&
+                    outcome.finish_reason == ninfer::FinishReason::Cancelled) {
+                    lifecycle->response_failure(
+                        make_client_disconnected_failure(RequestFailurePhase::Transport));
+                    return false;
+                }
                 std::vector<std::string> terminal;
                 try {
                     terminal = encoder->finish(outcome);
