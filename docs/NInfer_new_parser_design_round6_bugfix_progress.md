@@ -67,11 +67,17 @@ Baseline targeted run (before any Round-6 change), `build-new-parser`, Release, 
 build:        cmake --build build-new-parser --config Release --parallel 16 — no errors
 gate:         cmake -E chdir build-new-parser ctest -C Release -E "_real" --parallel 16
               (CUDA_VISIBLE_DEVICES=99; no GPU execution per user constraint)
-outcome:      147 total: 143 passed, 4 failed
-failures:     ninfer_linear_swiglu_{q4_a16,q8_a16,nvfp4,fp8}_test — all fail with
-              "SKIP: no usable CUDA device" (environmental: local AI occupies the GPU;
-              identical to the Round-5 record). No CPU-test failures.
-skips:        GPU-dependent tests report runtime SKIP (counted as passed via SKIP_RETURN_CODE).
+outcome:      147 total: 143 passed, 4 failed — the gate was NOT globally green.
+failures:     ninfer_linear_swiglu_{q4_a16,q8_a16,nvfp4,fp8}_test — all print
+              "SKIP: no usable CUDA device", but their main() functions translated
+              the helper's exit code 77 to exit code 1, so CTest recorded them as
+              failures despite the intended SKIP_RETURN_CODE 77 configuration
+              (environmental: local AI occupies the GPU; identical to the Round-5
+              record). No CPU-test failures. R7-04 corrected the wrappers and this
+              wording.
+skips:        GPU-dependent tests that exit 77 directly from main() are counted as
+              skipped via SKIP_RETURN_CODE; the four LinearSwiGLU tests above did
+              not reach that path in Round 6.
 targets:      ninfer_tool_call_parser_test, ninfer_tool_call_grammar_test,
               ninfer_tool_call_grammar_state_test, ninfer_qwen3_5_frontend_test,
               ninfer_serve_options_test, ninfer_request_log_test,
@@ -79,4 +85,6 @@ targets:      ninfer_tool_call_parser_test, ninfer_tool_call_grammar_test,
 ```
 
 Round 6 is complete: R6-01–R6-05 implemented, R6-06 designed, R6-07 documented as
-fail-fast non-goal; full CPU gate green (GPU failures environmental).
+fail-fast non-goal. The full CTest -E "_real" gate was not globally green (143 passed,
+4 failed — the four GPU-dependent LinearSwiGLU wrappers, environmental); all
+parser/frontend/serve/template CPU targets relevant to this change passed.

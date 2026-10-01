@@ -83,12 +83,18 @@ int main() {
         constexpr std::array<std::int32_t, 17> kA4Cases{2,   4,   5,   16,  56,  64,  65,  96,  97,
                                                         112, 128, 129, 255, 256, 257, 512, 1024};
         int failures = check_negative_gate();
-        failures += run_profile("LinearSwiGLU NVFP4_A16",
-                                {QType::NVFP4, 34816, 5120, 17408, 1801U, ActivationCompute::A16},
-                                kA16Cases);
-        failures += run_profile("LinearSwiGLU NVFP4_A4",
-                                {QType::NVFP4, 34816, 5120, 17408, 1803U, ActivationCompute::A4},
-                                kA4Cases, std::array<std::int32_t, 4>{65, 97, 128, 129});
+        const int a16 =
+            run_profile("LinearSwiGLU NVFP4_A16",
+                        {QType::NVFP4, 34816, 5120, 17408, 1801U, ActivationCompute::A16},
+                        kA16Cases);
+        if (a16 == 77) { return 77; } // R7-04: preserve the CTest SKIP_RETURN_CODE
+        failures += a16;
+        const int a4 =
+            run_profile("LinearSwiGLU NVFP4_A4",
+                        {QType::NVFP4, 34816, 5120, 17408, 1803U, ActivationCompute::A4},
+                        kA4Cases, std::array<std::int32_t, 4>{65, 97, 128, 129});
+        if (a4 == 77) { return 77; }
+        failures += a4;
         std::cout << (failures == 0 ? "OK" : "FAIL") << " LinearSwiGLU NVFP4 correctness\n";
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {

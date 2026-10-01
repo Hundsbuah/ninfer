@@ -30,11 +30,14 @@ int main() {
             1,   2,   6,   32,  33,  40,  41,  48,  49,  65,  81,  97,  129,
             193, 241, 256, 257, 265, 289, 321, 385, 449, 513, 560, 561,
         };
-        int failures = run_profile(
-            "LinearSwiGLU Q8_A16",
-            {QType::Q8_G32_FP16, 12288, 2048, 6144, 1601U, ActivationCompute::A16}, kTokenCases);
-
-        failures += dflash2_conformance();
+        const int result =
+            run_profile("LinearSwiGLU Q8_A16",
+                        {QType::Q8_G32_FP16, 12288, 2048, 6144, 1601U, ActivationCompute::A16}, kTokenCases);
+        if (result == 77) { return 77; } // R7-04: preserve the CTest SKIP_RETURN_CODE
+        int failures = result;
+        const int conformance = dflash2_conformance();
+        if (conformance == 77) { return 77; }
+        failures += conformance;
         std::cout << (failures == 0 ? "OK" : "FAIL") << " LinearSwiGLU Q8_A16 correctness\n";
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {
