@@ -88,6 +88,10 @@ struct ToolCallParsePolicy {
     // production path; this internal default keeps the parser entry API at the historical
     // compatibility behavior for existing callers.
     ToolCallSyntaxMode syntax = ToolCallSyntaxMode::Compatibility;
+    // R5-06: the ambiguous-byte protocol policy (ToolCallAmbiguityPolicy). The product
+    // boundary (OutputOptions) defaults to FailClosed; this internal default keeps the
+    // historical payload-fidelity behavior for existing callers.
+    ToolCallAmbiguityPolicy ambiguity = ToolCallAmbiguityPolicy::PayloadFidelity;
 };
 // Objective parse outcome of one tool region (P3.1): what was safely recognized, where the
 // input ended, which state was complete and which was incomplete. It carries no policy

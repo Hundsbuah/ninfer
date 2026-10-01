@@ -1233,10 +1233,10 @@ int test_tolerant_never_commits_open_function() {
         "<tool_call>\n<invoke=bash>\n<parameter=command>\nls\n</parameter>";
     const std::string cut_bare   = "<function=bash>\n<parameter=command>\nls\n</parameter>";
     for (const std::string& region : {cut_tool_call, cut_invoke, cut_bare}) {
-        for (const FinishReason reason : {FinishReason::StopToken, FinishReason::StopString,
-                                          FinishReason::OutputLimit,
-                                          FinishReason::ContextCapacity,
-                                          FinishReason::Cancelled}) {
+        for (const FinishReason reason : {ninfer::FinishReason::StopToken, ninfer::FinishReason::StopString,
+                                          ninfer::FinishReason::OutputLimit,
+                                          ninfer::FinishReason::ContextCapacity,
+                                          ninfer::FinishReason::Cancelled}) {
             const auto tolerant =
                 fi::parse_qwen_tool_call_output(region, 64, *contract, true, reason);
             failures += check(!tolerant.is_tool_call_response && tolerant.tool_calls.empty(),
@@ -1317,10 +1317,10 @@ int test_eof_parameter_closer_never_executes_open_function() {
         {"edit.new_string", "<tool_call>\n<function=edit>\n<parameter=new_string>\necho 'literal </parameter>"},
     }};
     for (const auto& [label, text] : fixtures) {
-        for (const FinishReason reason : {FinishReason::StopToken, FinishReason::StopString,
-                                          FinishReason::OutputLimit,
-                                          FinishReason::ContextCapacity,
-                                          FinishReason::Cancelled}) {
+        for (const FinishReason reason : {ninfer::FinishReason::StopToken, ninfer::FinishReason::StopString,
+                                          ninfer::FinishReason::OutputLimit,
+                                          ninfer::FinishReason::ContextCapacity,
+                                          ninfer::FinishReason::Cancelled}) {
             const auto strict =
                 fi::parse_qwen_tool_call_output(text, 64, kLegacyContract, false, reason);
             failures += check(
@@ -1411,10 +1411,10 @@ int test_all_delimiter_byte_cuts_preserve_previous_boundary() {
                 "strict did not commit the complete canonical call");
         }
         // Tolerant, every finish reason.
-        for (const FinishReason reason : {FinishReason::StopToken, FinishReason::StopString,
-                                          FinishReason::OutputLimit,
-                                          FinishReason::ContextCapacity,
-                                          FinishReason::Cancelled}) {
+        for (const FinishReason reason : {ninfer::FinishReason::StopToken, ninfer::FinishReason::StopString,
+                                          ninfer::FinishReason::OutputLimit,
+                                          ninfer::FinishReason::ContextCapacity,
+                                          ninfer::FinishReason::Cancelled}) {
             const auto tolerant =
                 fi::parse_qwen_tool_call_output(cut_text, 64, *contract, true, reason);
             if (cut < fn_close_end) {
@@ -1461,9 +1461,9 @@ int test_all_delimiter_byte_cuts_preserve_previous_boundary() {
             for (std::size_t offset = 0; offset < cut_text.size(); offset += chunk) {
                 streamed += decoder.feed(std::string_view(cut_text).substr(offset, chunk));
             }
-            auto terminal = decoder.finish(FinishReason::StopToken);
+            auto terminal = decoder.finish(ninfer::FinishReason::StopToken);
             const auto one_shot = fi::parse_qwen_tool_call_output(
-                cut_text, 64, *contract, true, FinishReason::StopToken);
+                cut_text, 64, *contract, true, ninfer::FinishReason::StopToken);
             failures += check(
                 terminal.tool_calls.size() == one_shot.tool_calls.size() &&
                     terminal.content == one_shot.content &&
@@ -1494,7 +1494,7 @@ int test_all_delimiter_byte_cuts_other_families() {
     for (std::size_t cut = 0; cut <= text.size(); ++cut) {
         const std::string cut_text(text.substr(0, cut));
         const auto tolerant = fi::parse_qwen_tool_call_output(
-            cut_text, 64, *contract, true, FinishReason::OutputLimit);
+            cut_text, 64, *contract, true, ninfer::FinishReason::OutputLimit);
         if (cut < fn_close_end) {
             failures += check(!tolerant.is_tool_call_response && tolerant.tool_calls.empty(),
                               "tolerant executed an invoke before its complete close");
@@ -1658,9 +1658,9 @@ int check_round2_region(const std::string& text, const fi::ToolCallOutputContrac
                         std::string_view message) {
     using FinishReason = ninfer::FinishReason;
     int failures = 0;
-    for (const FinishReason reason : {FinishReason::StopToken, FinishReason::StopString,
-                                      FinishReason::OutputLimit, FinishReason::ContextCapacity,
-                                      FinishReason::Cancelled}) {
+    for (const FinishReason reason : {ninfer::FinishReason::StopToken, ninfer::FinishReason::StopString,
+                                      ninfer::FinishReason::OutputLimit, ninfer::FinishReason::ContextCapacity,
+                                      ninfer::FinishReason::Cancelled}) {
         const auto parsed =
             fi::parse_qwen_tool_call_output(text, 64, contract, tolerant, reason);
         failures += check(parsed.is_tool_call_response == !expected_names.empty(),
@@ -1717,10 +1717,10 @@ int check_round2_region(const std::string& text, const fi::ToolCallOutputContrac
                          std::string_view message) {
      using FinishReason = ninfer::FinishReason;
      int failures = 0;
-     for (const FinishReason reason : {FinishReason::StopToken, FinishReason::StopString,
-                                       FinishReason::OutputLimit, FinishReason::ContextCapacity,
-                                       FinishReason::Cancelled}) {
-         const Round3Outcome& expected = reason == FinishReason::StopToken ? natural : cut;
+     for (const FinishReason reason : {ninfer::FinishReason::StopToken, ninfer::FinishReason::StopString,
+                                       ninfer::FinishReason::OutputLimit, ninfer::FinishReason::ContextCapacity,
+                                       ninfer::FinishReason::Cancelled}) {
+         const Round3Outcome& expected = reason == ninfer::FinishReason::StopToken ? natural : cut;
          const auto parsed =
              fi::parse_qwen_tool_call_output(text, 64, contract, tolerant, reason);
          failures += check(parsed.is_tool_call_response == !expected.names.empty(),
@@ -2739,10 +2739,10 @@ int test_recovery_policy_phase3() {
 
         // An open value is never committable, whatever the finish reason was.
         cut.open_value_open = true;
-        for (const FinishReason reason : {FinishReason::StopToken, FinishReason::StopString,
-                                          FinishReason::OutputLimit,
-                                          FinishReason::ContextCapacity,
-                                          FinishReason::Cancelled}) {
+        for (const FinishReason reason : {ninfer::FinishReason::StopToken, ninfer::FinishReason::StopString,
+                                          ninfer::FinishReason::OutputLimit,
+                                          ninfer::FinishReason::ContextCapacity,
+                                          ninfer::FinishReason::Cancelled}) {
             const ToolCallRecoveryPolicy budget{.tolerant = true, .finish_reason = reason};
             failures += check(fi::decide_tool_call_recovery(cut, budget).decision ==
                                   ToolCallRecoveryDecision::Reject,
@@ -2821,10 +2821,10 @@ int test_recovery_policy_phase3() {
         terminal = decoder.finish(reason);
         return visible;
     };
-    for (const FinishReason reason : {FinishReason::StopToken, FinishReason::StopString,
-                                      FinishReason::OutputLimit,
-                                      FinishReason::ContextCapacity,
-                                      FinishReason::Cancelled}) {
+    for (const FinishReason reason : {ninfer::FinishReason::StopToken, ninfer::FinishReason::StopString,
+                                      ninfer::FinishReason::OutputLimit,
+                                      ninfer::FinishReason::ContextCapacity,
+                                      ninfer::FinishReason::Cancelled}) {
         const auto one_shot = fi::parse_qwen_tool_call_output(missing_wrapper, 64, *contract,
                                                               true, reason);
         failures += check(one_shot.is_tool_call_response && one_shot.tool_calls.size() == 1 &&
@@ -2859,7 +2859,7 @@ int test_recovery_policy_phase3() {
                           "streaming committed a cut string value");
 
         const auto tail = fi::parse_qwen_tool_call_output(trailing, 64, *contract, true, reason);
-        if (reason == FinishReason::StopToken) {
+        if (reason == ninfer::FinishReason::StopToken) {
             failures += check(tail.is_tool_call_response && tail.tool_calls.size() == 1 &&
                                   tail.diagnostics.fallback_reason == Reason::TruncatedTail,
                               "complete calls before trailing prose were not recovered at a natural stop");
@@ -2898,7 +2898,7 @@ int test_recovery_policy_phase3() {
                               strict.diagnostics.fallback_reason == Reason::MalformedStructure,
                           "a quoted closer committed a string value early (strict)");
         auto terminal = fi::ToolCallOutputDecoder::Terminal{};
-        stream(fixture, true, FinishReason::StopToken, terminal, write_contract);
+        stream(fixture, true, ninfer::FinishReason::StopToken, terminal, write_contract);
         failures += check(terminal.tool_calls.empty() && terminal.content == fixture &&
                               terminal.diagnostics.fallback_reason == Reason::TruncatedTail,
                           "streaming committed a string value at a quoted closer");
@@ -3077,7 +3077,7 @@ int test_round3_spec_corpus() {
     auto stream_equals_one_shot = [&](const char* label, const std::string& text,
                                      bool tolerant, bool every_split) {
         const auto one = fi::parse_qwen_tool_call_output(text, 64, c, tolerant,
-                                                         FinishReason::StopToken);
+                                                         ninfer::FinishReason::StopToken);
         auto compare = [&](const std::vector<std::size_t>& points) -> bool {
             fi::ToolCallOutputDecoder dec(contract, 64, tolerant);
             std::string_view sv = text;
@@ -3088,7 +3088,7 @@ int test_round3_spec_corpus() {
                 from = pt;
             }
             if (from < text.size()) { visible += dec.feed(sv.substr(from)); }
-            const auto term = dec.finish(FinishReason::StopToken);
+            const auto term = dec.finish(ninfer::FinishReason::StopToken);
             std::string total = visible + term.content;
             if (one.is_tool_call_response) {
                 while (!total.empty() && fi::is_tool_format_whitespace(total.back())) {
@@ -3204,12 +3204,12 @@ int test_round3_spec_corpus() {
         const std::string p_a_args = "{\"command\":\"rm -rf x\"}";
         for (const bool tolerant : {false, true}) {
             const auto st = fi::parse_qwen_tool_call_output(p_a_text, 64, c, tolerant,
-                                                            FinishReason::StopToken);
+                                                            ninfer::FinishReason::StopToken);
             failures += one_call(tolerant ? "R3 P-A StopToken tolerant: the example call"
                                           : "R3 P-A StopToken: the example call",
                                  st, "bash", p_a_args);
             const auto ol = fi::parse_qwen_tool_call_output(p_a_text, 64, c, tolerant,
-                                                            FinishReason::OutputLimit);
+                                                            ninfer::FinishReason::OutputLimit);
             failures += as_text(tolerant ? "R3 P-A OutputLimit tolerant: text" : "R3 P-A OutputLimit: text",
                                 ol, p_a_text,
                                 tolerant ? Reason::TruncatedTail : Reason::MalformedStructure);
@@ -3220,7 +3220,7 @@ int test_round3_spec_corpus() {
         const std::string p_a3_text = "<function=write>\n<parameter=content>\nEx:\n" + E +
                                       "\nDone.\n</parameter>\n";
         for (const bool tolerant : {false, true}) {
-            for (const auto reason : {FinishReason::StopToken, FinishReason::OutputLimit}) {
+            for (const auto reason : {ninfer::FinishReason::StopToken, ninfer::FinishReason::OutputLimit}) {
                 const auto parsed = fi::parse_qwen_tool_call_output(p_a3_text, 64, c, tolerant, reason);
                 failures += as_text("R3 P-A3: the closed value keeps the example inert",
                                     parsed, p_a3_text,
@@ -3331,7 +3331,7 @@ int test_round3_spec_corpus() {
         const auto strict = fi::parse_qwen_tool_call_output(s8_cut, 64, c);
         failures += as_text("R3 S8-cut strict: text", strict, s8_cut, Reason::TrailingContent);
         const auto tol_stop = fi::parse_qwen_tool_call_output(s8_cut, 64, c, true,
-                                                              FinishReason::StopToken);
+                                                              ninfer::FinishReason::StopToken);
         failures += check(tol_stop.is_tool_call_response && tol_stop.tool_calls.size() == 1 &&
                               tol_stop.tool_calls.front().name == "bash" &&
                               tol_stop.tool_calls.front().arguments_json ==
@@ -3339,7 +3339,7 @@ int test_round3_spec_corpus() {
                               tol_stop.diagnostics.fallback_reason == Reason::TruncatedTail,
                           "R3 S8-cut tolerant StopToken: the truncated command commits (residual)");
         const auto tol_limit = fi::parse_qwen_tool_call_output(s8_cut, 64, c, true,
-                                                               FinishReason::OutputLimit);
+                                                               ninfer::FinishReason::OutputLimit);
         failures += as_text("R3 S8-cut tolerant OutputLimit: no commit", tol_limit, s8_cut,
                             Reason::TrailingContent);
         failures += stream_equals_one_shot("R3 S8-cut streaming", s8_cut, true, true);
@@ -3381,7 +3381,7 @@ int test_round3_spec_corpus() {
         failures += as_text("R3 R1-inline strict: the inline closer note keeps the region text", strict,
                             r1, Reason::TrailingContent);
         const auto tol_stop = fi::parse_qwen_tool_call_output(r1, 64, c, true,
-                                                              FinishReason::StopToken);
+                                                              ninfer::FinishReason::StopToken);
         failures += as_text("R3 R1-inline tolerant StopToken: the value closer in the tail blocks the commit",
                             tol_stop, r1, Reason::TrailingContent);
         failures += stream_equals_one_shot("R3 R1 streaming", r1, true, true);
@@ -3424,7 +3424,7 @@ int test_round3_spec_corpus() {
             std::string("{\"path\":\"d.md\",\"content\":\"") +
             json_escape("Ex:\n" + E + "\nDone.") + "\"}";
         for (const bool tolerant : {false, true}) {
-            for (const auto reason : {FinishReason::StopToken, FinishReason::OutputLimit}) {
+            for (const auto reason : {ninfer::FinishReason::StopToken, ninfer::FinishReason::OutputLimit}) {
                 const auto parsed = fi::parse_qwen_tool_call_output(p_a2, 64, c, tolerant, reason);
                 failures += one_call("R3 P-A2: the closed value with the example commits",
                                      parsed, "write", p_a2_args);
@@ -3462,12 +3462,12 @@ int test_round3_spec_corpus() {
         failures += as_text("R3 tail value-closer strict: text", strict, tailc,
                             Reason::TrailingContent);
         const auto tol_stop = fi::parse_qwen_tool_call_output(tailc, 64, c, true,
-                                                              FinishReason::StopToken);
+                                                              ninfer::FinishReason::StopToken);
         failures += as_text(
             "R3 tail value-closer tolerant StopToken: no commit despite the natural stop",
             tol_stop, tailc, Reason::TrailingContent);
         const auto tol_limit = fi::parse_qwen_tool_call_output(tailc, 64, c, true,
-                                                               FinishReason::OutputLimit);
+                                                               ninfer::FinishReason::OutputLimit);
         failures += as_text("R3 tail value-closer tolerant OutputLimit: no commit", tol_limit,
                             tailc, Reason::TrailingContent);
         failures += stream_equals_one_shot("R3 tail value-closer streaming", tailc, true, true);
@@ -3478,7 +3478,7 @@ int test_round3_spec_corpus() {
         const std::string bare_before = std::string("<function=read>\n<parameter=path>\ncut\n") +
                                         tool_call("bash", {{"command", "echo ok"}});
         const auto parsed = fi::parse_qwen_tool_call_output(bare_before, 64, c, true,
-                                                            FinishReason::OutputLimit);
+                                                            ninfer::FinishReason::OutputLimit);
         failures += as_text("R3 F7 cut: bare_before with a cut reason is rejected", parsed,
                             bare_before, Reason::TruncatedTail);
     }
@@ -3613,7 +3613,7 @@ int test_round3_streaming_equivalence_fuzz() {
         }
         if (!match) {
             std::cout << "FAIL fuzz " << t << " " << partition << " tolerant=" << (int)tolerant
-                      << " reason=" << (reason == FinishReason::StopToken ? "stop" : "limit")
+                      << " reason=" << (reason == ninfer::FinishReason::StopToken ? "stop" : "limit")
                       << (first.empty() ? "" : " (mismatch at " + first + ")") << std::endl;
         }
         return match ? 0 : 1;
@@ -3624,7 +3624,7 @@ int test_round3_streaming_equivalence_fuzz() {
         for (int i = 0; i < count; ++i) { text += frags[rng() % frags.size()]; }
         if (rng() % 3 == 0) { text += tail; }
         for (const bool tolerant : {false, true}) {
-            for (const FinishReason reason : {FinishReason::StopToken, FinishReason::OutputLimit}) {
+            for (const FinishReason reason : {ninfer::FinishReason::StopToken, ninfer::FinishReason::OutputLimit}) {
                 const auto one = fi::parse_qwen_tool_call_output(text, 64, c, tolerant, reason);
                 // whole text
                 {
@@ -3678,7 +3678,7 @@ int test_round3_work_bounds() {
         for (int i = 0; i < 4000; ++i) { text += "<function=write>\n<parameter=content>\n"; }
         fi::ToolCallStreamParser machine(policy);
         machine.feed(std::string_view(text));
-        const auto term = machine.finish(FinishReason::StopToken);
+        const auto term = machine.finish(ninfer::FinishReason::StopToken);
         failures += check(term.status == fi::ToolCallStreamStatus::Invalid && term.stage2_steps == 0,
                           "R3-14: 4000 bare open regions reject with Stage 2 uncharged");
     }
@@ -3687,7 +3687,7 @@ int test_round3_work_bounds() {
         header.append(40 * 1024, 'x');
         fi::ToolCallStreamParser machine(policy);
         machine.feed(std::string_view(header));
-        const auto term = machine.finish(FinishReason::OutputLimit);
+        const auto term = machine.finish(ninfer::FinishReason::OutputLimit);
         failures += check(term.rescan_steps < 512,
                           "R3-14: a 40 KB unterminated quoted header bounds the rescan");
     }
@@ -3698,7 +3698,7 @@ int test_round3_work_bounds() {
         }
         fi::ToolCallStreamParser machine(policy);
         machine.feed(std::string_view(text));
-        const auto term = machine.finish(FinishReason::OutputLimit);
+        const auto term = machine.finish(ninfer::FinishReason::OutputLimit);
         failures += check(term.stage2_steps <= std::max<std::uint64_t>(100000, 4 * text.size()) &&
                               !term.parse_budget_exhausted,
                           "R4 N-01/N-07: 2000 closer triples bound the Stage-2 work units");
@@ -3716,7 +3716,7 @@ int test_round3_work_bounds() {
         small.stage2_step_budget = 8;
         fi::ToolCallStreamParser machine(small);
         machine.feed(std::string_view(s1));
-        const auto term = machine.finish(FinishReason::StopToken);
+        const auto term = machine.finish(ninfer::FinishReason::StopToken);
         failures += check(term.status == fi::ToolCallStreamStatus::Invalid &&
                               term.region.calls.empty() && term.parse_budget_exhausted,
                           "R4 N-07: an exhausted Stage-2 budget fails closed");
@@ -3741,7 +3741,7 @@ int test_round4_stage2_many_values() {
     text += "<parameter=p69>\n# Example\n" + tool_call("read", {{"path", "foo.cpp"}}) + "\nDone.\n</parameter>\n";
     text += "</function>\n</tool_call>";
     const auto parsed = fi::parse_qwen_tool_call_output(text, 64, contract, false,
-                                                        FinishReason::StopToken);
+                                                        ninfer::FinishReason::StopToken);
     int ok = parsed.is_tool_call_response && parsed.tool_calls.size() == 1 &&
              parsed.tool_calls[0].name == "multi" &&
              parsed.diagnostics.fallback_reason == ninfer::ToolCallParseFallbackReason::None;
@@ -3777,7 +3777,7 @@ int test_round4_work_bounds() {
         const std::uint64_t limit = limit_of(text);
         fi::ToolCallStreamParser machine(policy);
         machine.feed(std::string_view(text));
-        const auto term = machine.finish(FinishReason::StopToken);
+        const auto term = machine.finish(ninfer::FinishReason::StopToken);
         failures += check(term.status == fi::ToolCallStreamStatus::Invalid &&
                               term.stage2_steps <= limit + 1,
                           "N-01: repetition with trailing prose is Invalid within the work bound");
@@ -3791,7 +3791,7 @@ int test_round4_work_bounds() {
         const std::uint64_t limit = limit_of(text);
         fi::ToolCallStreamParser machine(policy);
         machine.feed(std::string_view(text));
-        const auto term = machine.finish(FinishReason::StopToken);
+        const auto term = machine.finish(ninfer::FinishReason::StopToken);
         failures += check(term.status == fi::ToolCallStreamStatus::Complete &&
                               !term.parse_budget_exhausted && term.stage2_steps <= limit + 1,
                           "N-01: closer triples complete within the work bound without exhaustion");
@@ -3808,7 +3808,7 @@ int test_round4_work_bounds() {
         small.stage2_step_budget = 8;
         fi::ToolCallStreamParser machine(small);
         machine.feed(std::string_view(s1));
-        const auto term = machine.finish(FinishReason::StopToken);
+        const auto term = machine.finish(ninfer::FinishReason::StopToken);
         failures += check(term.status == fi::ToolCallStreamStatus::Invalid &&
                               term.region.calls.empty() && term.parse_budget_exhausted,
                           "N-07: a tiny Stage-2 budget fails closed with parse_budget_exhausted");
@@ -3876,14 +3876,14 @@ int test_round4_param_family_stage2() {
     const auto shared = contract_from_definitions(definitions);
     for (const bool tolerant : {false, true}) {
         const auto parsed = fi::parse_qwen_tool_call_output(text, 64, *shared, tolerant,
-                                                            FinishReason::StopToken);
+                                                            ninfer::FinishReason::StopToken);
         failures += check(parsed.is_tool_call_response && parsed.tool_calls.size() == 1 &&
                               parsed.tool_calls[0].name == "write" &&
                               parsed.diagnostics.markup_tolerant_completion &&
-                              parsed.diagnostics.fallback_reason == ToolCallParseFallbackReason::None,
+                              parsed.diagnostics.fallback_reason == ninfer::ToolCallParseFallbackReason::None,
                           "N-02: a <param>-family write completes via Stage 2");
     }
-    failures += stream_matches_one_shot(text, shared, false, FinishReason::StopToken, "N-02 streaming");
+    failures += stream_matches_one_shot(text, shared, false, ninfer::FinishReason::StopToken, "N-02 streaming");
     return failures;
 }
 
@@ -3905,17 +3905,17 @@ int test_round4_same_family_balance() {
     const std::string text    = "Example:\n" + ex + "\nNow writing.\n" +
                                 tool_call("write", {{"path", "d.md"}, {"content", content}});
     const auto parsed = fi::parse_qwen_tool_call_output(text, 64, *shared, false,
-                                                        FinishReason::StopToken);
+                                                        ninfer::FinishReason::StopToken);
     int failures = check(parsed.is_tool_call_response && parsed.tool_calls.size() == 1 &&
                              parsed.tool_calls[0].name == "write" &&
-                             parsed.diagnostics.fallback_reason == ToolCallParseFallbackReason::None,
+                             parsed.diagnostics.fallback_reason == ninfer::ToolCallParseFallbackReason::None,
                          "N-05: a cross-family <param> opener stays content (write completes)");
     if (parsed.is_tool_call_response && parsed.tool_calls.size() == 1) {
         const Json args = Json::parse(parsed.tool_calls[0].arguments_json);
         failures += check(args["content"].get<std::string>() == content,
                           "N-05: the write content is byte-exact (cross-family opener is content)");
     }
-    failures += stream_matches_one_shot(text, shared, false, FinishReason::StopToken, "N-05 streaming");
+    failures += stream_matches_one_shot(text, shared, false, ninfer::FinishReason::StopToken, "N-05 streaming");
     return failures;
 }
 
@@ -3937,54 +3937,54 @@ int test_round4_fence_diagnostics_scope() {
     // N6d: a closed fence before a call -> accepted, both fence fields 0/false.
     {
         const std::string text = "Run this:\n```bash\nls\n```\n" + tool_call("bash", {{"command", "ls"}});
-        const auto o = fi::parse_qwen_tool_call_output(text, 64, *shared, false, FinishReason::StopToken);
+        const auto o = fi::parse_qwen_tool_call_output(text, 64, *shared, false, ninfer::FinishReason::StopToken);
         failures += check(o.is_tool_call_response && o.tool_calls.size() == 1 &&
                               o.tool_calls[0].name == "bash" &&
                               o.diagnostics.fenced_markers_suppressed == 0 &&
                               !o.diagnostics.ended_in_unclosed_fence,
                           "N6d: a closed fence before a call is accepted, fence 0/false");
-        failures += stream_matches_one_shot(text, shared, false, FinishReason::StopToken, "N6d streaming");
+        failures += stream_matches_one_shot(text, shared, false, ninfer::FinishReason::StopToken, "N6d streaming");
     }
     // N6a: a write content with a python fence -> accepted, fence 0/false.
     {
         const std::string text = tool_call("write", {{"path", "a.md"}, {"content", "```python\nprint(1)"}});
-        const auto o = fi::parse_qwen_tool_call_output(text, 64, *shared, false, FinishReason::StopToken);
+        const auto o = fi::parse_qwen_tool_call_output(text, 64, *shared, false, ninfer::FinishReason::StopToken);
         failures += check(o.is_tool_call_response && o.tool_calls.size() == 1 &&
                               o.tool_calls[0].name == "write" &&
                               o.diagnostics.fenced_markers_suppressed == 0 &&
                               !o.diagnostics.ended_in_unclosed_fence,
                           "N6a: an accepted write with a python fence, fence 0/false");
-        failures += stream_matches_one_shot(text, shared, false, FinishReason::StopToken, "N6a streaming");
+        failures += stream_matches_one_shot(text, shared, false, ninfer::FinishReason::StopToken, "N6a streaming");
     }
     // N6b: a write content with a fenced read example -> accepted, fence 0/false.
     {
         const std::string content = "Ex:\n```xml\n" + tool_call("read", {{"path", "foo.cpp"}}) + "\n```\nmore";
         const std::string text = tool_call("write", {{"path", "a.md"}, {"content", content}});
-        const auto o = fi::parse_qwen_tool_call_output(text, 64, *shared, false, FinishReason::StopToken);
+        const auto o = fi::parse_qwen_tool_call_output(text, 64, *shared, false, ninfer::FinishReason::StopToken);
         failures += check(o.is_tool_call_response && o.tool_calls.size() == 1 &&
                               o.tool_calls[0].name == "write" &&
                               o.diagnostics.fenced_markers_suppressed == 0 &&
                               !o.diagnostics.ended_in_unclosed_fence,
                           "N6b: an accepted write with a fenced example, fence 0/false");
-        failures += stream_matches_one_shot(text, shared, false, FinishReason::StopToken, "N6b streaming");
+        failures += stream_matches_one_shot(text, shared, false, ninfer::FinishReason::StopToken, "N6b streaming");
     }
     // N6c: rejected, strict, OutputLimit -> text, malformed_structure, fence 2/true.
     {
         const std::string text = "<function=read>\n<parameter=path>\nx\n```xml\n" +
                                  tool_call("bash", {{"command", "ls"}}) + "\n";
-        const auto o = fi::parse_qwen_tool_call_output(text, 64, *shared, false, FinishReason::OutputLimit);
+        const auto o = fi::parse_qwen_tool_call_output(text, 64, *shared, false, ninfer::FinishReason::OutputLimit);
         failures += check(!o.is_tool_call_response && o.tool_calls.empty() &&
-                              o.diagnostics.fallback_reason == ToolCallParseFallbackReason::MalformedStructure &&
+                              o.diagnostics.fallback_reason == ninfer::ToolCallParseFallbackReason::MalformedStructure &&
                               o.diagnostics.fenced_markers_suppressed == 2 &&
                               o.diagnostics.ended_in_unclosed_fence,
                           "N6c: a rejected region with an unclosed fence, fence 2/true");
-        failures += stream_matches_one_shot(text, shared, false, FinishReason::OutputLimit, "N6c streaming");
+        failures += stream_matches_one_shot(text, shared, false, ninfer::FinishReason::OutputLimit, "N6c streaming");
     }
     // Round-3 S3 (no latch): unchanged (fence 2/true).
     {
         const std::string text = "Here is code:\n```python\nprint(1)\n\n" +
                                  tool_call("write", {{"path", "d.md"}, {"content", "Doc"}});
-        const auto o = fi::parse_qwen_tool_call_output(text, 64, *shared, false, FinishReason::StopToken);
+        const auto o = fi::parse_qwen_tool_call_output(text, 64, *shared, false, ninfer::FinishReason::StopToken);
         failures += check(!o.is_tool_call_response && o.tool_calls.empty() &&
                               o.diagnostics.ended_in_unclosed_fence &&
                               o.diagnostics.fenced_markers_suppressed == 2,
@@ -3993,7 +3993,7 @@ int test_round4_fence_diagnostics_scope() {
     // N-08 reproducer: reports ended_in_unclosed_fence == false.
     {
         const std::string text = std::string("```\nx\n```  \r\n") + tool_call("bash", {{"command", "ls"}});
-        const auto o = fi::parse_qwen_tool_call_output(text, 64, *shared, false, FinishReason::StopToken);
+        const auto o = fi::parse_qwen_tool_call_output(text, 64, *shared, false, ninfer::FinishReason::StopToken);
         failures += check(o.is_tool_call_response && !o.diagnostics.ended_in_unclosed_fence,
                           "N-08: the N-08 reproducer reports ended_in_unclosed_fence == false");
     }
@@ -4017,21 +4017,45 @@ int test_round4_r1_residual_pinned() {
         std::string("{\"command\":\"ls\\n</parameter>\\n</function>\\n</tool_call>\\nThen close with\"}");
     int failures = 0;
     const auto strict = fi::parse_qwen_tool_call_output(text, 64, *shared, false,
-                                                        FinishReason::StopToken);
+                                                        ninfer::FinishReason::StopToken);
     failures += check(strict.is_tool_call_response && strict.tool_calls.size() == 1 &&
                           strict.tool_calls[0].name == "bash" &&
                           strict.tool_calls[0].arguments_json == expected_args &&
                           strict.content == "Example:" && strict.diagnostics.markup_tolerant_completion,
-                      "R4 R1 residual: strict commits the phantom bash call (documented)");
+                      "R4 R1 residual: strict commits the phantom bash call under "
+                      "PayloadFidelity (documented)");
     const auto tol = fi::parse_qwen_tool_call_output(text, 64, *shared, true,
-                                                     FinishReason::StopToken);
+                                                     ninfer::FinishReason::StopToken);
     failures += check(tol.is_tool_call_response && tol.tool_calls.size() == 1 &&
                           tol.tool_calls[0].name == "bash" &&
                           tol.tool_calls[0].arguments_json == expected_args &&
                           tol.content == "Example:" && tol.diagnostics.markup_tolerant_completion,
-                      "R4 R1 residual: tolerant StopToken commits the phantom bash call (documented)");
-    failures += stream_matches_one_shot(text, shared, false, FinishReason::StopToken,
+                      "R4 R1 residual: tolerant StopToken commits the phantom bash call under "
+                      "PayloadFidelity (documented)");
+    failures += stream_matches_one_shot(text, shared, false, ninfer::FinishReason::StopToken,
                                         "R4 R1 residual streaming");
+    // R5-06: the FailClosed ambiguity policy refuses this documented ambiguity class: the
+    // same bytes are either a complete call at the early closer (the rest is trailing
+    // content) or a value extended to the later closer. Both are structurally plausible, so
+    // the region is returned as text with ambiguous_structure — strict and tolerant alike.
+    const auto fail_closed = fi::parse_qwen_tool_call_output(text, 64, *shared, false,
+                                                             ninfer::FinishReason::StopToken,
+                                                             ninfer::ToolCallSyntaxMode::Compatibility,
+                                                             ninfer::ToolCallAmbiguityPolicy::FailClosed);
+    failures += check(!fail_closed.is_tool_call_response && fail_closed.tool_calls.empty() &&
+                          fail_closed.content == text &&
+                          fail_closed.diagnostics.fallback_reason ==
+                              ninfer::ToolCallParseFallbackReason::AmbiguousStructure,
+                      "R5-06 FailClosed: the R1 phantom-acceptance class is refused as ambiguous");
+    const auto fail_closed_tol =
+        fi::parse_qwen_tool_call_output(text, 64, *shared, true, ninfer::FinishReason::StopToken,
+                                        ninfer::ToolCallSyntaxMode::Compatibility,
+                                        ninfer::ToolCallAmbiguityPolicy::FailClosed);
+    failures += check(!fail_closed_tol.is_tool_call_response &&
+                          fail_closed_tol.tool_calls.empty() &&
+                          fail_closed_tol.diagnostics.fallback_reason ==
+                              ninfer::ToolCallParseFallbackReason::AmbiguousStructure,
+                      "R5-06 FailClosed: tolerant mode does not recover the ambiguous region");
     return failures;
 }
 
@@ -4104,9 +4128,78 @@ int test_r5_syntax_mode_native_vs_compatibility() {
     return failures;
 }
 
+
+// R5-06: two write.content payloads and their policy verdicts.
+//
+// (1) A balanced nested example — the embedded example carries its own <parameter> opener,
+// so its closer is consumed by nesting depth and only the outer close is a viable boundary.
+// The region is unambiguous: both policies commit the outer write call with the content
+// preserved byte-exact. FailClosed must not over-refuse well-formed nested payloads.
+//
+// (2) An unbalanced early close chain followed by prose and the outer close chain — the R1
+// ambiguity class inside a write payload. Both boundaries are structurally viable (a
+// complete call at the early close, or the later close as payload). PayloadFidelity commits
+// the legacy last-close-wins value; FailClosed refuses the region as ambiguous_structure
+// and no call may execute.
+int test_r5_ambiguity_policy_write_payload() {
+    Json write_props = Json::object();
+    write_props["content"] = Json{{"type", "string"}};
+    const std::vector<std::string> definitions = {tool_definition("write", write_props)};
+    const auto shared = contract_from_definitions(definitions);
+    int failures = 0;
+
+    // (1) balanced nested example: unambiguous under both policies.
+    const std::string content = "Syntax example:\n" + tool_call("write", {{"content", "ls"}}) +
+                                "\nThen run the command.";
+    const std::string text = tool_call("write", {{"content", content}});
+    const auto fidelity = fi::parse_qwen_tool_call_output(text, 64, *shared, false,
+                                                          ninfer::FinishReason::StopToken);
+    failures += check(fidelity.is_tool_call_response && fidelity.tool_calls.size() == 1 &&
+                          fidelity.tool_calls[0].name == "write" &&
+                          fidelity.tool_calls[0].arguments_json ==
+                              Json{{"content", content}}.dump(),
+                      "R5-06 PayloadFidelity: the balanced embedded example stays inside the "
+                      "content byte-exact");
+    const auto balanced_closed = fi::parse_qwen_tool_call_output(
+        text, 64, *shared, false, ninfer::FinishReason::StopToken,
+        ninfer::ToolCallSyntaxMode::Compatibility,
+        ninfer::ToolCallAmbiguityPolicy::FailClosed);
+    failures += check(balanced_closed.is_tool_call_response &&
+                          balanced_closed.tool_calls.size() == 1 &&
+                          balanced_closed.tool_calls[0].name == "write" &&
+                          balanced_closed.tool_calls[0].arguments_json ==
+                              Json{{"content", content}}.dump(),
+                      "R5-06 FailClosed: a balanced nested example is not ambiguous and must "
+                      "not be refused");
+
+    // (2) the R1 ambiguity class inside a write payload: an early complete close chain,
+    // prose, then the outer close chain. Two structurally viable boundaries.
+    const std::string r1_content =
+        "X\n</parameter>\n</function>\n</tool_call>\nThen close with";
+    const std::string r1_text = tool_call("write", {{"content", r1_content}});
+    const auto r1_fidelity = fi::parse_qwen_tool_call_output(r1_text, 64, *shared, false,
+                                                             ninfer::FinishReason::StopToken);
+    failures += check(r1_fidelity.is_tool_call_response && r1_fidelity.tool_calls.size() == 1 &&
+                          r1_fidelity.tool_calls[0].name == "write" &&
+                          r1_fidelity.tool_calls[0].arguments_json ==
+                              Json{{"content", r1_content}}.dump(),
+                      "R5-06 PayloadFidelity: the ambiguous write payload commits the legacy "
+                      "last-close-wins value");
+    const auto r1_closed = fi::parse_qwen_tool_call_output(
+        r1_text, 64, *shared, false, ninfer::FinishReason::StopToken,
+        ninfer::ToolCallSyntaxMode::Compatibility,
+        ninfer::ToolCallAmbiguityPolicy::FailClosed);
+    failures += check(!r1_closed.is_tool_call_response && r1_closed.tool_calls.empty() &&
+                          r1_closed.diagnostics.fallback_reason ==
+                              ninfer::ToolCallParseFallbackReason::AmbiguousStructure,
+                      "R5-06 FailClosed: the ambiguous write payload is refused as text, no "
+                      "call executes");
+    return failures;
+}
 int main() {
     int failures = 0;
     failures += test_r5_syntax_mode_native_vs_compatibility();
+    failures += test_r5_ambiguity_policy_write_payload();
     failures += test_duplicate_parameter_keeps_last_value();
     failures += test_basic_legacy_parsing();
     failures += test_multiple_calls();

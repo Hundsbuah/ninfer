@@ -63,6 +63,12 @@ struct ServeOptions {
     // accepts. qwen-wrapped (default) latches only the wrapped <tool_call> entry; compat keeps
     // the legacy bare <function=...>/<invoke=...> and <function_calls> top-level entries.
     ToolCallSyntaxMode tool_call_syntax = ToolCallSyntaxMode::QwenWrappedNative;
+    // R5-06: --tool-call-ambiguity fail-closed|payload-fidelity: the ambiguous-byte protocol
+    // policy. fail-closed (default) refuses a Stage-2 completion that would reinterpret a
+    // closer chain that already formed a complete call (ambiguous_structure, region as text);
+    // payload-fidelity keeps the historical behavior (the payload interpretation wins, and the
+    // R1 phantom-acceptance class stays executable).
+    ToolCallAmbiguityPolicy tool_call_ambiguity = ToolCallAmbiguityPolicy::FailClosed;
     std::optional<std::uint32_t> default_thinking_budget;
     // End-of-thinking message fed to the model when it hits the thinking budget; empty
     // preserves the model's built-in control suffix.

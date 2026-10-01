@@ -230,6 +230,11 @@ std::string serve_usage_text(const char* argv0) {
            "                             latches only the wrapped <tool_call> entry) or compat\n"
            "                             (also accepts the legacy bare <function=...>/\n"
            "                             <invoke=...> and <function_calls> entries)\n"
+           "  --tool-call-ambiguity MODE ambiguous-byte protocol policy: fail-closed (default;\n"
+           "                             refuses a Stage-2 completion that would reinterpret a\n"
+           "                             closer chain that already formed a complete call) or\n"
+           "                             payload-fidelity (the payload interpretation wins; the\n"
+           "                             R1 phantom-acceptance class stays executable)\n"
            "\n"
            "NETWORKING & RESOURCES\n"
            "  --host H                   listen address (default 127.0.0.1)\n"
@@ -589,6 +594,16 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             } else {
                 throw std::invalid_argument(
                     "--tool-call-syntax must be qwen-wrapped or compat");
+            }
+        } else if (arg == "--tool-call-ambiguity") {
+            const std::string value = require_value("--tool-call-ambiguity");
+            if (value == "fail-closed") {
+                options.tool_call_ambiguity = ToolCallAmbiguityPolicy::FailClosed;
+            } else if (value == "payload-fidelity") {
+                options.tool_call_ambiguity = ToolCallAmbiguityPolicy::PayloadFidelity;
+            } else {
+                throw std::invalid_argument(
+                    "--tool-call-ambiguity must be fail-closed or payload-fidelity");
             }
         } else if (arg == "--cors") {
             options.enable_cors = true;

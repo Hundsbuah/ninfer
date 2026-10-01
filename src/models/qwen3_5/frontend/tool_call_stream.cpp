@@ -230,7 +230,7 @@ ToolCallParseProgress parse_region(std::string_view text, const ToolCallParsePol
 // final, so the selection is a linear chain of decisions driven by run_stage2_base.
 
 enum class CandidatePass : std::uint8_t { Balanced, Lazy };
-enum class Stage2Verdict : std::uint8_t { Complete, EndOfInput, Definitive, Exhausted };
+enum class Stage2Verdict : std::uint8_t { Complete, EndOfInput, Definitive, Exhausted, Ambiguous };
 
 struct Stage2Path {
     std::vector<std::pair<std::size_t, std::size_t>> values; // chosen [begin, end) per parameter
@@ -378,7 +378,9 @@ Stage2Verdict run_stage2_base(Stage2Context& cx, std::size_t base, Stage2Path& p
             }
         }
         // `s` is the machine state at the start of a parameter value.
-        bool stood = false;
+        bool stood          = false;
+        bool earlier_complete = false; // R5-06: a candidate whose close had already
+                                       // completed the call (phantom-acceptance class)
         for (const CandidatePass pass : {CandidatePass::Balanced, CandidatePass::Lazy}) {
             bool skipped_viable = false; // per value and per pass
             CandidateWalk walk(cx.text, s.value_begin, s.param_family, pass);
@@ -406,9 +408,19 @@ Stage2Verdict run_stage2_base(Stage2Context& cx, std::size_t base, Stage2Path& p
                 if (!r.stage2_at_value && r.termination == ToolCallRegionTermination::Definitive) {
                     cx.dead.insert(key); // the glue up to the next value or the end is contradicted
                     skipped_viable = true;
+                    // R5-06: the candidate's closer chain had already formed a complete call;
+                    // a later standing candidate would reinterpret those closes as payload.
+                    if (!r.calls.empty()) { earlier_complete = true; }
                     continue;
                 }
                 path.values.emplace_back(s.value_begin, c); // the candidate stands
+                if (earlier_complete &&
+                    cx.policy.ambiguity == ToolCallAmbiguityPolicy::FailClosed) {
+                    // R5-06: both interpretations are structurally plausible (a complete call
+                    // at the earlier close, or the later close as payload); refuse the
+                    // ambiguous completion and let the region fall to text.
+                    return Stage2Verdict::Ambiguous;
+                }
                 if (pass == CandidatePass::Lazy) { path.lazy_used = true; }
                 s     = std::move(trial);
                 out   = std::move(r);
@@ -1248,6 +1260,15 @@ ToolCallStreamResult ToolCallStreamParser::finish(FinishReason finish_reason) co
             ToolCallParseProgress out;
             const Stage2Verdict verdict = run_stage2_base(cx, attempt.base, path, out);
             if (verdict == Stage2Verdict::Exhausted) { stage2_exhausted = true; break; }
+            if (verdict == Stage2Verdict::Ambiguous) {
+                // R5-06 FailClosed: the ambiguity is a property of the region, not of this
+                // base; no later base or Stage-3 recovery may commit an alternative call.
+                result.status  = ToolCallStreamStatus::Invalid;
+                result.failure = ToolCallParseFailure::AmbiguousStructure;
+                result.tail    = region_;
+                add_region_fence_part();
+                return result;
+            }
             if (verdict != Stage2Verdict::Complete) { continue; }
             // Materialize the chosen values: one path entry per parameter, in order.
             std::size_t k = 0;

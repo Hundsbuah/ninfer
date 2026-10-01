@@ -751,6 +751,25 @@ int main() {
                       "R5-07: an unknown --tool-call-syntax value must be rejected");
     failures += check(tolerant_help.find("--tool-call-syntax") != std::string::npos,
                       "R5-07: the serve help must document --tool-call-syntax");
+    // R5-06: --tool-call-ambiguity fail-closed|payload-fidelity.
+    failures += check(parse({"ninfer-serve", "model.ninfer"}).tool_call_ambiguity ==
+                          ninfer::ToolCallAmbiguityPolicy::FailClosed,
+                      "R5-06: the serving ambiguity policy must default to fail-closed");
+    const auto payload_policy = parse(
+        {"ninfer-serve", "model.ninfer", "--tool-call-ambiguity", "payload-fidelity"});
+    failures += check(payload_policy.tool_call_ambiguity ==
+                          ninfer::ToolCallAmbiguityPolicy::PayloadFidelity,
+                      "R5-06: --tool-call-ambiguity payload-fidelity must reach serving options");
+    bool bad_policy_rejected = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--tool-call-ambiguity", "auto"});
+    } catch (const std::invalid_argument&) {
+        bad_policy_rejected = true;
+    }
+    failures += check(bad_policy_rejected,
+                      "R5-06: an unknown --tool-call-ambiguity value must be rejected");
+    failures += check(tolerant_help.find("--tool-call-ambiguity") != std::string::npos,
+                      "R5-06: the serve help must document --tool-call-ambiguity");
 
     const ServeOptions inherited = parse(
         {"ninfer-serve", "model.ninfer", "--max-context", "16384", "--use-original-prefix-caching"});

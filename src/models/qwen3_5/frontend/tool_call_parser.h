@@ -83,7 +83,9 @@ build_tool_call_output_contract(std::span<const std::string> tool_jsons, bool en
 parse_qwen_tool_call_output(const std::string& text, std::size_t max_tool_name_length,
                             const ToolCallOutputContract& contract, bool tolerant = false,
                             FinishReason finish_reason = FinishReason::None,
-                            ToolCallSyntaxMode syntax = ToolCallSyntaxMode::Compatibility);
+                            ToolCallSyntaxMode syntax = ToolCallSyntaxMode::Compatibility,
+                            ToolCallAmbiguityPolicy ambiguity =
+                                ToolCallAmbiguityPolicy::PayloadFidelity);
 
 // Incrementally publishes bytes that are provably outside a possible terminal Qwen tool-call
 // suffix. At terminal time, valid calls are retained structurally; malformed output is restored
@@ -99,7 +101,9 @@ public:
     // decoder from OutputOptions (the production Qwen3.8 default is the native mode).
     ToolCallOutputDecoder(std::shared_ptr<const ToolCallOutputContract> contract,
                           std::size_t max_tool_name_length, bool tolerant = false,
-                          ToolCallSyntaxMode syntax = ToolCallSyntaxMode::Compatibility);
+                          ToolCallSyntaxMode syntax = ToolCallSyntaxMode::Compatibility,
+                          ToolCallAmbiguityPolicy ambiguity =
+                              ToolCallAmbiguityPolicy::PayloadFidelity);
 
     [[nodiscard]] std::string feed(std::string_view text);
     [[nodiscard]] Terminal finish(FinishReason finish_reason = FinishReason::None);
@@ -112,7 +116,8 @@ private:
     ToolCallStreamParser machine_{ToolCallParsePolicy{}};
     std::size_t max_tool_name_length_ = 0;
     bool tolerant_                    = false;
-    ToolCallSyntaxMode syntax_        = ToolCallSyntaxMode::QwenWrappedNative;
+    ToolCallSyntaxMode syntax_           = ToolCallSyntaxMode::Compatibility;
+    ToolCallAmbiguityPolicy ambiguity_   = ToolCallAmbiguityPolicy::PayloadFidelity;
     bool finished_                    = false;
 };
 

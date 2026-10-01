@@ -416,6 +416,15 @@ enum class ToolCallSyntaxMode : std::uint8_t {
     Compatibility,
 };
 
+// R5-06: the policy for the ambiguous byte protocol: the same bytes can be a structural
+// closer or literal tool markup inside a string parameter value, and a byte parser cannot
+// prove which.
+enum class ToolCallAmbiguityPolicy : std::uint8_t {
+    PayloadFidelity, // current round-4 behavior: the payload interpretation wins
+    FailClosed,      // refuse the ambiguous completion (ambiguous_structure, region as text)
+};
+
+
 struct OutputOptions {
     bool raw                     = false;
     bool preserve_special_tokens = false;
@@ -428,6 +437,13 @@ struct OutputOptions {
     // R5-07: the top-level tool-call syntax policy. QwenWrappedNative is the production
     // Qwen3.8 default; Compatibility widens the entry set to the legacy forms.
     ToolCallSyntaxMode tool_call_syntax = ToolCallSyntaxMode::QwenWrappedNative;
+    // R5-06: the ambiguous-byte protocol policy. PayloadFidelity keeps the historical
+    // round-4 behavior (a later closing chain wins: embedded tool markup inside a string
+    // value is preserved byte-exact, and the known R1 phantom-acceptance class stays
+    // executable). FailClosed refuses a Stage-2 completion that would reinterpret a closer
+    // chain that already formed a complete call, and returns the region as text with the
+    // ambiguous_structure reason. The production Qwen3.8 default is FailClosed.
+    ToolCallAmbiguityPolicy tool_call_ambiguity = ToolCallAmbiguityPolicy::FailClosed;
 };
 
 struct NgramSessionHints {

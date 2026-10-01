@@ -326,6 +326,7 @@ ninfer::RequestOptions to_request_options(const GenerationRequest& request,
     options.output.tool_name_max_length = static_cast<std::uint32_t>(request.tool_name_max_length);
     options.output.tolerant_tool_calls  = server.tolerant_tool_calls;
     options.output.tool_call_syntax     = server.tool_call_syntax;
+    options.output.tool_call_ambiguity  = server.tool_call_ambiguity;
     options.stop.include_model_defaults = !request.ignore_eos;
     options.stop.strings.reserve(request.stop_strings.size() *
                                  (request.stop_strings_apply_to_reasoning ? 2U : 1U));
