@@ -19,8 +19,10 @@ std::string marker_suffix(const std::string& text) {
 
 } // namespace
 
-ToolCallGrammarConstraint::ToolCallGrammarConstraint(std::size_t max_tool_name_length)
-    : max_tool_name_length_(max_tool_name_length == 0 ? 64 : max_tool_name_length) {}
+ToolCallGrammarConstraint::ToolCallGrammarConstraint(std::size_t max_tool_name_length,
+                                                     ToolCallSyntaxMode syntax)
+    : max_tool_name_length_(max_tool_name_length == 0 ? 64 : max_tool_name_length),
+      syntax_(syntax) {}
 
 ToolCallParsePolicy ToolCallGrammarConstraint::parse_policy() const {
     ToolCallParsePolicy policy;
@@ -32,9 +34,11 @@ ToolCallParsePolicy ToolCallGrammarConstraint::parse_policy() const {
     // concern, not wire syntax.
     policy.tolerant = false;
     policy.enforce_declared_names = false;
-    // R5-07: the constraint trigger tracks the compatibility superset; the region re-parse
-    // must use the same entry set or a compatibility latch would be re-read as prose.
-    policy.syntax = ToolCallSyntaxMode::Compatibility;
+    // R6-01: the constraint follows the selected syntax mode (R6-I1): the trigger, the
+    // region re-parse, and the production parser must agree on what a top-level entry is.
+    // Strict (no tolerant recovery): the model is constrained to the canonical wire syntax,
+    // and the declared-name check is a contract concern, not wire syntax.
+    policy.syntax = syntax_;
     return policy;
 }
 
@@ -93,8 +97,8 @@ ToolCallGrammarConstraint::advance(std::string_view decoded_bytes, ToolCallGramm
             }
             state.marker_prefix_.push_back(byte);
             ToolOpenTag marker = {};
-            const ToolMarkerStatus status = classify_tool_marker_prefix(state.marker_prefix_, marker,
-                                                                        ToolCallSyntaxMode::Compatibility);
+            const ToolMarkerStatus status =
+                classify_tool_marker_prefix(state.marker_prefix_, marker, state.syntax_);
             if (status == ToolMarkerStatus::Complete) {
                 state.triggered_ = true;
                 state.buffer_ = state.marker_prefix_ + std::string(decoded_bytes.substr(i + 1));
@@ -119,7 +123,7 @@ ToolCallGrammarConstraint::advance(std::string_view decoded_bytes, ToolCallGramm
     if (!state.triggered_ && !state.marker_prefix_.empty()) {
         ToolOpenTag marker = {};
         if (classify_tool_marker_prefix(state.marker_prefix_, marker,
-                                        ToolCallSyntaxMode::Compatibility) == ToolMarkerStatus::NeedMore) {
+                                        state.syntax_) == ToolMarkerStatus::NeedMore) {
             return ToolCallConstraintVerdict::NeedMore;
         }
     }

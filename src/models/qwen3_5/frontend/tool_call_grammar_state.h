@@ -33,7 +33,15 @@ class ToolCallGrammarConstraint {
 public:
     // `max_tool_name_length` mirrors the model's tool-name limit for the strict structural
     // check; zero selects the 64-byte default.
-    explicit ToolCallGrammarConstraint(std::size_t max_tool_name_length = 64);
+    // R6-01: `syntax` is the top-level entry syntax this constraint state shares with the
+    // production parser (R6-I1: one syntax mode means one syntax mode). The trigger, the
+    // marker classification, and the pending-prefix decision all use this mode, so the
+    // CPU constraint core can never latch an entry the parser would treat as prose (or
+    // vice versa). The default keeps the historical compatibility entry set for existing
+    // callers.
+    explicit ToolCallGrammarConstraint(std::size_t max_tool_name_length = 64,
+                                       ToolCallSyntaxMode syntax =
+                                           ToolCallSyntaxMode::Compatibility);
 
     // Decide the legality of one candidate token's decoded bytes (the wire grammar is
     // byte-oriented and performs no further character-set validation, so UTF-8 multi-byte
@@ -73,6 +81,10 @@ private:
     [[nodiscard]] ToolCallConstraintVerdict
     advance(std::string_view decoded_bytes, ToolCallGrammarConstraint* target) const;
     std::size_t max_tool_name_length_;
+    // R6-01: the selected top-level entry syntax (shared by the marker trigger, the
+    // pending-prefix classification, and the region re-parse policy). Value-semantic:
+    // checkpoint()/restore() carry it with the state words.
+    ToolCallSyntaxMode syntax_;
     // Bytes of the open region since the trigger (empty while inactive).
     std::string buffer_;
     // The accumulating marker-trigger candidate while inactive (starts with '<'; may
