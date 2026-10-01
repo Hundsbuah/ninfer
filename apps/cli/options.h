@@ -27,10 +27,8 @@ struct Options {
     int device                   = 0;
 
     KvCacheStorage kv_cache = KvCacheStorage::BFloat16;
-    // INT8, K8V4 and NVFP4 KV prefill with their fast prompt kernels unless the original one is
-    // selected.
-    bool original_int8_prefill_kernel  = false;
-    bool original_k8v4_prefill_kernel  = false;
+    // INT8 KV prefills with the fast prompt kernel unless the original kernel is selected.
+    bool original_int8_prefill_kernel = false;
     bool original_nvfp4_prefill_kernel = false;
     SpeculativeOptions speculative;
     bool enable_vision                     = false;
@@ -51,8 +49,6 @@ struct Options {
     // Omitted fields are resolved from the loaded model and rendered prompt mode by Engine.
     SamplingOverrides sampling;
     bool greedy                 = false;
-    // Grammar-constrained tool decoding (default off: the sampling path stays unchanged).
-    ConstrainedToolDecoding constrained_tool_decoding = ConstrainedToolDecoding::Off;
     product::LogLevel log_level = product::LogLevel::Info;
 };
 

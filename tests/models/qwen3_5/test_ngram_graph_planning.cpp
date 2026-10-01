@@ -46,7 +46,7 @@ void verify_profiles() {
              {ninfer::SpeculativeBackend::DFlash, ninfer::SpeculativeBackend::DFlash2}) {
             for (unsigned width = 1; width <= 63; ++width) {
                 const auto profiles =
-                    qwen::detail::dflash_graph_profiles(backend, capacity, width, 1);
+                    qwen::detail::dflash_graph_profiles(backend, capacity, width);
                 unsigned frontier = 0;
                 for (const auto& profile : profiles) {
                     require(profile.min == frontier && profile.max >= profile.min,

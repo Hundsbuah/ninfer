@@ -329,6 +329,12 @@ struct HybridLaneState {
     // deeper snapshot, its lineage resumes from that one and this one is superseded.
     runtime::prefix_cache::SnapshotRef resume_snapshot;
     std::uint32_t resume_frontier = 0;
+    // The newest Tap (not Boundary) this sequence published. A deeper tap of the same prompt
+    // supersedes it: the lineage resumes from the deeper one, and it only serves a request
+    // diverging between them. The endpoint does not, since a next turn whose template re-renders
+    // the reply resumes from the prompt-end tap.
+    runtime::prefix_cache::SnapshotRef tap_snapshot;
+    std::uint32_t tap_frontier = 0;
     // The Host restore this sequence was admitted from (0 without one). Its first prefill pass
     // queues behind the restore's per-layer events; releasing the lane queues behind the whole
     // restore if it may still be landing.
@@ -812,8 +818,9 @@ public:
     qwen3_5::MtpDecodeIngress* mtp_host_ingress = nullptr;
     qwen3_5::MtpDecodeEgress* mtp_host_egress   = nullptr;
     std::optional<PinnedHostBuffer> dflash_host;
-    qwen3_5::DFlashDecodeIngress* dflash_host_ingress = nullptr;
-    qwen3_5::DFlashDecodeEgress* dflash_host_egress   = nullptr;
+    qwen3_5::DFlashDecodeIngress* dflash_host_ingress          = nullptr;
+    qwen3_5::DFlashDecodeEgress* dflash_host_egress            = nullptr;
+    qwen3_5::DFlashPrefillIngress* dflash_prefill_host_ingress = nullptr;
 
     std::size_t workspace_logical_peak_bytes = 0;
     std::size_t vision_handoff_peak_bytes    = 0;
@@ -1171,8 +1178,10 @@ private:
                                           std::uint32_t lane, bool endpoint) noexcept;
     // Drops the lane's index pins. Safe on any lane state.
     void hybrid_release_lane(std::uint32_t lane) noexcept;
-    // Supersedes the snapshot the lane resumed from once the lane has published a deeper one.
-    void hybrid_supersede_resume(HybridLaneState& lane);
+    // Supersedes the snapshot the sequence resumed from once it snapshots past it at
+    // `frontier`, before the new snapshot takes a slot or slabs (spec §9.2, §9.3).
+    void hybrid_supersede_resume(HybridLaneState& lane, std::uint32_t frontier);
+    void hybrid_supersede_tap(HybridLaneState& lane, std::uint32_t frontier);
 
     [[nodiscard]] std::optional<AdmissionCandidate>
     inspect_lane(std::uint32_t lane, const PreparedPromptData& prompt, const RequestBasePlan& base,
@@ -1446,9 +1455,6 @@ private:
     [[nodiscard]] runtime::PrefillStepResult
     advance_prefill(SequenceState& sequence, RequestControl& request,
                     runtime::ExecutionTiming* failed_timing);
-    // Row-0 DFlash frame controls (lane, state slots, backend KV row) read by a prefill's
-    // feature sink. The frame is shared with decode rounds, so every prefill step re-uploads them.
-    void upload_dflash_prefill_controls(const SequenceState& sequence);
     void enqueue_dflash_context_append(std::span<const std::uint32_t> lanes,
                                        std::span<const std::uint32_t> starts,
                                        std::span<const std::uint32_t> counts);

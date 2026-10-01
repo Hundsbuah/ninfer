@@ -330,29 +330,6 @@ OperationalRecord render_request_done(const RequestLogContext& context,
 std::optional<OperationalRecord> render_tool_call_fallback(const RequestLogContext& context,
                                                            const GenerationOutcome& outcome) {
     const ninfer::ToolCallParseFallbackReason reason = outcome.tool_call_parse.fallback_reason;
-    // R3-12 / N-06 item 2: no marker was seen, no tool call was produced, the fence
-    // suppressed markers, and the pre-latch bytes ended inside an unclosed fence: the model
-    // likely emitted an unbalanced fence block around its markup. Warn with a bounded
-    // single-line snippet of the fence start.
-    if (!outcome.tool_call_parse.marker_seen && outcome.tool_calls.empty() &&
-        outcome.tool_call_parse.ended_in_unclosed_fence &&
-        outcome.tool_call_parse.fenced_markers_suppressed > 0) {
-        constexpr std::size_t kSnippetBytes = 80;
-        std::string snippet;
-        if (const std::size_t fence = outcome.text.find("```"); fence != std::string::npos) {
-            snippet = outcome.text.substr(fence, kSnippetBytes);
-            for (char& byte : snippet) {
-                if (byte == '\n' || byte == '\r' || byte == '\t') { byte = ' '; }
-            }
-        }
-        return OperationalRecord{
-            .severity = OperationalSeverity::Warning,
-            .message  = "req#" + std::to_string(context.id) +
-                        " tool-call fence left unclosed | fenced_markers_suppressed=" +
-                        std::to_string(outcome.tool_call_parse.fenced_markers_suppressed) +
-                        (snippet.empty() ? std::string{} : " | " + snippet),
-        };
-    }
     if (!outcome.tool_call_parse.marker_seen ||
         reason == ninfer::ToolCallParseFallbackReason::None) {
         return std::nullopt;
@@ -372,19 +349,11 @@ std::optional<OperationalRecord> render_tool_call_fallback(const RequestLogConte
         };
     }
     // The reason names the verdict; a bounded, single-line snippet of the returned markup shows
-    // what earned it, starting at the region's first marker of any family (R3-12: bare
-    // unwrapped regions log their markup too). Text before the first marker never appears.
+    // what earned it. Text before the first marker never appears.
     constexpr std::size_t kMarkupSnippetBytes = 240;
     std::string snippet;
-    std::size_t marker = std::string::npos;
-    for (const std::string_view prefix : {std::string_view("<tool_call>"),
-                                          std::string_view("<function_calls>"),
-                                          std::string_view("<function="),
-                                          std::string_view("<invoke ")}) {
-        const std::size_t at = outcome.text.find(prefix);
-        if (at != std::string::npos && (marker == std::string::npos || at < marker)) { marker = at; }
-    }
-    if (marker != std::string::npos) {
+    if (const std::size_t marker = outcome.text.find("<tool_call>");
+        marker != std::string::npos) {
         snippet = outcome.text.substr(marker, kMarkupSnippetBytes);
         if (outcome.text.size() - marker > kMarkupSnippetBytes) { snippet += "..."; }
         for (char& byte : snippet) {
@@ -392,19 +361,11 @@ std::optional<OperationalRecord> render_tool_call_fallback(const RequestLogConte
         }
     }
 
-    // N-06 item 2: the fence part (the region ended in an unclosed fence that suppressed
-    // markers) and the budget part (N-07) precede the snippet.
-    const std::uint32_t suppressed = outcome.tool_call_parse.fenced_markers_suppressed;
-    std::string message = "req#" + std::to_string(context.id) + " tool markup returned as text | " +
-                          pretty_code(ninfer::tool_call_parse_fallback_reason_name(reason));
-    if (suppressed > 0 && outcome.tool_call_parse.ended_in_unclosed_fence) {
-        message += " | fenced_markers_suppressed=" + std::to_string(suppressed);
-    }
-    if (outcome.tool_call_parse.parse_budget_exhausted) { message += " | parse budget exhausted"; }
-    if (!snippet.empty()) { message += " | " + snippet; }
     return OperationalRecord{
         .severity = OperationalSeverity::Warning,
-        .message  = std::move(message),
+        .message  = "req#" + std::to_string(context.id) + " tool markup returned as text | " +
+                   pretty_code(ninfer::tool_call_parse_fallback_reason_name(reason)) +
+                   (snippet.empty() ? std::string{} : " | " + snippet),
     };
 }
 

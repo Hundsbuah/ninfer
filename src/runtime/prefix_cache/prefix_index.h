@@ -56,9 +56,10 @@ enum class SnapshotKind : std::uint8_t {
     Tap,
     Endpoint,
     OutputBoundary,
-    // A tap at a boundary that later prompts share across conversations: a client-named
+    // A tap at a boundary that later prompts may share across conversations: a client-named
     // breakpoint, the end of the tools or leading System/Developer block, or the divergence of
-    // concurrent requests. A lineage continuing past it does not supersede it.
+    // concurrent requests. A lineage continuing past it supersedes it only while no other
+    // conversation has continued from it.
     Boundary,
 };
 
@@ -211,11 +212,12 @@ public:
     // Records a hit on the snapshot selected for an admission. A hit on a superseded snapshot
     // shows it still serves requests: it is retained again until its new lineage moves on.
     void note_hit(SnapshotRef snapshot);
-    // A lineage that resumed from `snapshot` has published a deeper snapshot on the same path, so
-    // its next request resumes from that one: `snapshot` now serves only requests that diverge
-    // before it. Superseded snapshots are evicted before every retained one, oldest supersession
-    // first, and retained snapshots are valued against their nearest retained ancestor. A
-    // Boundary snapshot is never superseded.
+    // A lineage that resumed from `snapshot`, or captured it as a tap, has published a deeper
+    // snapshot on the same path, so its next request resumes from that one: `snapshot` now serves
+    // only requests that diverge before it. Superseded snapshots are evicted before every retained
+    // one, oldest supersession first, and retained snapshots are valued against their nearest
+    // retained ancestor. A Boundary snapshot is superseded only while no other conversation has
+    // continued from it (the tree below it is a single chain).
     void supersede(SnapshotRef snapshot);
 
     // ---- pins -----------------------------------------------------------------------------
@@ -275,11 +277,17 @@ public:
     void abort_tail_device_fill(SnapshotRef snapshot);
 
     // ---- snapshots (§5.3, §7.4, §7.7, §9.2)
-    // ------------------------------------------------------- Returns a free device snapshot slot
-    // for a tap/endpoint destination (staging), evicting the least recently hit host-backed slot.
-    // With `allow_unbacked`, an unpinned slot whose snapshot has no host copy may be evicted when
-    // no backed slot exists (that snapshot is lost).
-    [[nodiscard]] std::optional<std::uint32_t> acquire_device_slot(bool allow_unbacked);
+    // ------------------------------------------------------- Returns a device snapshot slot for a
+    // tap/endpoint destination (staging): a free one, else a superseded owner's, else the least
+    // valuable Device-only owner's when the new snapshot's `claim` priority is at least its GDSF
+    // priority (that snapshot is lost), else the least recently hit Host-backed owner's (which
+    // keeps its Host copy).
+    [[nodiscard]] std::optional<std::uint32_t>
+    acquire_device_slot(double claim = std::numeric_limits<double>::infinity());
+    // GDSF priority of a new snapshot at `frontier` whose nearest retained snapshot on its path
+    // is at `base_frontier` and which alone keeps the blocks between them (§9.3).
+    [[nodiscard]] double estimate_priority(std::uint32_t base_frontier, std::uint32_t frontier,
+                                           bool tail) const noexcept;
     void release_device_slot(std::uint32_t slot);
     // Publishes a snapshot whose image is in staging slot `device_slot`. frontier must equal
     // 64 * (anchor depth + 1) + tail.size() (tail.size() for the root anchor). A tail requires
@@ -411,13 +419,19 @@ private:
     void dead_append(std::uint32_t node);
 
     [[nodiscard]] bool take_free_slabs(std::uint32_t count, std::vector<std::uint32_t>& out);
+    // Evicts dead KV, superseded snapshots, then retained snapshots in GDSF order until `count`
+    // slabs are free, but no retained snapshot with a priority above `claim`.
     [[nodiscard]] bool allocate_slabs(std::uint32_t count, std::vector<std::uint32_t>& out,
-                                      std::uint32_t protect_snapshot);
+                                      std::uint32_t protect_snapshot,
+                                      double claim = std::numeric_limits<double>::infinity());
     void free_slab(std::uint32_t slab);
 
     void remove_snapshot(std::uint32_t snapshot);
     // Snapshot ancestry: `above` lies on `below`'s path at a smaller frontier.
     [[nodiscard]] bool on_path(const Snapshot& above, const Snapshot& below) const noexcept;
+    // Whether the tree branches below the snapshot's frontier (another conversation continued
+    // from its prefix).
+    [[nodiscard]] bool shared_below(const Snapshot& snapshot) const noexcept;
     [[nodiscard]] std::uint32_t find_ancestor(std::uint32_t snapshot) const noexcept;
     void link_snapshot(std::uint32_t snapshot);
     void unlink_snapshot(std::uint32_t snapshot);

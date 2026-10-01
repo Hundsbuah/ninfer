@@ -241,9 +241,34 @@ void PrefixCacheIndex::note_hit(SnapshotRef snapshot) {
     revalue_around(snapshot.index, dependents);
 }
 
+bool PrefixCacheIndex::shared_below(const Snapshot& snapshot) const noexcept {
+    // The blocks right after the snapshot: children of its anchor whose tokens begin with its
+    // tail. Two of them, or a branch further down the one chain they start, mean another
+    // conversation has continued from this prefix differently.
+    const std::vector<std::uint32_t>& first =
+        snapshot.anchor == kNoId ? root_children_ : nodes_[snapshot.anchor].children;
+    std::uint32_t chain = kNoId;
+    for (const std::uint32_t child : first) {
+        const auto tail = snapshot.tail.begin();
+        if (!std::equal(tail, tail + snapshot.tail_len, nodes_[child].tokens.begin())) { continue; }
+        if (chain != kNoId) { return true; }
+        chain = child;
+    }
+    while (chain != kNoId) {
+        const std::vector<std::uint32_t>& children = nodes_[chain].children;
+        if (children.size() > 1) { return true; }
+        chain = children.empty() ? kNoId : children.front();
+    }
+    return false;
+}
+
 void PrefixCacheIndex::supersede(SnapshotRef snapshot) {
     Snapshot& entry = require(snapshot);
-    if (entry.superseded || entry.kind == SnapshotKind::Boundary) { return; }
+    // A boundary serves the conversations that share it, so it is superseded only while the tree
+    // shows no other conversation below it: until then it is just this lineage's snapshot.
+    if (entry.superseded || (entry.kind == SnapshotKind::Boundary && shared_below(entry))) {
+        return;
+    }
     std::vector<std::uint32_t> dependents;
     collect_retained_dependents(snapshot.index, dependents);
     entry.superseded      = true;
@@ -626,7 +651,7 @@ void PrefixCacheIndex::free_slab(std::uint32_t slab) {
 }
 
 bool PrefixCacheIndex::allocate_slabs(std::uint32_t count, std::vector<std::uint32_t>& out,
-                                      std::uint32_t protect_snapshot) {
+                                      std::uint32_t protect_snapshot, double claim) {
     out.clear();
     if (count > config_.host_slabs) { return false; }
     while (free_slabs_.size() < count) {
@@ -644,6 +669,9 @@ bool PrefixCacheIndex::allocate_slabs(std::uint32_t count, std::vector<std::uint
         const std::uint32_t victim = pick_victim(true, protect_snapshot);
         if (victim == kNoId) { return false; }
         Snapshot& chosen = snapshots_[victim];
+        // A retained snapshot only yields its slabs to something worth at least as much: GDSF
+        // never inserts what it would evict next.
+        if (!chosen.superseded && chosen.priority > claim) { return false; }
         if (chosen.superseded) {
             // Only requests diverging before its lineage's newer snapshot could use it: both
             // copies go, and GDSF time does not advance.
@@ -712,7 +740,9 @@ bool PrefixCacheIndex::begin_snapshot_host_fill(SnapshotRef ref) {
     const std::uint32_t count =
         config_.image_slabs + (config_.host_blocks && snapshot.tail_len != 0 ? 1U : 0U);
     std::vector<std::uint32_t> slabs;
-    if (!allocate_slabs(count, slabs, ref.index)) { return false; }
+    // The image goes to the Host only if it is worth what it displaces; otherwise it stays
+    // Device-only.
+    if (!allocate_slabs(count, slabs, ref.index, snapshot.priority)) { return false; }
     Snapshot& filled  = snapshots_[ref.index];
     filled.host_slabs = std::move(slabs);
     filled.host       = CopyState::Filling;
@@ -770,60 +800,84 @@ void PrefixCacheIndex::abort_tail_device_fill(SnapshotRef ref) {
 
 // ---- snapshots ---------------------------------------------------------------------------------
 
-std::optional<std::uint32_t> PrefixCacheIndex::acquire_device_slot(bool allow_unbacked) {
+std::optional<std::uint32_t> PrefixCacheIndex::acquire_device_slot(double claim) {
     for (std::uint32_t slot = 0; slot < slot_state_.size(); ++slot) {
         if (slot_state_[slot] == SlotState::Free) {
             set_slot(slot, SlotState::Staging);
             return slot;
         }
     }
-    auto pick = [&](bool backed_only) {
-        std::uint32_t best = kNoId;
-        for (std::uint32_t slot = 0; slot < slot_state_.size(); ++slot) {
-            if (slot_state_[slot] != SlotState::Owned) { continue; }
-            const Snapshot& owner = snapshots_[slot_owner_[slot]];
-            if (owner.pins != 0 || (backed_only && owner.host != CopyState::Resident)) { continue; }
-            if (best == kNoId ||
-                owner.last_hit_tick < snapshots_[slot_owner_[best]].last_hit_tick) {
-                best = slot;
-            }
-        }
-        return best;
-    };
-    // A superseded owner goes first, backed or not: its lineage resumes from a newer snapshot.
-    std::uint32_t slot = kNoId;
-    for (std::uint32_t candidate = 0; candidate < slot_state_.size(); ++candidate) {
-        if (slot_state_[candidate] != SlotState::Owned) { continue; }
-        const Snapshot& owner = snapshots_[slot_owner_[candidate]];
-        if (owner.pins != 0 || !owner.superseded) { continue; }
-        if (slot == kNoId ||
-            owner.superseded_tick < snapshots_[slot_owner_[slot]].superseded_tick) {
-            slot = candidate;
-        }
-    }
-    if (slot != kNoId && snapshots_[slot_owner_[slot]].host != CopyState::Resident) {
-        remove_snapshot(slot_owner_[slot]);
+    const auto take = [&](std::uint32_t slot) {
         ++counters_.device_slot_evictions;
         set_slot(slot, SlotState::Staging);
         return slot;
-    }
-    if (slot == kNoId) { slot = pick(true); }
-    if (slot != kNoId) {
+    };
+    const auto drop_device_copy = [&](std::uint32_t slot) {
         const std::uint32_t owner = slot_owner_[slot];
         backend_->drop_snapshot_device_image(ref_of_snapshot(owner));
         snapshots_[owner].device_slot = kNoId;
         slot_owner_[slot]             = kNoId;
-        set_slot(slot, SlotState::Staging);
-        ++counters_.device_slot_evictions;
-        return slot;
+        return take(slot);
+    };
+    // A superseded owner goes first, backed or not: its lineage resumes from a newer snapshot.
+    std::uint32_t superseded = kNoId;
+    std::uint32_t unbacked   = kNoId;
+    std::uint32_t backed     = kNoId;
+    for (std::uint32_t slot = 0; slot < slot_state_.size(); ++slot) {
+        if (slot_state_[slot] != SlotState::Owned) { continue; }
+        const Snapshot& owner = snapshots_[slot_owner_[slot]];
+        if (owner.pins != 0) { continue; }
+        if (owner.superseded) {
+            if (superseded == kNoId ||
+                owner.superseded_tick < snapshots_[slot_owner_[superseded]].superseded_tick) {
+                superseded = slot;
+            }
+        } else if (owner.host != CopyState::Resident) {
+            const Snapshot* best = unbacked == kNoId ? nullptr : &snapshots_[slot_owner_[unbacked]];
+            if (best == nullptr || owner.priority < best->priority ||
+                (owner.priority == best->priority && owner.last_hit_tick < best->last_hit_tick)) {
+                unbacked = slot;
+            }
+        } else if (backed == kNoId ||
+                   owner.last_hit_tick < snapshots_[slot_owner_[backed]].last_hit_tick) {
+            backed = slot;
+        }
     }
-    if (!allow_unbacked) { return std::nullopt; }
-    slot = pick(false);
-    if (slot == kNoId) { return std::nullopt; }
-    remove_snapshot(slot_owner_[slot]);
-    ++counters_.device_slot_evictions;
-    set_slot(slot, SlotState::Staging);
-    return slot;
+    if (superseded != kNoId) {
+        if (snapshots_[slot_owner_[superseded]].host == CopyState::Resident) {
+            return drop_device_copy(superseded);
+        }
+        remove_snapshot(slot_owner_[superseded]);
+        return take(superseded);
+    }
+    // A Device-only owner is lost when its slot is taken, so value decides: the least valuable
+    // goes, before any backed owner gives up its Device copy, but only for a new snapshot worth
+    // at least as much. Host eviction leaves such owners behind, and without this they hold their
+    // slots for good; a short request's snapshots must not push out the one a long conversation
+    // resumes from.
+    if (unbacked != kNoId && snapshots_[slot_owner_[unbacked]].priority <= claim) {
+        inflation_ = std::max(inflation_, snapshots_[slot_owner_[unbacked]].priority);
+        remove_snapshot(slot_owner_[unbacked]);
+        return take(unbacked);
+    }
+    // A backed owner keeps its Host copy: the least recently hit gives up its Device copy.
+    if (backed != kNoId) { return drop_device_copy(backed); }
+    return std::nullopt;
+}
+
+double PrefixCacheIndex::estimate_priority(std::uint32_t base_frontier, std::uint32_t frontier,
+                                           bool tail) const noexcept {
+    // update_priority for a snapshot that has not been published yet: no hits, and the blocks
+    // between its nearest retained snapshot and itself are its own.
+    if (frontier <= base_frontier) { return inflation_; }
+    const double saved = config_.cost.prefill_seconds(base_frontier, frontier - base_frontier) -
+                         config_.cost.restore_seconds(config_.image_bytes);
+    const std::uint64_t exclusive_blocks = frontier / kBlockTokens - base_frontier / kBlockTokens;
+    const double size =
+        static_cast<double>(config_.image_bytes) +
+        static_cast<double>(tail ? config_.block_bytes : 0ULL) +
+        static_cast<double>(exclusive_blocks) * static_cast<double>(config_.block_bytes);
+    return inflation_ + std::max(0.0, saved) / std::max(size, 1.0);
 }
 
 void PrefixCacheIndex::release_device_slot(std::uint32_t slot) {
@@ -1421,8 +1475,8 @@ HostRestorePlan plan_host_restore(std::span<const std::int32_t> block_parents,
             static_cast<double>(config.image_bytes) +
             static_cast<double>(snapshot.slabs > config.image_slabs ? config.block_bytes : 0U) +
             static_cast<double>(path) * static_cast<double>(config.block_bytes);
-        density[index] = (1.0 + static_cast<double>(snapshot.hits)) * std::max(0.0, saved) /
-                         std::max(size, 1.0);
+        density[index] =
+            (1.0 + static_cast<double>(snapshot.hits)) * std::max(0.0, saved) / std::max(size, 1.0);
     }
     std::vector<std::uint32_t> order(snapshots.size());
     for (std::uint32_t index = 0; index < order.size(); ++index) { order[index] = index; }
@@ -1525,9 +1579,6 @@ void PrefixCacheIndex::check_invariants() const {
         if (!snapshot.occupied) { continue; }
         ++occupied_snapshots;
         if (!snapshot_valid(snapshot)) { invariant("indexed snapshot is not valid"); }
-        if (snapshot.superseded && snapshot.kind == SnapshotKind::Boundary) {
-            invariant("a boundary snapshot is superseded");
-        }
         for (std::uint32_t current = snapshot.anchor; current != kNoId;
              current               = nodes_[current].parent) {
             ++live[current];

@@ -8,7 +8,6 @@ namespace ninfer::models::qwen3_5::detail {
 mtp_graph_profiles(std::uint32_t capacity, std::uint32_t draft_window, std::uint32_t neural_drafts);
 [[nodiscard]] std::vector<GraphExecutionProfile> dflash_graph_profiles(SpeculativeBackend backend,
                                                                        std::uint32_t capacity,
-                                                                       std::uint32_t draft_window,
-                                                                       std::uint32_t batch_size);
+                                                                       std::uint32_t draft_window);
 
 } // namespace ninfer::models::qwen3_5::detail

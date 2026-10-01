@@ -170,7 +170,7 @@ void ProgramImpl::prepare_graphs() {
             controls.push_back(io.mtp->target_input_ids);
             controls.push_back(io.mtp->target_positions);
         }
-        if (io.dflash_prefill) { controls.push_back(io.dflash_prefill->produced_count); }
+        if (io.dflash_prefill) { controls.push_back(io.dflash_prefill->local_append_count); }
         for (const Tensor& tensor : controls) {
             CUDA_CHECK(cudaMemsetAsync(tensor.data, 0, tensor.bytes(), device.stream));
         }
@@ -420,10 +420,10 @@ void ProgramImpl::prepare_graphs() {
                 return core;
             };
             auto& graph_family = ngram ? ngram_graphs : dflash_graphs;
-            const auto batch_one_profiles =
-                dflash_graph_profiles(speculative_backend, capacity, family_window, 1);
-            validate_graph_profiles(batch_one_profiles, capacity - 1, "DFlash");
-            const GraphExecutionProfile code_warm = batch_one_profiles.front();
+            const auto planned_profiles =
+                dflash_graph_profiles(speculative_backend, capacity, family_window);
+            validate_graph_profiles(planned_profiles, capacity - 1, "DFlash");
+            const GraphExecutionProfile code_warm = planned_profiles.front();
             const ops::CausalAttentionExecutionEnvelope code_warm_target{
                 1,
                 static_cast<std::uint32_t>(std::min<std::uint64_t>(
@@ -444,13 +444,8 @@ void ProgramImpl::prepare_graphs() {
             }
             device.synchronize();
 
-            graph_family.profiles.reserve(batch_one_profiles.size() * max_concurrency);
+            graph_family.profiles.reserve(planned_profiles.size() * max_concurrency);
             for (std::uint32_t batch_size = 1; batch_size <= max_concurrency; ++batch_size) {
-                const auto planned_profiles =
-                    batch_size == 1 ? batch_one_profiles
-                                    : dflash_graph_profiles(speculative_backend, capacity,
-                                                            family_window, batch_size);
-                validate_graph_profiles(planned_profiles, capacity - 1, "DFlash");
                 execution::DFlashBatchContext dflash_state{
                     family_core(),        decoder->text_kv,
                     *dflash,              *io.dflash_decode,

@@ -256,43 +256,28 @@ case-insensitive boolean text is normalized to `true` or `false`. A nonempty sch
 a structured call: valid JSON retains its represented type and other text becomes a JSON string so
 the tool consumer can report the validation error and continue the agent loop. Schemas without a
 supported explicit type retain untyped inference. NInfer does not apply defaults, enforce required
-properties, or perform recursive JSON Schema validation. NInfer does not implement grammar-
-constrained tool decoding yet: `--constrained-tool-decoding` accepts `off` only, and
-`tool-calls-only` is not implemented in this build and fails at startup (default `off`; with `off`
-the sampling path is unchanged), see [Tool-call parser](tool_call_parser.md#constrained-tool-decoding).
+properties, perform recursive JSON Schema validation, or use constrained decoding.
 
-String parameters preserve function/tool-call markers and nested `<parameter=...>...</parameter>`
-text as value bytes. Marker recognition, the accepted header forms (short, attribute and bare
-openers with quote-aware names) and the value/closer rules come from a single wire grammar that
-one-shot and streaming parsing share ([Tool-call parser](tool_call_parser.md)). The Qwen wire
-format has no delimiter escape, so a standalone `</parameter>` ends a value only when its one-token
-continuation is the grammar's next structural token — a parameter opener, the function's closer, or
-the end of the output; any other continuation is value text, such as a shell command that echoes the
-markup. When the first (greedy) boundary choice leads the region into a definitive structural break,
-the parser re-parses the region with a consistent completion (Stage 2): an open value is closed at
-a boundary that stays balanced against nested openers of the same parameter family, and the first
-such completion that parses cleanly becomes the structured turn, so a quoted example that closes its
-own structure and then continues as prose is preserved byte-exact as the outer parameter's value.
-Stage 2 is bounded by a deterministic work budget (four units per region byte, at least 100 000);
-a region that exhausts it is returned as text and records `parse_budget_exhausted`.
-A region that fails both stages is ordinary content. Later content is still examined: retry entries
-skip markers inside a recognized code fence, and the first region that parses in either stage becomes
-the structured turn. Generated reasoning closes only at a `</think>` followed by a line break or the
-end of the turn, so a marker the model quotes while reasoning (followed by a space, punctuation or
-an escaped `\n`) stays in the reasoning channel.
+String parameters preserve function/tool-call markers and balanced nested
+`<parameter=...>...</parameter>` text as value bytes. The Qwen wire format has no delimiter escape,
+so a standalone `</parameter>` ends a value only when whitespace and then another parameter, the
+function's closer, or the end of the output follow it; any other one is value text, such as a shell
+command that echoes the markup. An unmatched nested parameter opener, or a quoted closer that is
+followed by the next token, cannot be represented unambiguously and makes that tool-call region
+ordinary content. Later content is still examined:
+the first tool-call region (any accepted marker form) that parses becomes the structured turn, and any
+quoted markup before it stays ordinary content. Generated reasoning closes only at a `</think>`
+followed by a line break or the end of the turn, so a marker the model quotes while reasoning (followed
+by a space, punctuation or an escaped `
+`) stays in the reasoning channel.
 
-By default the parser keeps that all-or-nothing behaviour. The consistent completion (Stage 2)
-is part of both modes. With `--tolerant-tool-calls`, a region that neither stage accepts may
-still return the calls whose function close was consumed, with the `truncated_tail` reason:
-the output ending inside the region (a cut next call, parameter or wrapper close) returns the
-function-closed calls before the cut, whatever the finish reason; a region that breaks on a
-malformed token or on trailing text returns calls without parameters, and calls with parameters
-only after a natural stop (`StopToken`, or no reported reason) and only when the remaining text
-contains no `</parameter>` or `</param>` closer that could still belong to a value; after a cut
-(`StopString`, `OutputLimit`, `ContextCapacity`, `Cancelled`) such a region is returned as text.
-A call whose function close is missing, an undeclared tool name, and a call of a declared tool
-with a repeated parameter name or (when its declared schema is unambiguous) with a non-declared
-name after its first parameter are never returned as calls.
+By default the parser keeps that all-or-nothing behaviour. With `--tolerant-tool-calls` the server
+recovers a call instead when the model adds a suffix after a complete call, a second call is
+malformed, a single final call is cut by the output budget before its closing tags, or the closing
+bracket after the function name is missing: the recovered call is reported structurally with a
+`truncated_tail` diagnostic (logged at Info severity) rather than demoted to text, and an
+undeclared tool name stays structured for the consumer to judge.
+
 Messages enter the selected template in their input order. The maintained Qwen templates keep
 system/developer messages at their original positions. A final assistant message is an assistant
 prefill: generation continues that turn in place instead of opening a new assistant turn. Because
@@ -936,8 +921,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--pending-timeout-ms N` | maximum preparation-plus-admission wait | `30000` |
 | `--prefill-chunk N` | text-prefill chunk | `1024` |
 | `--use-original-int8-prefill-kernel` | prefill INT8-KV prompt attention with the original kernel at the requested `--prefill-chunk`. Without it INT8 KV uses the fast kernel (FP16 per-tile PV accumulation) and rounds `--prefill-chunk` down to whole prompt-attention waves (896 tokens for the 24-head model on RTX 5090: `4096` runs as `3584`); requires `--kv-dtype int8` (startup rejects it with any other KV format) | off |
-| `--use-original-k8v4-prefill-kernel` | prefill K8V4-KV prompt attention with the original kernel. Without it K8V4 KV uses the fast kernel (V decoded in registers, FP16 per-tile PV accumulation), which splits a chunk's keys across CTAs when its row blocks alone would leave SMs idle; the split uses at most 64 MiB of workspace. Requires `--kv-dtype k8v4` (startup rejects it with any other KV format) | off |
-| `--use-original-nvfp4-prefill-kernel` | prefill NVFP4-KV prompt attention with the original warp-specialized kernel. Without it NVFP4 KV uses the fast kernel, which runs QK on block-scaled FP4 Tensor Cores directly over the stored K codes (Q as two NVFP4 terms), decodes V in registers with FP16 per-tile PV accumulation, and splits a chunk's keys across CTAs when its row blocks alone would leave SMs idle (at most 64 MiB of workspace). Requires `--kv-dtype nvfp4` (startup rejects it with any other KV format) | off |
+| `--use-original-nvfp4-prefill-kernel` | prefill NVFP4-KV prompt attention with the tiled kernel. Without it a chunk that sees more than 2048 keys uses the fast kernel, which runs QK on block-scaled FP4 Tensor Cores directly over the stored K codes (Q as two NVFP4 terms), decodes V in registers with FP16 per-tile PV accumulation, and splits the chunk's keys across CTAs when its row blocks alone would leave SMs idle (at most 64 MiB of workspace); shorter chunks keep the tiled kernel. Requires `--kv-dtype nvfp4` (startup rejects it with any other KV format) | off |
 | `--log-stats-interval-ms N` | aggregate throughput report interval; `0` disables it | `5000` |
 | `--log-stats-panel on\|off` | pin the session statistics panel beneath the console log on an interactive terminal | `on` |
 | `--log-colours on\|off` | colour the console statistics lines; never applies to file logs | `off` |
@@ -985,7 +969,6 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--no-thinking` | disable thinking by default | thinking on |
 | `--preserve-thinking` | preserve closed-turn assistant reasoning by default | off |
 | `--tolerant-tool-calls` | recover complete tool calls cut by a malformed wrapper, a trailing suffix or the output budget instead of demoting them to text | off |
-| `--constrained-tool-decoding M` | grammar-constrained decoding of the tool wire syntax (`off` or `tool-calls-only`); `tool-calls-only` is not implemented in this build and fails at engine startup with an explicit error; use `off` | off |
 | `--cors` | permissive browser CORS headers | off |
 | `--usage-chunk-choice` | give the streamed usage chunk a zero-delta choice, for strict client parsers that reject the OpenAI-conformant empty `choices` array | off |
 | `--temperature F` | process-level temperature override | unset |
@@ -1027,7 +1010,10 @@ readiness, request lifecycle, fixed-interval throughput, and shutdown; `--log-le
 internal startup and resource-planning detail. Engine runtime diagnostics are ordinary records
 prefixed `engine |`: a Device KV lease extended by releasing retained cache is `debug`; a lease
 that cannot grow, recovery from out of memory or a failed request, and a failed prefix-cache save
-are warnings or errors; the prefix-cache save at shutdown is `info`. A terminal may use one
+are warnings or errors; the prefix-cache save at shutdown is `info`. FFmpeg's media-decoding
+messages are records prefixed `media |`, so they never write inside the statistics panel: FFmpeg
+errors are warnings, and its warnings and notices, such as swscaler's `deprecated pixel format`
+notice for each JPEG, are `debug`. A terminal may use one
 transient line during startup, but Serve throughput is always a persistent record. Redirected
 stderr contains no terminal control sequences.
 
@@ -1090,20 +1076,13 @@ unspecified. `enable_thinking` records whether the response starts in thinking m
 `request_done.result.tool_call_parse` records whether a complete marker was seen, the structured
 call count, empty non-string arguments omitted during normalization, schema-mismatched arguments
 preserved for consumer validation, `duplicate_parameters_repaired`, and a stable fallback reason.
-The diagnostics also include `markup_tolerant_completion` (the region was resolved by the
-Stage-2 consistent completion instead of the greedy parse), `fenced_markers_suppressed`
-(complete markers a recognized code fence suppressed), `ended_in_unclosed_fence`, and
-`parse_budget_exhausted` (the Stage-2 work budget was exhausted and the region was returned
-as text). Fallback
-reasons are `none`, `malformed_structure`, `invalid_tool_name`, `undeclared_tool`,
-`trailing_content`, `truncated_tail`, and `ambiguous_structure`. A call of a declared tool with a
-repeated parameter name, or with a non-declared name outside its first parameter when the declared
-schema is unambiguous, makes the region ambiguous: it is returned verbatim as text with
-`ambiguous_structure` (the legacy last-value merge, counted in `duplicate_parameters_repaired`,
-applies only to tools the contract does not declare). `truncated_tail` occurs only with
-`--tolerant-tool-calls`: with a nonzero `structured_call_count` the recovered calls were returned
-structurally, and with none the region was returned as text. An output without any marker records
-the reason `none`. These counters contain no tool arguments or generated text.
+A parameter named more than once in one call keeps its last value, as in JSON object syntax, and
+counts once in `duplicate_parameters_repaired` for each repeat instead of demoting the call to text.
+Fallback reasons are `none`, `malformed_structure`, `invalid_tool_name`, `undeclared_tool`,
+`trailing_content`, and `truncated_tail`. `truncated_tail` occurs only with `--tolerant-tool-calls`:
+with a nonzero `structured_call_count` the recovered calls were returned structurally (a discarded
+suffix or a call cut at the region end), and with none the region was returned as text. These
+counters contain no tool arguments or generated text.
 
 `request_done.timings_seconds` contains `prepare`, `ttft`, `vision`, `prefill`, `decode`, and `total`
 as full-precision JSON numbers. Its `speculative` object contains `backend`, `draft_window`, `rounds`,
@@ -1141,9 +1120,8 @@ the KV sizing reserved, and `cuda_graph_measured_bytes` the Device memory graph 
 actually took at startup (`0` without CUDA Graphs); the startup log warns when the second exceeds
 the first.
 
-`server_start.engine.original_int8_prefill_kernel`, `original_k8v4_prefill_kernel` and
-`original_nvfp4_prefill_kernel` record `--use-original-int8-prefill-kernel`,
-`--use-original-k8v4-prefill-kernel` and `--use-original-nvfp4-prefill-kernel`. `ngram_draft_window` and
+`server_start.engine.original_int8_prefill_kernel` and `original_nvfp4_prefill_kernel` record
+`--use-original-int8-prefill-kernel` and `--use-original-nvfp4-prefill-kernel`. `ngram_draft_window` and
 `ngram_min_match` record `--ngram-draft-tokens` (`0` disables n-gram drafting) and
 `--ngram-min-match`; `ngram_archive_bytes` and `ngram_session_bytes` are the draft-archive budgets
 from `--ngram-archive-mib` (`0` keeps drafting request-local) and `--ngram-session-mib`; and

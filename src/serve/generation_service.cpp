@@ -246,14 +246,12 @@ GenerationService::GenerationService(ServeOptions options, StartupObserver start
     engine_options.pending_timeout_ms       = options_.pending_timeout_ms;
     engine_options.prefill_chunk            = options_.prefill_chunk;
     engine_options.original_int8_prefill_kernel = options_.original_int8_prefill_kernel;
-    engine_options.original_k8v4_prefill_kernel = options_.original_k8v4_prefill_kernel;
     engine_options.original_nvfp4_prefill_kernel = options_.original_nvfp4_prefill_kernel;
     engine_options.kv_cache                  = options_.kv_cache;
     engine_options.enable_vision             = options_.enable_vision;
     engine_options.vision_offload            = options_.vision_offload;
     engine_options.vision_max_merged_tokens  = options_.vision_max_merged_tokens;
     engine_options.use_cuda_graph            = options_.use_cuda_graph;
-    engine_options.constrained_tool_decoding = options_.constrained_tool_decoding;
     engine_options.speculative              = options_.speculative;
     engine_options.context_cache            = options_.context_cache;
     engine_options.context_cost.preset_path = options_.context_cost_presets;

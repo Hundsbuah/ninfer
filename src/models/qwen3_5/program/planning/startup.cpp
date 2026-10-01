@@ -304,15 +304,13 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     const auto drafts = static_cast<std::int32_t>(plan.draft_window);
     const auto verify = drafts + 1;
     const ops::CausalAttentionExecutionEnvelope text_envelope{1, plan.capacity};
-    // Prefill chunks run with the small-prefill route hint and the selected prompt kernel, whose
-    // fast K8V4 and NVFP4 forms may split keys into workspace (see execution/text.cpp).
+    // Prefill chunks run the selected prompt kernel, whose fast NVFP4 form may split keys into
+    // workspace (see execution/text.cpp).
     const ops::CausalAttentionExecutionEnvelope prefill_envelope{
         .min_visible_keys   = 1,
         .max_visible_keys   = plan.capacity,
-        .fast_prompt_kernel = plan.fast_prefill_kernel,
-        .small_prefill      = true};
-    const ops::CausalAttentionExecutionEnvelope verify_envelope{1, plan.capacity,
-                                                                plan.ngram_draft_window > 15};
+        .fast_prompt_kernel = plan.fast_prefill_kernel};
+    const ops::CausalAttentionExecutionEnvelope verify_envelope{1, plan.capacity};
 
     const auto matrix  = [](WorkspaceLayoutBuilder& layout, DType dtype, std::int32_t rows,
                            std::int32_t tokens) { (void)layout.alloc(dtype, {rows, tokens}); };
@@ -383,10 +381,10 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                     }
                     (void)workspace::gdn_recurrent_output(layout, config, last);
                     if (path == GdnWorkspacePath::Prefill) {
-                        scratch(layout, ops::gated_delta_net_workspace_capacity_bytes(
-                                            dimension(config.gdn->linear_num_key_heads),
-                                            dimension(config.gdn->linear_num_value_heads),
-                                            first, last));
+                        scratch(layout,
+                                ops::gated_delta_net_workspace_capacity_bytes(
+                                    dimension(config.gdn->linear_num_key_heads),
+                                    dimension(config.gdn->linear_num_value_heads), first, last));
                     }
                     (void)workspace::gdn_normalized_output(layout, config, last);
                     add_scratch(layout, gdn.output, first, last, wide_verification);
@@ -947,13 +945,13 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
         } else {
             // Each DFlash family's profiles are captured at the family's own window for every
             // batch size, on the one frame viewed at that width.
-            for (std::uint32_t batch_size = 1; batch_size <= impl->max_concurrency; ++batch_size) {
-                for (const std::uint32_t window :
-                     {impl->neural_draft_window, impl->ngram_draft_window}) {
-                    if (window == 0) { continue; }
-                    executables += graph_topology_classes(dflash_graph_profiles(
-                        impl->speculative_backend, impl->capacity, window, batch_size));
-                }
+            for (const std::uint32_t window :
+                 {impl->neural_draft_window, impl->ngram_draft_window}) {
+                if (window == 0) { continue; }
+                executables += static_cast<std::uint64_t>(graph_topology_classes(
+                                   dflash_graph_profiles(impl->speculative_backend,
+                                                         impl->capacity, window))) *
+                               impl->max_concurrency;
             }
         }
         impl->graph_allowance_bytes = checked_add(
@@ -1037,19 +1035,16 @@ bool uses_fast_int8_prefill(const EngineOptions& options) {
     return options.kv_cache == KvCacheStorage::Int8Group64 && !options.original_int8_prefill_kernel;
 }
 
-// INT8, K8V4 and NVFP4 KV prefill with their fast prompt kernels unless the original one was
-// selected.
+// INT8 and NVFP4 KV prefill with their fast prompt kernels unless the original was selected.
 bool uses_fast_prefill_kernel(const EngineOptions& options) {
     return uses_fast_int8_prefill(options) ||
-           (options.kv_cache == KvCacheStorage::Fp8KeyNvfp4Value &&
-            !options.original_k8v4_prefill_kernel) ||
            (options.kv_cache == KvCacheStorage::Nvfp4Group16 &&
             !options.original_nvfp4_prefill_kernel);
 }
 } // namespace
 
-// Every chunk but a prompt's last one has the effective width, so with the fast INT8 prefill kernel
-// it is rounded down to whole prompt-attention waves, keeping each full chunk's attention free of a
+// Every chunk but a prompt's last one has the effective width, so with the fast prefill kernel it
+// is rounded down to whole prompt-attention waves, keeping each full chunk's attention free of a
 // partial last wave.
 std::uint32_t effective_prefill_chunk(const execution::Parameters& parameters,
                                       const EngineOptions& options) {
@@ -1078,14 +1073,14 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         .fast_prefill_kernel = uses_fast_prefill_kernel(options),
         .draft_window =
             std::max(options.speculative.draft_tokens, options.speculative.ngram_draft_tokens),
-        .speculative_backend = options.speculative.backend,
-        .kv_storage          = options.kv_cache,
-        .proposal_head       = options.speculative.proposal_head,
-        .features            = models::load_options(options),
-        .use_cuda_graph      = options.use_cuda_graph,
-        .causal_scoring      = options.purpose == EnginePurpose::CausalScoring,
-        .device              = options.device,
-        .context_cache       = options.context_cache,
+        .speculative_backend        = options.speculative.backend,
+        .kv_storage                 = options.kv_cache,
+        .proposal_head              = options.speculative.proposal_head,
+        .features                   = models::load_options(options),
+        .use_cuda_graph             = options.use_cuda_graph,
+        .causal_scoring             = options.purpose == EnginePurpose::CausalScoring,
+        .device                     = options.device,
+        .context_cache              = options.context_cache,
     };
     const std::uint32_t logical_pages = page_count(inputs.capacity);
     const std::uint32_t minimum_pages = std::max(logical_pages, inputs.max_concurrency);

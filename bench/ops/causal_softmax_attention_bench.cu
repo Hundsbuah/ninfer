@@ -10,7 +10,6 @@
 #include "core/device.h"
 #include "core/paged_kv_cache.h"
 #include "core/paged_kv_storage.h"
-#include "ninfer/ops/sigmoid_mul.h"
 #include "ninfer_bench_common.h"
 
 #include <cuda_profiler_api.h>
@@ -46,12 +45,6 @@ enum class Execution : std::uint8_t { Eager, Graph, Both };
 enum class CacheMode : std::uint8_t { Cold, Warm, Both };
 enum class CacheState : std::uint8_t { Cold, Warm };
 enum class PageMapping : std::uint8_t { Identity, Fragmented };
-// off: no gate at all. standalone: the Op runs ungated and the standalone sigmoid_mul follows,
-// which is exactly what a full-attention layer used to issue. fused: the gate is handed to the Op.
-// standalone and fused compute the same bytes, so their medians compare directly; off is the
-// control that neither form changes. The cached entry takes no gate parameter, so it applies the
-// standalone multiply in both gated modes and is a second control inside the same table.
-enum class GateMode : std::uint8_t { Off, Standalone, Fused };
 
 struct Geometry {
     const char* name;
@@ -69,43 +62,23 @@ struct Options {
     Execution execution     = Execution::Graph;
     CacheMode cache         = CacheMode::Cold;
     PageMapping mapping     = PageMapping::Identity;
-    GateMode gate           = GateMode::Off;
     std::vector<std::int32_t> batches{1};
     std::vector<std::int32_t> tokens{1, 2, 4, 6, 8, 12, 16, 1024};
     std::vector<std::int32_t> contexts{0, 128, 2048, 8192};
     std::vector<std::int32_t> row_contexts;
     std::vector<std::int32_t> valid_columns;
     std::vector<std::int32_t> table_rows;
-    int graph_calls = 1;
-    int warmup      = 5;
-    int repeat      = 30;
-    bool profile    = false;
-    // Execution-envelope hints: single-row widths up to 64 may take the chunked small-T route,
-    // and the prompt route may take the fast INT8 kernel.
-    bool wide        = false;
+    int graph_calls  = 1;
+    int envelope_max = 0;
+    int warmup       = 5;
+    int repeat       = 30;
+    bool profile     = false;
     bool fast_prompt = false;
-    // The small-prefill hint: single-row widths 17-64 over a long context take chunked small-T.
-    bool small_prefill = false;
-    // Graph-replay resource envelope upper bound (0: exact). Production decode graphs launch with
-    // [1, capacity], which can change split capacity; this reproduces that envelope.
-    std::int32_t envelope_max = 0;
     std::string csv_out;
 };
 
-// The envelope hints of the current run; every envelope this bench builds carries them.
-bool envelope_wide          = false;
-bool envelope_fast_prompt   = false;
-bool envelope_small_prefill = false;
-std::int32_t envelope_max   = 0;
-
-ops::CausalAttentionExecutionEnvelope bench_envelope(std::int32_t visible) {
-    if (envelope_max > 0) {
-        return {1U, static_cast<std::uint32_t>(std::max(visible, envelope_max)), envelope_wide,
-                envelope_fast_prompt, envelope_small_prefill};
-    }
-    return {static_cast<std::uint32_t>(visible), static_cast<std::uint32_t>(visible), envelope_wide,
-            envelope_fast_prompt, envelope_small_prefill};
-}
+// --fast-prompt: every envelope asks for the fast INT8/NVFP4 prompt kernel.
+bool envelope_fast_prompt = false;
 
 struct Result {
     Entry entry;
@@ -132,21 +105,8 @@ struct Result {
     bench::ColdTiming timing;
     std::size_t graph_nodes = 0, workspace_peak = 0;
     int graph_calls = 1;
-    // The mode this row was actually measured in, not the one asked for on the command line: the
-    // cached entry takes no gate parameter, so it is standalone whenever a gate is requested.
-    GateMode gate = GateMode::Off;
+    ops::CausalAttentionExecutionEnvelope envelope{};
 };
-
-const char* gate_name(GateMode gate) noexcept {
-    return gate == GateMode::Off ? "off" : gate == GateMode::Standalone ? "standalone" : "fused";
-}
-
-// The cached entry takes no gate parameter, so a requested fused gate is a standalone multiply
-// there. Every line that names a gate names this one.
-GateMode effective_gate(GateMode requested, Entry entry) noexcept {
-    return entry == Entry::Cached && requested == GateMode::Fused ? GateMode::Standalone
-                                                                  : requested;
-}
 
 [[noreturn]] void usage(const char* message) {
     std::fprintf(stderr,
@@ -157,11 +117,11 @@ GateMode effective_gate(GateMode requested, Entry entry) noexcept {
                  "[--kv-dtype bf16|int8|fp8|nvfp4|k8v4|all] [--batch B,...] [--tokens W,...] "
                  "[--context L,...] [--row-contexts L0,...] [--valid-columns V0,...] "
                  "[--table-rows R0,...] "
+                 "[--envelope-max N] "
                  "[--execution eager|graph|both] [--cache cold|warm|both] "
-                 "[--mapping identity|fragmented] [--gate off|standalone|fused] "
-                 "[--warmup N] [--repeat N] [--graph-calls N] [--profile] [--wide] [--fast-prompt] "
-                 "[--small-prefill] "
-                 "[--envelope-max N] [--csv-out PATH]\n",
+                 "[--mapping identity|fragmented] "
+                 "[--warmup N] [--repeat N] [--graph-calls N] [--profile] [--fast-prompt] "
+                 "[--csv-out PATH]\n",
                  message);
     std::exit(2);
 }
@@ -283,16 +243,9 @@ Options parse_options(int argc, char** argv) {
                 options.mapping = PageMapping::Fragmented;
             else
                 usage("--mapping expects identity or fragmented");
-        } else if (argument == "--gate") {
-            const std::string_view value(next("--gate requires a value"));
-            if (value == "off")
-                options.gate = GateMode::Off;
-            else if (value == "standalone")
-                options.gate = GateMode::Standalone;
-            else if (value == "fused")
-                options.gate = GateMode::Fused;
-            else
-                usage("--gate expects off, standalone, or fused");
+        } else if (argument == "--envelope-max") {
+            options.envelope_max =
+                parse_i32(next("--envelope-max requires a value"), 1, 262144, "--envelope-max");
         } else if (argument == "--graph-calls") {
             options.graph_calls =
                 parse_i32(next("--graph-calls requires a value"), 1, 128, "--graph-calls");
@@ -302,17 +255,8 @@ Options parse_options(int argc, char** argv) {
             options.repeat = parse_i32(next("--repeat requires a value"), 1, 10000, "--repeat");
         } else if (argument == "--profile") {
             options.profile = true;
-        } else if (argument == "--wide") {
-            options.wide = true;
         } else if (argument == "--fast-prompt") {
             options.fast_prompt = true;
-        } else if (argument == "--small-prefill") {
-            options.small_prefill = true;
-        } else if (argument == "--envelope-max") {
-            options.envelope_max =
-                parse_i32(next("--envelope-max requires a value"), 1,
-                          static_cast<std::int32_t>(ops::kCausalAttentionMaximumVisibleKeys),
-                          "--envelope-max");
         } else if (argument == "--csv-out") {
             options.csv_out = next("--csv-out requires a path");
         } else if (argument == "--help" || argument == "-h") {
@@ -443,8 +387,8 @@ PagedKVBatchLayerView make_batch_cache_view(DeviceBuffer& k, DeviceBuffer& v, De
 }
 
 std::size_t workspace_capacity(const Geometry& geometry, KvCacheStorage storage,
-                               std::int32_t tokens, std::int32_t batch, std::int32_t visible) {
-    const ops::CausalAttentionExecutionEnvelope envelope = bench_envelope(visible);
+                               std::int32_t tokens, std::int32_t batch,
+                               ops::CausalAttentionExecutionEnvelope envelope) {
     return ops::causal_softmax_attention_workspace_capacity_bytes(
         {kHeadDim, geometry.query_heads, geometry.kv_heads}, storage, envelope, batch, tokens,
         tokens);
@@ -459,41 +403,32 @@ std::int32_t profile_visible(std::span<const std::int32_t> contexts,
     return visible;
 }
 
-__global__ void initialize_values(__nv_bfloat16* data, std::size_t count, unsigned seed,
-                                  float scale) {
-    const std::size_t i = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (i >= count) return;
-    unsigned value = static_cast<unsigned>(i) + seed;
-    value ^= value >> 16;
-    value *= 0x7feb352dU;
-    value ^= value >> 15;
-    value *= 0x846ca68bU;
-    value ^= value >> 16;
-    data[i] = __float2bfloat16_rn((float(value >> 8) * (2.f / 16777216.f) - 1.f) * scale);
+ops::CausalAttentionExecutionEnvelope execution_envelope(int visible, int maximum) {
+    if (maximum != 0 && maximum < visible)
+        throw std::invalid_argument("--envelope-max is smaller than the visible input");
+    ops::CausalAttentionExecutionEnvelope envelope{
+        maximum == 0 ? static_cast<unsigned>(visible) : 1U,
+        static_cast<unsigned>(maximum == 0 ? visible : maximum)};
+    envelope.fast_prompt_kernel = envelope_fast_prompt;
+    return envelope;
 }
 
 DeviceBuffer varied_values(std::size_t count, unsigned seed, float scale) {
-    DeviceBuffer result(count * 2);
-    initialize_values<<<(count + 255) / 256, 256>>>(static_cast<__nv_bfloat16*>(result.p), count,
-                                                    seed, scale);
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaDeviceSynchronize());
-    return result;
+    return bench::make_bf16(count, seed, -scale, scale);
 }
 
 class Case {
 public:
     Case(Geometry geometry, KvCacheStorage storage, std::int32_t tokens,
          std::span<const std::int32_t> contexts, std::span<const std::int32_t> valid_columns,
-         std::span<const std::int32_t> table_rows, PageMapping mapping,
-         GateMode gate = GateMode::Off)
-        : storage_layout_(paged_kv_storage_layout(storage, kHeadDim)), gate_(gate),
+         std::span<const std::int32_t> table_rows, PageMapping mapping, int envelope_max)
+        : storage_layout_(paged_kv_storage_layout(storage, kHeadDim)),
           batch_(static_cast<std::int32_t>(contexts.size())),
           masked_(std::any_of(valid_columns.begin(), valid_columns.end(),
                               [tokens](std::int32_t valid) { return valid != tokens; })),
-          visible_(profile_visible(contexts, valid_columns)), padded_(align_context(visible_)),
-          table_padded_(align_context(std::max(visible_, envelope_max))),
-          table_pages_(table_padded_ / kPagedKVPageSize), mapping_(mapping),
+          visible_(profile_visible(contexts, valid_columns)),
+          envelope_(execution_envelope(visible_, envelope_max)),
+          padded_(align_context(envelope_.max_visible_keys)), mapping_(mapping),
           logical_pages_(padded_ / kPagedKVPageSize),
           physical_pages_(mapping == PageMapping::Identity ? batch_ * logical_pages_
                                                            : 2 * batch_ * logical_pages_ + 1),
@@ -519,12 +454,10 @@ public:
               storage_layout_.value.has_scale()
                   ? scale_plane_bytes(geometry, storage_layout_.value, physical_pages_)
                   : std::size_t{1})),
-          block_table_(static_cast<std::size_t>(table_pages_) * batch_ * sizeof(std::int32_t)),
+          block_table_(static_cast<std::size_t>(logical_pages_) * batch_ * sizeof(std::int32_t)),
           output_(bench::make_zeros(static_cast<std::size_t>(kHeadDim) * geometry.query_heads *
                                     tokens * batch_ * 2)),
-          gate_buffer_(bench::make_bf16(static_cast<std::size_t>(kHeadDim) * geometry.query_heads *
-                                        tokens * batch_)),
-          workspace_bytes_(workspace_capacity(geometry, storage, tokens, batch_, visible_)),
+          workspace_bytes_(workspace_capacity(geometry, storage, tokens, batch_, envelope_)),
           workspace_(std::max<std::size_t>(workspace_bytes_, 1)),
           q_tensor_(q_.p, DType::BF16, {kHeadDim, geometry.query_heads, tokens, batch_}),
           k_tensor_(k_.p, DType::BF16, {kHeadDim, geometry.kv_heads, tokens, batch_}),
@@ -533,15 +466,11 @@ public:
           valid_columns_tensor_(valid_columns_.p, DType::I32, {batch_}),
           table_rows_tensor_(table_rows_.p, DType::I32, {batch_}),
           output_tensor_(output_.p, DType::BF16, {kHeadDim, geometry.query_heads, tokens, batch_}),
-          gate_tensor_(gate_buffer_.p, DType::BF16,
-                       {kHeadDim, geometry.query_heads, tokens, batch_}),
           cache_view_(make_cache_view(cache_k_, cache_v_, cache_k_scale_, cache_v_scale_,
-                                      block_table_, geometry, storage, table_padded_,
-                                      physical_pages_)),
+                                      block_table_, geometry, storage, padded_, physical_pages_)),
           batch_cache_view_(make_batch_cache_view(cache_k_, cache_v_, cache_k_scale_,
                                                   cache_v_scale_, block_table_, geometry, storage,
-                                                  table_padded_, physical_pages_, batch_)),
-          envelope_(bench_envelope(visible_)) {
+                                                  padded_, physical_pages_, batch_)) {
         std::vector<std::int32_t> host_positions(static_cast<std::size_t>(tokens) * batch_, 0);
         for (std::int32_t row = 0; row < batch_; ++row) {
             const std::int32_t valid = valid_columns[static_cast<std::size_t>(row)];
@@ -555,14 +484,11 @@ public:
                 host_positions[static_cast<std::size_t>(row) * tokens + token] = padding_position;
             }
         }
-        // Envelope pages past the populated context are never read; they alias the row's first
-        // page.
-        std::vector<std::int32_t> host_table(static_cast<std::size_t>(table_pages_) * batch_);
+        std::vector<std::int32_t> host_table(static_cast<std::size_t>(logical_pages_) * batch_);
         for (std::int32_t row = 0; row < batch_; ++row) {
-            for (std::int32_t page = 0; page < table_pages_; ++page) {
-                const std::int32_t linear =
-                    row * logical_pages_ + (page < logical_pages_ ? page : 0);
-                host_table[static_cast<std::size_t>(row) * table_pages_ + page] =
+            for (std::int32_t page = 0; page < logical_pages_; ++page) {
+                const std::int32_t linear = row * logical_pages_ + page;
+                host_table[static_cast<std::size_t>(row) * logical_pages_ + page] =
                     mapping_ == PageMapping::Identity ? linear : 2 * linear + 1;
             }
         }
@@ -590,8 +516,8 @@ public:
             Tensor v(initial_v.p, DType::BF16, {kHeadDim, geometry.kv_heads, padded_});
             auto row_cache = cache_view_;
             row_cache.block_table =
-                Tensor(static_cast<std::int32_t*>(block_table_.p) + row * table_pages_, DType::I32,
-                       {table_pages_});
+                Tensor(static_cast<std::int32_t*>(block_table_.p) + row * logical_pages_,
+                       DType::I32, {logical_pages_});
             ops::kv_cache_append(k, v, positions, row_cache, nullptr);
             CUDA_CHECK(cudaDeviceSynchronize());
         }
@@ -603,19 +529,17 @@ public:
             ops::causal_softmax_attention(
                 q_tensor_, k_tensor_, v_tensor_, positions_tensor_, validity, table_rows_tensor_,
                 {kHeadDim, q_tensor_.ne[1], k_tensor_.ne[1]}, kScale, batch_cache_view_, envelope_,
-                workspace_, output_tensor_, stream,
-                gate_ == GateMode::Fused ? &gate_tensor_ : nullptr);
+                workspace_, output_tensor_, stream);
         } else {
             ops::causal_softmax_attention_cached(
                 q_tensor_, positions_tensor_, {kHeadDim, q_tensor_.ne[1], cache_view_.num_kv_heads},
                 kScale, cache_view_, envelope_, workspace_, output_tensor_, stream);
         }
-        if (gate_ == GateMode::Standalone || (gate_ == GateMode::Fused && entry == Entry::Cached)) {
-            ops::sigmoid_mul(gate_tensor_, output_tensor_, stream);
-        }
     }
 
     [[nodiscard]] std::size_t workspace_bytes() const noexcept { return workspace_bytes_; }
+
+    [[nodiscard]] ops::CausalAttentionExecutionEnvelope envelope() const { return envelope_; }
 
     [[nodiscard]] std::size_t workspace_peak() const {
         if (workspace_.used() != 0 || workspace_.peak_used() > workspace_bytes_)
@@ -625,13 +549,11 @@ public:
 
 private:
     PagedKVStorageLayout storage_layout_;
-    GateMode gate_;
     std::int32_t batch_;
     bool masked_;
     std::int32_t visible_;
+    ops::CausalAttentionExecutionEnvelope envelope_;
     std::int32_t padded_;
-    std::int32_t table_padded_;
-    std::int32_t table_pages_;
     PageMapping mapping_;
     std::int32_t logical_pages_;
     std::int32_t physical_pages_;
@@ -647,7 +569,6 @@ private:
     DeviceBuffer cache_v_scale_;
     DeviceBuffer block_table_;
     DeviceBuffer output_;
-    DeviceBuffer gate_buffer_;
     std::size_t workspace_bytes_;
     WorkspaceArena workspace_;
     Tensor q_tensor_;
@@ -657,10 +578,8 @@ private:
     Tensor valid_columns_tensor_;
     Tensor table_rows_tensor_;
     Tensor output_tensor_;
-    Tensor gate_tensor_;
     PagedKVLayerView cache_view_;
     PagedKVBatchLayerView batch_cache_view_;
-    ops::CausalAttentionExecutionEnvelope envelope_;
 };
 
 const char* entry_name(Entry entry) { return entry == Entry::Append ? "append" : "cached"; }
@@ -771,8 +690,8 @@ double unique_kv_bytes(const Geometry& geometry, KvCacheStorage storage,
 }
 
 bench::ColdTiming measure(Case& data, Entry entry, Execution execution, CacheState cache,
-                          bench::TimedGraph* graph, DeviceBuffer& flush, cudaStream_t stream,
-                          int warmup, int repeat) {
+                          bench::TimedGraph* graph, bench::L2FlushBuffer& flush,
+                          cudaStream_t stream, int warmup, int repeat) {
     if (execution == Execution::Eager) {
         const auto launch = [&](cudaStream_t launch_stream) { data.launch(entry, launch_stream); };
         return cache == CacheState::Cold
@@ -794,15 +713,16 @@ void report(const Result& result) {
     const double pv_tflops     = result.pv_flops / seconds / 1.0e12;
     std::printf(
         "entry=%-6s geometry=%-14s kv=%-6s mapping=%-10s execution=%-5s cache=%-4s "
-        "gate=%-10s B=%d W=%d contexts=%s valid=%s rows=%s "
+        "B=%d W=%d contexts=%s valid=%s rows=%s envelope=[%u,%u] "
         "workspace=%9zu peak=%9zu nodes=%zu calls=%d median=%10.3f us min=%10.3f us p95=%10.3f us "
         "logical_payload=%8.1f GB/s physical_payload=%8.1f GB/s math=%7.2f TFLOP/s\n",
         entry_name(result.entry), result.geometry.name, storage_name(result.storage),
         mapping_name(result.mapping), execution_name(result.execution), cache_name(result.cache),
-        gate_name(result.gate), result.batch, result.tokens, result.row_contexts.c_str(),
-        result.valid_columns.c_str(), result.table_rows.c_str(), result.workspace_bytes,
-        result.workspace_peak, result.graph_nodes, result.graph_calls, result.timing.median_us,
-        result.timing.min_us, result.timing.p95_us, logical_gbps, physical_gbps, tflops);
+        result.batch, result.tokens, result.row_contexts.c_str(), result.valid_columns.c_str(),
+        result.table_rows.c_str(), result.envelope.min_visible_keys,
+        result.envelope.max_visible_keys, result.workspace_bytes, result.workspace_peak,
+        result.graph_nodes, result.graph_calls, result.timing.median_us, result.timing.min_us,
+        result.timing.p95_us, logical_gbps, physical_gbps, tflops);
     std::printf("  vectors K=%.0f V=%.0f bytes cache logical=%.0f physical=%.0f bytes "
                 "qk_flops=%.0f pv_flops=%.0f qk_full_op=%7.2f TFLOP/s "
                 "pv_full_op=%7.2f TFLOP/s unique_kv=%.0f bytes "
@@ -818,37 +738,37 @@ void write_csv(const Options& options, const std::vector<Result>& results) {
     if (!path.parent_path().empty()) { std::filesystem::create_directories(path.parent_path()); }
     std::ofstream output(path);
     if (!output) { throw std::runtime_error("failed to open CSV output"); }
-    output
-        << "entry,geometry,kv_dtype,mapping,execution,cache,gate,B,W,row_contexts,valid_columns,"
-           "table_rows,workspace_bytes,logical_bytes,physical_bytes,logical_cache_bytes,"
-           "key_vector_bytes,value_vector_bytes,physical_cache_bytes,qk_flops,pv_flops,"
-           "qk_full_op_tflops,pv_full_op_tflops,"
-           "unique_kv_bytes,"
-           "unique_kv_gbps,median_us,min_us,p95_us,graph_nodes,workspace_peak_bytes,graph_calls\n";
+    output << "entry,geometry,kv_dtype,mapping,execution,cache,B,W,row_contexts,valid_columns,"
+              "table_rows,workspace_bytes,logical_bytes,physical_bytes,logical_cache_bytes,"
+              "key_vector_bytes,value_vector_bytes,physical_cache_bytes,qk_flops,pv_flops,"
+              "qk_full_op_tflops,pv_full_op_tflops,"
+              "unique_kv_bytes,"
+              "unique_kv_gbps,median_us,min_us,p95_us,graph_nodes,workspace_peak_bytes,graph_calls,"
+              "envelope_min,envelope_max\n";
     for (const Result& result : results) {
         output << entry_name(result.entry) << ',' << result.geometry.name << ','
                << storage_name(result.storage) << ',' << mapping_name(result.mapping) << ','
                << execution_name(result.execution) << ',' << cache_name(result.cache) << ','
-               << gate_name(result.gate) << ',' << result.batch << ',' << result.tokens << ','
-               << result.row_contexts << ',' << result.valid_columns << ',' << result.table_rows
-               << ',' << result.workspace_bytes << ',' << result.logical_bytes << ','
-               << result.physical_bytes << ',' << result.logical_cache_bytes << ','
-               << result.key_vector_bytes << ',' << result.value_vector_bytes << ','
-               << result.physical_cache_bytes << ',' << result.qk_flops << ',' << result.pv_flops
-               << ',';
+               << result.batch << ',' << result.tokens << ',' << result.row_contexts << ','
+               << result.valid_columns << ',' << result.table_rows << ',' << result.workspace_bytes
+               << ',' << result.logical_bytes << ',' << result.physical_bytes << ','
+               << result.logical_cache_bytes << ',' << result.key_vector_bytes << ','
+               << result.value_vector_bytes << ',' << result.physical_cache_bytes << ','
+               << result.qk_flops << ',' << result.pv_flops << ',';
         const double seconds = result.timing.median_us * 1.0e-6;
         output << result.qk_flops / seconds / 1.0e12 << ',' << result.pv_flops / seconds / 1.0e12
                << ',' << result.unique_kv_bytes << ',' << result.unique_kv_bytes / seconds / 1.0e9;
         output << ',' << result.timing.median_us << ',' << result.timing.min_us << ','
                << result.timing.p95_us << ',' << result.graph_nodes << ',' << result.workspace_peak
-               << ',' << result.graph_calls << '\n';
+               << ',' << result.graph_calls << ',' << result.envelope.min_visible_keys << ','
+               << result.envelope.max_visible_keys << '\n';
     }
 }
 
 void profile(Case& data, Entry entry, const Geometry& geometry, KvCacheStorage storage,
              const Options& options, std::int32_t batch, std::int32_t width,
              std::string_view contexts, std::string_view valid_columns, std::string_view table_rows,
-             DeviceBuffer& flush, cudaStream_t stream) {
+             bench::L2FlushBuffer& flush, cudaStream_t stream) {
     const Execution execution = options.execution;
     const CacheState cache = options.cache == CacheMode::Cold ? CacheState::Cold : CacheState::Warm;
     bench::TimedGraph graph;
@@ -870,10 +790,9 @@ void profile(Case& data, Entry entry, const Geometry& geometry, KvCacheStorage s
     }
     std::printf(
         "PROFILE entry=%s geometry=%s kv=%s mapping=%s dispatch=public execution=%s cache=%s "
-        "gate=%s B=%d W=%d contexts=%.*s valid=%.*s rows=%.*s graph_calls=%d\n",
+        "B=%d W=%d contexts=%.*s valid=%.*s rows=%.*s graph_calls=%d\n",
         entry_name(entry), geometry.name, storage_name(storage), mapping_name(options.mapping),
-        execution_name(execution), cache_name(cache),
-        gate_name(effective_gate(options.gate, entry)), batch, width,
+        execution_name(execution), cache_name(cache), batch, width,
         static_cast<int>(contexts.size()), contexts.data(), static_cast<int>(valid_columns.size()),
         valid_columns.data(), static_cast<int>(table_rows.size()), table_rows.data(),
         options.graph_calls);
@@ -948,13 +867,10 @@ int main(int argc, char** argv) {
             return 0;
         }
         const Options options = parse_options(argc, argv);
-        envelope_wide         = options.wide;
         envelope_fast_prompt  = options.fast_prompt;
-        envelope_small_prefill = options.small_prefill;
-        envelope_max           = options.envelope_max;
         cudaStream_t stream   = nullptr;
         CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
-        DeviceBuffer flush(kFlushBytes);
+        bench::L2FlushBuffer flush(kFlushBytes);
         const std::vector<Geometry> geometries     = selected_geometries(options.geometry);
         const std::vector<KvCacheStorage> storages = selected_storages(options.kv);
 
@@ -968,7 +884,7 @@ int main(int argc, char** argv) {
                 options.row_contexts.empty() ? options.contexts.front() : 0;
             const RowProfile rows = make_row_profile(options, batch, width, context);
             Case data(geometry, storage, width, rows.contexts, rows.valid_columns, rows.table_rows,
-                      options.mapping, options.gate);
+                      options.mapping, options.envelope_max);
             const std::string context_name = profile_name(rows.contexts);
             const std::string valid_name   = profile_name(rows.valid_columns);
             const std::string table_name   = profile_name(rows.table_rows);
@@ -978,7 +894,6 @@ int main(int argc, char** argv) {
             return 0;
         }
 
-        std::printf("gate=%s\n", gate_name(options.gate));
         std::vector<Result> results;
         const std::vector<std::int32_t> context_profiles =
             options.row_contexts.empty() ? options.contexts : std::vector<std::int32_t>{0};
@@ -990,7 +905,7 @@ int main(int argc, char** argv) {
                             const RowProfile rows =
                                 make_row_profile(options, batch, tokens, context);
                             Case data(geometry, storage, tokens, rows.contexts, rows.valid_columns,
-                                      rows.table_rows, options.mapping, options.gate);
+                                      rows.table_rows, options.mapping, options.envelope_max);
                             for (const Entry entry : {Entry::Append, Entry::Cached}) {
                                 if ((options.entry == Entry::Append && entry != Entry::Append) ||
                                     (options.entry == Entry::Cached && entry != Entry::Cached) ||
@@ -1058,9 +973,9 @@ int main(int argc, char** argv) {
                                         result.graph_nodes =
                                             execution == Execution::Graph ? graph.nodes() : 0;
                                         result.workspace_peak = data.workspace_peak();
+                                        result.envelope       = data.envelope();
                                         result.graph_calls =
                                             execution == Execution::Graph ? options.graph_calls : 1;
-                                        result.gate = effective_gate(options.gate, entry);
                                         result.timing.median_us /= result.graph_calls;
                                         result.timing.min_us /= result.graph_calls;
                                         result.timing.p95_us /= result.graph_calls;

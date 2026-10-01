@@ -26,8 +26,9 @@ throughput, GPU memory, token IDs when requested, and speculative-decoding stati
 stderr as unprefixed product output, so stdout can be redirected independently. On a terminal,
 weight materialization is one transient progress line followed by a compact Engine-ready summary.
 Redirected stderr contains persistent readable progress for long loads and no carriage returns or
-ANSI escapes. `--log-level debug` exposes every startup phase. Option and local prompt/message input
-failures remain direct command diagnostics:
+ANSI escapes. `--log-level debug` exposes every startup phase. FFmpeg's media-decoding messages are
+records prefixed `media |`: FFmpeg errors are warnings and everything milder is `debug`. Option and
+local prompt/message input failures remain direct command diagnostics:
 
 ```bash
 ./build/apps/ninfer models/qwen3_8_27b_nvfp4.ninfer \
@@ -216,8 +217,7 @@ The table lists executable defaults. The examples above select FP8 KV and MTP3.
 | `--device N` | CUDA device index | `0` |
 | `--kv-dtype bf16\|int8\|fp8\|nvfp4\|k8v4` | KV-cache storage | `bf16` |
 | `--use-original-int8-prefill-kernel` | prefill INT8 KV with the original prompt-attention kernel; requires `--kv-dtype int8` | fast kernel |
-| `--use-original-k8v4-prefill-kernel` | prefill K8V4 KV with the original prompt-attention kernel; requires `--kv-dtype k8v4` | fast kernel |
-| `--use-original-nvfp4-prefill-kernel` | prefill NVFP4 KV with the original prompt-attention kernel; requires `--kv-dtype nvfp4` | fast kernel |
+| `--use-original-nvfp4-prefill-kernel` | prefill NVFP4 KV with the tiled prompt-attention kernel; requires `--kv-dtype nvfp4` | fast kernel over more than 2048 visible keys |
 | `--spec mtp\|dflash\|dflash2` | speculative backend | off |
 | `--draft-tokens N` | MTP `1..5`; DFlash/DFlash2 `1..15` | unset |
 | `--lm-head-draft` | optimized proposal head | off |
@@ -239,7 +239,6 @@ The table lists executable defaults. The examples above select FP8 KV and MTP3.
 | `--presence-penalty F` | presence-penalty override | registered model/mode default |
 | `--frequency-penalty F` | frequency-penalty override | registered model/mode default (`0`) |
 | `--seed N` | sampling seed | `0` |
-| `--constrained-tool-decoding M` | grammar-constrained decoding of the tool wire syntax (`off` or `tool-calls-only`); `tool-calls-only` is not implemented in this build and fails at engine startup with an explicit error; use `off` | `off` |
 | `--log-colours on\|off` | colour the statistics output on stderr | on when stderr is a terminal |
 
 When a sampling flag is omitted, Engine selects the general-task preset for the loaded architecture

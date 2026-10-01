@@ -82,11 +82,8 @@ std::string serve_usage_text(const char* argv0) {
            "                             prefill INT8 KV with the original prompt kernel at\n"
            "                             the requested chunk (default: the fast kernel, chunk\n"
            "                             rounded down to whole attention waves)\n"
-           "  --use-original-k8v4-prefill-kernel\n"
-           "                             prefill K8V4 KV with the original prompt kernel\n"
-           "                             (default: the fast kernel)\n"
            "  --use-original-nvfp4-prefill-kernel\n"
-           "                             prefill NVFP4 KV with the original prompt kernel\n"
+           "                             prefill NVFP4 KV with the tiled prompt kernel\n"
            "                             (default: the fast kernel)\n"
            "  --no-cuda-graph            disable CUDA-graph decode rounds (on by default)\n"
            "  --default-max-tokens N     default max_tokens when a request omits it\n"
@@ -224,13 +221,10 @@ std::string serve_usage_text(const char* argv0) {
            "  --no-thinking              disable the thinking mode (enabled by default)\n"
            "  --preserve-thinking        retain closed-turn assistant reasoning\n"
            "                             in later prompts\n"
-           "  --tolerant-tool-calls      keep function-closed Qwen calls before a cut-off or\n"
-           "                             malformed tail (calls with arguments before a malformed\n"
-           "                             tail only after a natural stop); never an open value or\n"
-           "                             an undeclared name (strict all-or-nothing by default)\n"
-           "  --constrained-tool-decoding M grammar-constrained tool decoding (off|tool-calls-only;\n"
-           "                             default off; tool-calls-only is not implemented in this\n"
-           "                             build and fails at startup; use off)\n"
+           "  --tolerant-tool-calls      recover complete Qwen calls with malformed wrapper or\n"
+           "                             suffix output, keep a final call cut by the output\n"
+           "                             budget and an undeclared name (strict all-or-nothing\n"
+           "                             by default)\n"
            "\n"
            "NETWORKING & RESOURCES\n"
            "  --host H                   listen address (default 127.0.0.1)\n"
@@ -356,8 +350,6 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 parse_nonnegative_int(require_value("--prefill-chunk"), "prefill-chunk"));
         } else if (arg == "--use-original-int8-prefill-kernel") {
             options.original_int8_prefill_kernel = true;
-        } else if (arg == "--use-original-k8v4-prefill-kernel") {
-            options.original_k8v4_prefill_kernel = true;
         } else if (arg == "--use-original-nvfp4-prefill-kernel") {
             options.original_nvfp4_prefill_kernel = true;
         } else if (arg == "--context-cost-presets") {
@@ -583,16 +575,6 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.preserve_thinking = true;
         } else if (arg == "--tolerant-tool-calls") {
             options.tolerant_tool_calls = true;
-        } else if (arg == "--constrained-tool-decoding") {
-            const std::string mode = require_value("--constrained-tool-decoding");
-            if (mode == "off") {
-                options.constrained_tool_decoding = ConstrainedToolDecoding::Off;
-            } else if (mode == "tool-calls-only") {
-                options.constrained_tool_decoding = ConstrainedToolDecoding::ToolCallsOnly;
-            } else {
-                throw std::invalid_argument(
-                    "--constrained-tool-decoding must be off or tool-calls-only");
-            }
         } else if (arg == "--cors") {
             options.enable_cors = true;
         } else if (arg == "--usage-chunk-choice") {

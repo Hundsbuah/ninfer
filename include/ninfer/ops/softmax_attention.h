@@ -18,21 +18,14 @@ inline constexpr std::uint32_t kCausalAttentionMaximumVisibleKeys = 1048576;
 struct CausalAttentionExecutionEnvelope {
     std::uint32_t min_visible_keys = 0;
     std::uint32_t max_visible_keys = 0;
-    // Opt into chunked single-row verification through width 64; ordinary prompts keep
-    // their existing route. Workspace planning and execution must use the same hint.
-    bool wide_verification = false;
-    // Select the fast prompt kernel for prompt-route launches over an INT8-G64, NVFP4-G16 or K8V4
-    // cache (FP16 per-tile PV accumulation; NVFP4 and K8V4 also decode V in registers, and NVFP4
-    // runs QK on block-scaled FP4 Tensor Cores with a two-term NVFP4 Q). Other routes and cache
-    // formats ignore it, and it never changes the route. Over NVFP4 and K8V4 it can change the
-    // workspace: the fast kernel may split a single-row launch's keys, so workspace planning and
-    // execution must use the same hint.
+    // Run prompt-route launches over an INT8-G64 or NVFP4-G16 cache on the fast prompt kernel
+    // (each warp keeps its query rows, scores and output in registers; FP16 per-tile PV
+    // accumulation; NVFP4 also decodes V in registers and runs QK on block-scaled FP4 Tensor Cores
+    // with a two-term NVFP4 Q) instead of the storage's tiled kernel. NVFP4 takes it only over more
+    // than 2048 visible keys. Other routes and cache formats ignore it, and it never changes the
+    // route. Over NVFP4 it can change the workspace: the fast kernel may split a single-row launch's
+    // keys across CTAs, so workspace planning and execution must use the same hint.
     bool fast_prompt_kernel = false;
-    // Single-row prefill: widths 17 through 64 take the chunked small-T route once the visible
-    // keys make it faster than the prompt route. The prompt route runs one CTA per query head and
-    // row block, so a few query rows over a long context leave most SMs idle; small-T splits the
-    // keys across CTAs instead. Workspace planning and execution must use the same hint.
-    bool small_prefill = false;
 };
 
 struct ContextAttentionExecutionEnvelope {
@@ -138,31 +131,24 @@ void packed_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
  * through the inert tail; an empty row uses zero positions. Other tail values are safe dummies.
  * Tail columns do not mutate cache and produce exact BF16 zero.
  *
- * The registered prompt route consumes the paged cache directly. Over an NVFP4 or K8V4 cache the
- * fast prompt kernel may divide the keys of every row block of a single-row launch whose row
- * blocks alone would leave SMs idle among CTAs and merge their normalized FP32 partial rows; that
- * split, like the split state of the small-T routes, uses the transient capacity returned by the
- * query below.
+ * Attention consumes the paged cache directly. Caller-owned transient storage is bounded by the
+ * capacity query below; implementations that need no partial state return zero capacity.
  *
  * The caller guarantees that the maximum p+1 over live rows lies within envelope. The envelope is
  * a host launch/workspace resource promise over that batch maximum, not a mask and not persistent
  * state. A masked physical width may exceed max_visible_keys when its live prefix is shorter.
- * Inputs, output, every cache plane/table, and live workspace suballocations are pairwise
- * non-overlapping. The Op overwrites every addressed cache row but owns no cache allocation,
- * frontier, request identity, or commit authority.
- *
- * An optional gate asks the Op to finish with out *= sigmoid(gate). When present it is a contiguous
- * BF16 tensor shaped exactly like out and disjoint from every other operand. Where the route allows
- * it the multiply is folded into the reduce epilogue; every other route applies the standalone
- * elementwise kernel inside the Op. Either way the result is bit-identical to calling sigmoid_mul
- * on the ungated output, so no caller has to know which route it landed on.
+ * With fixed tensor views, geometry and cache storage, calls with W<=16 remain CUDA Graph
+ * update-compatible across valid envelopes. Live row lengths determine the KV work partition within
+ * each capture. Inputs, output, every cache plane/table, and live workspace suballocations are
+ * pairwise non-overlapping. The Op overwrites every addressed cache row but owns no cache
+ * allocation, frontier, request identity, or commit authority.
  */
 void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
                               const Tensor& positions, const Tensor& valid_columns,
                               const Tensor& kv_table_rows, AttentionHeadGeometry geometry,
                               float scale, PagedKVBatchLayerView cache,
                               CausalAttentionExecutionEnvelope envelope, WorkspaceArena& workspace,
-                              Tensor& out, cudaStream_t stream, const Tensor* gate = nullptr);
+                              Tensor& out, cudaStream_t stream);
 
 /**
  * Read-only single-sequence causal attention over an already populated cache.
@@ -179,24 +165,23 @@ void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
                                      WorkspaceArena& workspace, Tensor& out, cudaStream_t stream);
 
 /**
+ * Return the prompt-route width granule of one registered head geometry on the current device.
+ * A single-sequence call whose width is a multiple of the granule launches whole waves of fast
+ * prompt-kernel CTAs, so a caller that splits a long prompt into such calls leaves no SM idle behind
+ * a partial wave. The granule is a positive multiple of 128 tokens.
+ */
+[[nodiscard]] std::int32_t
+causal_softmax_attention_prompt_wave_tokens(AttentionHeadGeometry geometry);
+
+/**
  * Return transient capacity for every W in the inclusive interval at one exact batch size. The
  * head geometry, cache dtype, and execution envelope are fixed implementation-profile inputs.
- * Invalid profiles or intervals throw. An interval containing only prompt routes returns zero,
- * except for single-row NVFP4 and K8V4 prompts whose fast kernel splits their keys.
+ * Invalid profiles or intervals throw. The returned capacity may be zero.
  */
 [[nodiscard]] std::size_t causal_softmax_attention_workspace_capacity_bytes(
     AttentionHeadGeometry geometry, KvCacheStorage cache_storage,
     CausalAttentionExecutionEnvelope envelope, std::int32_t batch_size, std::int32_t min_tokens,
     std::int32_t max_tokens);
-
-/**
- * Return the prompt-route width granule of one registered head geometry on the current device.
- * A single-sequence call whose width is a multiple of the granule launches whole waves of prompt
- * CTAs, so a caller that splits a long prompt into such calls leaves no SM idle behind a partial
- * wave. The granule is a positive multiple of 128 tokens.
- */
-[[nodiscard]] std::int32_t
-causal_softmax_attention_prompt_wave_tokens(AttentionHeadGeometry geometry);
 
 /**
  * Non-causal grouped-query attention over persistent context plus one live query block.

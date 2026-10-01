@@ -78,7 +78,10 @@ function(ninfer_stage_test_runtime_dlls anchor_target)
   if(NOT _ninfer_test_rt_dlls)
     return()
   endif()
+  # The staging target does not depend on the anchor, so on a fresh build tree it can run before
+  # the test output directory exists; create it first.
   add_custom_target(ninfer_stage_test_runtime_dlls ALL
+    COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:${anchor_target}>"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
             ${_ninfer_test_rt_dlls}
             "$<TARGET_FILE_DIR:${anchor_target}>"

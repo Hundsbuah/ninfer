@@ -184,15 +184,7 @@ int run_tests() {
                       "--use-original-int8-prefill-kernel was not parsed");
     failures += check(help.find("--use-original-int8-prefill-kernel") != std::string::npos,
                       "CLI help omits --use-original-int8-prefill-kernel");
-    failures += check(!k8v4.original_k8v4_prefill_kernel,
-                      "the CLI original K8V4 prefill kernel must default off");
-    failures += check(parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--kv-dtype",
-                             "k8v4", "--use-original-k8v4-prefill-kernel"})
-                          .original_k8v4_prefill_kernel,
-                      "--use-original-k8v4-prefill-kernel was not parsed");
-    failures += check(help.find("--use-original-k8v4-prefill-kernel") != std::string::npos,
-                      "CLI help omits --use-original-k8v4-prefill-kernel");
-    failures += check(!nvfp4.original_nvfp4_prefill_kernel,
+    failures += check(!k8v4.original_nvfp4_prefill_kernel,
                       "the CLI original NVFP4 prefill kernel must default off");
     failures += check(parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--kv-dtype",
                              "nvfp4", "--use-original-nvfp4-prefill-kernel"})
@@ -225,31 +217,6 @@ int run_tests() {
                   (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--top-k", "21"});
               }),
               "CLI accepted top_k beyond the executable candidate domain");
-    failures += check(
-        parse({"ninfer-cli", "model.ninfer", "--prompt", "hello"}).constrained_tool_decoding ==
-            ninfer::ConstrainedToolDecoding::Off,
-        "CLI constrained tool decoding must default off");
-    for (const auto* mode : {"off", "tool-calls-only"}) {
-        const auto constrained =
-            parse({"ninfer-cli", "model.ninfer", "--prompt", "hello",
-                   "--constrained-tool-decoding", mode});
-        failures += check(constrained.constrained_tool_decoding ==
-                             (std::string(mode) == "off" ? ninfer::ConstrainedToolDecoding::Off
-                                                          : ninfer::ConstrainedToolDecoding::ToolCallsOnly),
-                          "CLI failed to map a constrained tool decoding mode");
-    }
-    failures += check(rejects([] {
-                          (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello",
-                                       "--constrained-tool-decoding", "bogus"});
-                      }),
-                      "CLI accepted an unknown constrained tool decoding mode");
-    failures += check(rejects([] {
-                          (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello",
-                                       "--constrained-tool-decoding"});
-                      }),
-                      "CLI accepted a missing constrained tool decoding mode");
-    failures += check(help.find("--constrained-tool-decoding") != std::string::npos,
-                      "CLI help omits constrained tool decoding");
     return failures == 0 ? 0 : 1;
 }
 

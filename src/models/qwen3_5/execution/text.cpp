@@ -380,9 +380,6 @@ void TextContext::mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& po
         Tensor a_batch        = a.view({dimension(config_.attention->head_dim),
                                         dimension(config_.attention->num_attention_heads), width,
                                         active_sequence_batch_});
-        Tensor gate_batch     = gate.view({dimension(config_.attention->head_dim),
-                                           dimension(config_.attention->num_attention_heads), width,
-                                           active_sequence_batch_});
         Tensor position_batch = positions.view({width, active_sequence_batch_});
         ops::causal_softmax_attention(
             q_batch, k_batch, v_batch, position_batch, *active_valid_columns_,
@@ -391,7 +388,7 @@ void TextContext::mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& po
              dimension(config_.attention->num_attention_heads),
              dimension(config_.attention->num_key_value_heads)},
             static_cast<float>(1.0 / std::sqrt(static_cast<double>(config_.attention->head_dim))),
-            batch_mtp_kv_->batch_layer_view(0), envelope, work_, a_batch, s, &gate_batch);
+            batch_mtp_kv_->batch_layer_view(0), envelope, work_, a_batch, s);
     } else {
         ops::causal_softmax_attention(
             qn, kn, v, positions, Tensor{}, io_.backend_kv_table_row,
@@ -399,8 +396,9 @@ void TextContext::mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& po
              dimension(config_.attention->num_attention_heads),
              dimension(config_.attention->num_key_value_heads)},
             static_cast<float>(1.0 / std::sqrt(static_cast<double>(config_.attention->head_dim))),
-            batch_mtp_kv_->batch_layer_view(0), envelope, work_, a, s, &gate);
+            batch_mtp_kv_->batch_layer_view(0), envelope, work_, a, s);
     }
+    ops::sigmoid_mul(gate, a, s);
 
     const auto post = workspace::mtp_post_attention(work_, config_, T);
     Tensor o        = post.output;
@@ -913,14 +911,8 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
         Tensor a_batch        = a.view({dimension(config_.attention->head_dim),
                                         dimension(config_.attention->num_attention_heads), width,
                                         active_sequence_batch_});
-        Tensor gate_batch     = gate.view({dimension(config_.attention->head_dim),
-                                           dimension(config_.attention->num_attention_heads), width,
-                                           active_sequence_batch_});
         Tensor position_batch = cache_positions.view({width, active_sequence_batch_});
         const Tensor valid = active_valid_columns_ != nullptr ? *active_valid_columns_ : Tensor{};
-        // The gate rides along with the attention call: where the route can, the reduce epilogue
-        // applies it at the store, and every other route applies it inside the Op. One contract
-        // either way, and the same bytes the standalone multiply produced.
         ops::causal_softmax_attention(
             q_batch, k_batch, v_batch, position_batch, valid, kv_table_rows,
             {dimension(config_.attention->head_dim),
@@ -928,7 +920,7 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
              dimension(config_.attention->num_key_value_heads)},
             static_cast<float>(1.0 / std::sqrt(static_cast<double>(config_.attention->head_dim))),
             batch_text_kv_->batch_layer_view(fidx), *active_causal_attention_envelope_, work_,
-            a_batch, s, &gate_batch);
+            a_batch, s);
     } else {
         ops::causal_softmax_attention(
             qn, kn, v, cache_positions, Tensor{}, kv_table_rows,
@@ -936,9 +928,10 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
              dimension(config_.attention->num_attention_heads),
              dimension(config_.attention->num_key_value_heads)},
             static_cast<float>(1.0 / std::sqrt(static_cast<double>(config_.attention->head_dim))),
-            batch_text_kv_->batch_layer_view(fidx), *active_causal_attention_envelope_, work_, a, s,
-            &gate);
+            batch_text_kv_->batch_layer_view(fidx), *active_causal_attention_envelope_, work_, a,
+            s);
     }
+    ops::sigmoid_mul(gate, a, s);
 
     ops::linear_add(a.view({dimension(config_.attention->query_width()), T}), p.output.weight, x,
                     residual_projection_policy(
@@ -1273,11 +1266,10 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
             ScopedPositions scoped_cache(active_cache_positions_, positions);
             ScopedPositions scoped_rope(active_rope_positions_, rope_positions);
             const auto visible = static_cast<std::uint32_t>(base_i + t0 + len);
-            const ops::CausalAttentionExecutionEnvelope chunk_envelope{.min_visible_keys = visible,
-                                                                       .max_visible_keys = visible,
-                                                                       .fast_prompt_kernel =
-                                                                           fast_prefill_kernel_,
-                                                                       .small_prefill = true};
+            const ops::CausalAttentionExecutionEnvelope chunk_envelope{
+                .min_visible_keys   = visible,
+                .max_visible_keys   = visible,
+                .fast_prompt_kernel = fast_prefill_kernel_};
             ScopedEnvelope scoped_envelope(active_causal_attention_envelope_, chunk_envelope);
 
             Tensor x = roots.residual;

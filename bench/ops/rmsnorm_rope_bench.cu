@@ -156,24 +156,21 @@ std::vector<std::int32_t> host_positions(int tokens) {
     return values;
 }
 
-bench::Result measure(const Options& options, const bench::launch_fn& launch, double bytes,
-                      cudaStream_t stream) {
-    if (options.execution == Execution::Eager) {
-        return bench::bench_loop(launch, bytes, options.warmup, options.repeat, 100);
-    }
-    constexpr int repetitions = 32;
+bench::Result measure(const Options& options, const bench::launch_fn& restore,
+                      const bench::launch_fn& launch, double bytes, cudaStream_t stream) {
     bench::TimedGraph graph;
-    graph.capture(stream, [&](cudaStream_t) {
-        for (int i = 0; i < repetitions; ++i) launch(stream);
-    });
-    const auto timing = bench::measure_graph(graph, stream, options.warmup, options.repeat);
+    if (options.execution == Execution::Graph) graph.capture(stream, launch);
+    const auto timing =
+        options.execution == Execution::Graph
+            ? bench::measure_graph_prepared(restore, graph, stream, options.warmup, options.repeat)
+            : bench::measure_launch_prepared(restore, launch, stream, options.warmup,
+                                             options.repeat);
     bench::Result result;
-    result.n_runs      = options.repeat;
-    result.inner_iters = repetitions;
-    result.median_us   = timing.median_us / repetitions;
-    result.min_us      = timing.min_us / repetitions;
-    result.p95_us      = timing.p95_us / repetitions;
-    result.gbs         = bytes / result.median_us / 1.0e3;
+    result.n_runs    = options.repeat;
+    result.median_us = timing.median_us;
+    result.min_us    = timing.min_us;
+    result.p95_us    = timing.p95_us;
+    result.gbs       = bytes / timing.median_us / 1.0e3;
     return result;
 }
 
@@ -182,10 +179,18 @@ void run_pair(const Options& options, int width, int batch, cudaStream_t stream)
     const auto positions_host = host_positions(tokens);
     DeviceBuffer positions(positions_host.size() * sizeof(std::int32_t));
     positions.copy_from_host(positions_host.data(), positions.bytes);
-    DeviceBuffer q = bench::make_bf16(static_cast<std::size_t>(kHeadDim) * kQueryHeads * tokens);
-    DeviceBuffer k = bench::make_bf16(static_cast<std::size_t>(kHeadDim) * kKeyHeads * tokens);
-    DeviceBuffer q_weight = bench::make_bf16(kHeadDim);
-    DeviceBuffer k_weight = bench::make_bf16(kHeadDim);
+    DeviceBuffer q =
+        bench::make_bf16(static_cast<std::size_t>(kHeadDim) * kQueryHeads * tokens, 101U);
+    DeviceBuffer k =
+        bench::make_bf16(static_cast<std::size_t>(kHeadDim) * kKeyHeads * tokens, 103U);
+    DeviceBuffer q_weight = bench::make_bf16(kHeadDim, 105U, .8F, 1.2F);
+    DeviceBuffer k_weight = bench::make_bf16(kHeadDim, 107U, .8F, 1.2F);
+    bench::SavedBuffer initial_q(q);
+    bench::SavedBuffer initial_k(k);
+    const auto restore = [&](cudaStream_t stream) {
+        initial_q.restore(stream);
+        initial_k.restore(stream);
+    };
     Tensor t_positions(positions.p, DType::I32, {width, batch});
     Tensor t_q(q.p, DType::BF16, {kHeadDim, kQueryHeads, width, batch});
     Tensor t_k(k.p, DType::BF16, {kHeadDim, kKeyHeads, width, batch});
@@ -195,7 +200,12 @@ void run_pair(const Options& options, int width, int batch, cudaStream_t stream)
         ops::rmsnorm_rope(t_positions, t_q_weight, t_k_weight, t_q, t_k, launch_stream);
     };
     if (options.profile) {
-        for (int index = 0; index < options.warmup; ++index) launch(stream);
+        for (int index = 0; index < options.warmup; ++index) {
+            restore(stream);
+            launch(stream);
+        }
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        restore(stream);
         CUDA_CHECK(cudaStreamSynchronize(stream));
         CUDA_CHECK(cudaProfilerStart());
         launch(stream);
@@ -205,25 +215,81 @@ void run_pair(const Options& options, int width, int batch, cudaStream_t stream)
     }
     const double bytes =
         2.0 * static_cast<double>(kHeadDim) * (kQueryHeads + kKeyHeads) * tokens * 2.0;
-    const bench::Result timing = measure(options, launch, bytes, stream);
+    const bench::Result timing = measure(options, restore, launch, bytes, stream);
     std::printf("form=pair W=%d B=%d T=%d heads_per_cta=8 execution=%s median=%.3f us min=%.3f us "
                 "p95=%.3f us useful=%.1f GB/s graph_repetitions=%d cache=warm\n",
                 width, batch, tokens, options.execution == Execution::Graph ? "graph" : "eager",
-                timing.median_us, timing.min_us, timing.p95_us, timing.gbs,
-                options.execution == Execution::Graph ? 32 : 1);
+                timing.median_us, timing.min_us, timing.p95_us, timing.gbs, 1);
 }
 
 void run_single(const Options& options, int tokens, cudaStream_t stream) {
     const auto positions_host = host_positions(tokens);
     DeviceBuffer positions(positions_host.size() * sizeof(std::int32_t));
     positions.copy_from_host(positions_host.data(), positions.bytes);
-    DeviceBuffer x      = bench::make_bf16(static_cast<std::size_t>(kHeadDim) * kKeyHeads * tokens);
-    DeviceBuffer weight = bench::make_bf16(kHeadDim);
+    DeviceBuffer x =
+        bench::make_bf16(static_cast<std::size_t>(kHeadDim) * kKeyHeads * tokens, 109U);
+    DeviceBuffer weight = bench::make_bf16(kHeadDim, 111U, .8F, 1.2F);
+    bench::SavedBuffer initial_x(x);
+    const auto restore = [&](cudaStream_t stream) { initial_x.restore(stream); };
     Tensor t_positions(positions.p, DType::I32, {tokens});
     Tensor t_x(x.p, DType::BF16, {kHeadDim, kKeyHeads, tokens});
     Tensor t_weight(weight.p, DType::BF16, {kHeadDim});
     const auto launch = [&](cudaStream_t launch_stream) {
         ops::rmsnorm_rope(t_positions, t_weight, t_x, launch_stream);
+    };
+    if (options.profile) {
+        for (int index = 0; index < options.warmup; ++index) {
+            restore(stream);
+            launch(stream);
+        }
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        restore(stream);
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        CUDA_CHECK(cudaProfilerStart());
+        launch(stream);
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        CUDA_CHECK(cudaProfilerStop());
+        return;
+    }
+    const double bytes         = 2.0 * static_cast<double>(kHeadDim) * kKeyHeads * tokens * 2.0;
+    const bench::Result timing = measure(options, restore, launch, bytes, stream);
+    std::printf("form=single T=%d heads_per_cta=8 execution=%s median=%.3f us min=%.3f us "
+                "p95=%.3f us useful=%.1f GB/s graph_repetitions=%d cache=warm\n",
+                tokens, options.execution == Execution::Graph ? "graph" : "eager", timing.median_us,
+                timing.min_us, timing.p95_us, timing.gbs, 1);
+}
+
+// The text profile of the two registered geometries. `split` is what every full-attention layer
+// issues today: normalize q, normalize k, rotate both. `fused` is the Op that replaces the three.
+void run_text(const Options& options, int query_heads, int key_heads, int tokens,
+              cudaStream_t stream) {
+    const auto positions_host = host_positions(tokens);
+    DeviceBuffer positions(positions_host.size() * sizeof(std::int32_t));
+    positions.copy_from_host(positions_host.data(), positions.bytes);
+    const std::size_t q_elements = static_cast<std::size_t>(kTextHeadDim) * query_heads * tokens;
+    const std::size_t k_elements = static_cast<std::size_t>(kTextHeadDim) * key_heads * tokens;
+    DeviceBuffer q               = bench::make_bf16(q_elements, 113U);
+    DeviceBuffer k               = bench::make_bf16(k_elements, 115U);
+    DeviceBuffer qn              = bench::make_bf16(q_elements, 117U);
+    DeviceBuffer kn              = bench::make_bf16(k_elements, 119U);
+    DeviceBuffer q_weight        = bench::make_bf16(kTextHeadDim, 121U, .8F, 1.2F);
+    DeviceBuffer k_weight        = bench::make_bf16(kTextHeadDim, 123U, .8F, 1.2F);
+    Tensor t_positions(positions.p, DType::I32, {tokens});
+    Tensor t_q(q.p, DType::BF16, {kTextHeadDim, query_heads, tokens});
+    Tensor t_k(k.p, DType::BF16, {kTextHeadDim, key_heads, tokens});
+    Tensor t_qn(qn.p, DType::BF16, {kTextHeadDim, query_heads, tokens});
+    Tensor t_kn(kn.p, DType::BF16, {kTextHeadDim, key_heads, tokens});
+    Tensor t_q_weight(q_weight.p, DType::BF16, {kTextHeadDim});
+    Tensor t_k_weight(k_weight.p, DType::BF16, {kTextHeadDim});
+    const auto launch = [&](cudaStream_t launch_stream) {
+        if (options.route == Route::Fused) {
+            ops::rmsnorm_rope(t_positions, t_q_weight, t_k_weight, t_q, t_k, t_qn, t_kn,
+                              launch_stream);
+            return;
+        }
+        ops::rmsnorm(t_q, t_q_weight, kTextEps, true, t_qn, launch_stream);
+        ops::rmsnorm(t_k, t_k_weight, kTextEps, true, t_kn, launch_stream);
+        ops::rope(t_positions, kTextRotaryDim, kTextRopeBase, t_qn, t_kn, launch_stream);
     };
     if (options.profile) {
         for (int index = 0; index < options.warmup; ++index) launch(stream);
@@ -234,11 +300,15 @@ void run_single(const Options& options, int tokens, cudaStream_t stream) {
         CUDA_CHECK(cudaProfilerStop());
         return;
     }
-    const double bytes         = 2.0 * static_cast<double>(kHeadDim) * kKeyHeads * tokens * 2.0;
-    const bench::Result timing = measure(options, launch, bytes, stream);
-    std::printf("form=single T=%d heads_per_cta=8 execution=%s median=%.3f us min=%.3f us "
+    // Read in, write out, for both operands.
+    const double bytes         = 2.0 * 2.0 * static_cast<double>(q_elements + k_elements);
+    // Out of place: the inputs are never written, so nothing needs restoring between launches.
+    const auto restore         = [](cudaStream_t) {};
+    const bench::Result timing = measure(options, restore, launch, bytes, stream);
+    std::printf("form=text route=%s Q=%d K=%d T=%d execution=%s median=%.3f us min=%.3f us "
                 "p95=%.3f us useful=%.1f GB/s graph_repetitions=%d cache=warm\n",
-                tokens, options.execution == Execution::Graph ? "graph" : "eager", timing.median_us,
+                options.route == Route::Fused ? "fused" : "split", query_heads, key_heads, tokens,
+                options.execution == Execution::Graph ? "graph" : "eager", timing.median_us,
                 timing.min_us, timing.p95_us, timing.gbs,
                 options.execution == Execution::Graph ? 32 : 1);
 }

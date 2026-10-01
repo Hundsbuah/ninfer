@@ -990,7 +990,7 @@ private:
 
     void complete_cancelled(const std::shared_ptr<Request>& request) {
         (void)request->output.preview_terminal(FinishReason::Cancelled);
-        append_output(request, request->output.commit_preview(FinishReason::Cancelled));
+        append_output(request, request->output.commit_preview());
         complete_success(request, FinishReason::Cancelled);
     }
 
@@ -1090,7 +1090,7 @@ private:
             request->speculative_stats  = std::move(aborted.speculative);
             if (aborted.salvaged) { ++cumulative_stats_.salvaged_continuations; }
             if (scheduler_.owns_prefill_lane(lane)) { scheduler_.clear_prefill_lane(lane); }
-            append_output(request, request->output.commit_preview(FinishReason::Cancelled));
+            append_output(request, request->output.commit_preview());
             finish_engine_phase(boundary, EngineHostPhase::Boundary);
             // Free the slot and publish the post-release snapshot before waking the caller so
             // runtime_stats() read after generate() returns reflects the released lane.
@@ -1328,7 +1328,7 @@ private:
                     request->budget->commit(accepted);
                     if (decode_round) { Scheduling::consume_service_work(*request, accepted); }
                 }
-                auto published = request->output.commit_preview(finish_reasons[row]);
+                auto published = request->output.commit_preview();
                 auto timing    = record_committed_output(request, accepted);
                 append_output(request, std::move(published), std::move(timing));
                 if (decisions[row].terminal) {
