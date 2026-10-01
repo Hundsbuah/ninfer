@@ -327,6 +327,8 @@ ConstructedModel construct_model(const EngineOptions& options, DeviceContext& de
     // on the same capacity instead of a silently divergent default.
     EngineOptions resolved = options;
     resolved.context_cache = sequence.context_cache_options();
+    // Automatic tree widths on a target that cannot verify trees resolve to chain verification.
+    resolved.speculative.draft_tree_auto = sequence.draft_tree_auto();
     instance->frontend.publish_long_anchor_limit(
         resolved.context_cache.max_long_anchors_per_continuation.value_or(0));
     instance->kv_capacity_resolution = resolution;

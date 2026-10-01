@@ -164,7 +164,8 @@ public:
         : options(runtime::normalize_engine_options(std::move(engine_options))),
           device(initialize_device(options)) {
         nvtx::ScopedRange load_range(nvtx::Name::EngineLoad, nvtx::Category::Runtime);
-        auto constructed  = runtime::construct_model(options, device);
+        const bool tree_auto_requested = options.speculative.draft_tree_auto;
+        auto constructed               = runtime::construct_model(options, device);
         // construct_model returns the resolved options for this instance. Anything the model had
         // to derive (the single host RAM budget's Host split and long-anchor count) is only known
         // after planning, so the Engine adopts the resolved copy here — before the core that
@@ -174,6 +175,12 @@ public:
         load              = std::move(constructed.load);
         model_metadata    = std::move(constructed.model_metadata);
         load.cuda_sync_mode = device.sync_mode();
+        if (tree_auto_requested && !options.speculative.draft_tree_auto) {
+            runtime::publish_diagnostic(
+                options.diagnostic_observer, DiagnosticLevel::Warning,
+                "automatic DFlash2 tree verification is unavailable for this artifact (its GDN "
+                "input projections are not single FP8 or NVFP4 parents); rounds verify chains");
+        }
         sampling_defaults = active->frontend.sampling_defaults();
         StartupPhaseScope finalize_phase(options.startup_observer, StartupPhase::EngineFinalize);
         if (options.purpose == EnginePurpose::CausalScoring) {

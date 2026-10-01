@@ -37,6 +37,10 @@ std::size_t SequencePlan::workspace_capacity_bytes() const noexcept {
     return impl_ != nullptr ? impl_->workspace.capacity : 0;
 }
 
+bool SequencePlan::draft_tree_auto() const noexcept {
+    return impl_ != nullptr && impl_->tree_widths.automatic_mode();
+}
+
 const ContextCacheOptions& SequencePlan::context_cache_options() const noexcept {
     static const ContextCacheOptions empty;
     return impl_ != nullptr ? impl_->context_cache : empty;

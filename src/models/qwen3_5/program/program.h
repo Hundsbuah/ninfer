@@ -181,6 +181,8 @@ public:
     // resolved the Host state slots, Host KV bytes and long-anchor count here, so a reader that
     // reports or enforces capacity must take them from the plan rather than from raw options.
     [[nodiscard]] const ContextCacheOptions& context_cache_options() const noexcept;
+    // Whether automatic DFlash2 tree widths are active: requested and verifiable by the target.
+    [[nodiscard]] bool draft_tree_auto() const noexcept;
 
 public:
     // Family-private construction/storage seam; exact packages expose only the completed alias.
