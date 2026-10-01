@@ -39,9 +39,18 @@ public:
     // CPU constraint core can never latch an entry the parser would treat as prose (or
     // vice versa). The default keeps the historical compatibility entry set for existing
     // callers.
+    // R7-02: `intent` mirrors the parser's tool-entry intent policy (R7-I5: the constraint
+    // must eventually agree with the parser on both syntax and intent). Under
+    // RequireToolAtContentStart the trigger is a content-start gate, not a bare
+    // marker detector: visible non-whitespace content before the first entry point locks
+    // the gate, a complete marker under a locked gate is ordinary content, and only
+    // formatting whitespace between a closed region and the next wrapper keeps the
+    // consecutive-wrapper eligibility open.
     explicit ToolCallGrammarConstraint(std::size_t max_tool_name_length = 64,
                                        ToolCallSyntaxMode syntax =
-                                           ToolCallSyntaxMode::Compatibility);
+                                           ToolCallSyntaxMode::Compatibility,
+                                       ToolCallIntentPolicy intent =
+                                           ToolCallIntentPolicy::TemplateCompatible);
 
     // Decide the legality of one candidate token's decoded bytes (the wire grammar is
     // byte-oriented and performs no further character-set validation, so UTF-8 multi-byte
@@ -85,12 +94,23 @@ private:
     // pending-prefix classification, and the region re-parse policy). Value-semantic:
     // checkpoint()/restore() carry it with the state words.
     ToolCallSyntaxMode syntax_;
+    // R7-02: the tool-entry intent policy shared with the parser (R7-I5). Value-semantic:
+    // checkpoint()/restore() carry it with the state words.
+    ToolCallIntentPolicy intent_ = ToolCallIntentPolicy::TemplateCompatible;
     // Bytes of the open region since the trigger (empty while inactive).
     std::string buffer_;
     // The accumulating marker-trigger candidate while inactive (starts with '<'; may
     // contain further '<' bytes inside a quoted header value).
     std::string marker_prefix_;
     bool triggered_ = false;  // a complete marker fired; the region machine is live
+    // R7-02: the content-start gate is locked (visible non-whitespace content appeared
+    // before the next tool entry point). While locked under RequireToolAtContentStart a
+    // complete marker is ordinary content and never triggers.
+    bool entry_locked_ = false;
+    // R7-02: a tool region latched in this turn (mirrors the parser's latched_). Once set,
+    // the content-start gate is satisfied for the turn: later markers stay eligible
+    // (consecutive wrappers) and later visible content does not re-lock the gate.
+    bool latched_once_ = false;
 };
 
 

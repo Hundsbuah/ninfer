@@ -494,6 +494,115 @@ void test_r6_constraint_checkpoint_restore_preserves_syntax() {
     check(!constraint.active(),
           "r6-01 restore: restored native mode does not latch a bare function");
 }
+
+// R7 (Round 7 §5.7): the tool-entry intent policy is shared between constraint and
+// parser. Under RequireToolAtContentStart the constraint's trigger is a content-start
+// gate, not a bare marker detector: visible non-whitespace content before the first
+// entry point locks the gate, a complete marker under a locked gate is ordinary content,
+// and only formatting whitespace between a closed region and the next wrapper keeps the
+// consecutive-wrapper eligibility open. TemplateCompatible keeps the historical entry
+// semantics (prose + marker may still trigger).
+void test_r7_intent_content_start_gate() {
+    using Mode = ninfer::ToolCallSyntaxMode;
+    using Intent = ninfer::ToolCallIntentPolicy;
+    const char* marker = "<tool_call>";
+    const char* full_call =
+        "<tool_call><function=bash><parameter=command>echo hi</parameter></function></tool_call>";
+
+    // 1. TemplateCompatible baseline: prose + marker may still trigger (historical).
+    {
+        ToolCallGrammarConstraint constraint;
+        constraint.commit("Example: ");
+        constraint.commit(marker);
+        check(constraint.active(), "r7 tc: prose + marker still triggers the region");
+    }
+
+    // 2. SOC: prose + marker is content, never a trigger.
+    {
+        ToolCallGrammarConstraint constraint(64, Mode::Compatibility, Intent::RequireToolAtContentStart);
+        constraint.commit("Example: ");
+        constraint.commit(marker);
+        check(!constraint.active(), "r7 soc: prose + marker is content, no trigger");
+        check(constraint.finished(), "r7 soc: the gate stays closed after prose");
+    }
+
+    // 3. SOC: formatting whitespace + marker still triggers (whitespace is not content).
+    {
+        ToolCallGrammarConstraint constraint(64, Mode::Compatibility, Intent::RequireToolAtContentStart);
+        constraint.commit("\n \t\n");
+        constraint.commit(marker);
+        check(constraint.active(), "r7 soc: whitespace + marker triggers");
+    }
+
+    // 4. SOC: a failed marker candidate is visible content and locks the gate; a later
+    //    complete marker then stays content.
+    {
+        ToolCallGrammarConstraint constraint(64, Mode::Compatibility, Intent::RequireToolAtContentStart);
+        constraint.commit("<tool_x>");
+        constraint.commit(marker);
+        check(!constraint.active(), "r7 soc: failed candidate locks the gate");
+    }
+
+    // 5. SOC: consecutive wrappers keep eligibility (formatting whitespace only between
+    //    the close and the next marker).
+    {
+        ToolCallGrammarConstraint constraint(64, Mode::Compatibility, Intent::RequireToolAtContentStart);
+        constraint.commit(full_call);
+        check(!constraint.active(), "r7 soc: first wrapper closed");
+        constraint.commit(std::string("\n") + marker);
+        check(constraint.active(), "r7 soc: consecutive wrapper re-triggers after whitespace");
+    }
+
+    // 6. SOC: visible prose after an already latched region does not re-lock the gate
+    //    (the first latch satisfied the content-start requirement): a later marker still
+    //    triggers, mirroring the parser's latched_ lifecycle.
+    {
+        ToolCallGrammarConstraint constraint(64, Mode::Compatibility, Intent::RequireToolAtContentStart);
+        constraint.commit(full_call);
+        check(!constraint.active(), "r7 soc 6: first wrapper closed");
+        constraint.commit("\nor so.\n");
+        constraint.commit(marker);
+        check(constraint.active(), "r7 soc 6: prose after a latched region does not re-lock");
+    }
+
+    // 7. Checkpoint: a speculative draft that emitted prose must not permanently lock
+    //    the restored state.
+    {
+        ToolCallGrammarConstraint constraint(64, Mode::Compatibility, Intent::RequireToolAtContentStart);
+        const ToolCallGrammarConstraint gate_open = constraint.checkpoint();
+        constraint.commit("visible prose");
+        check(constraint.finished(), "r7 soc 7: prose locks the draft state");
+        constraint.commit(marker);
+        check(!constraint.active(), "r7 soc 7: the locked draft does not trigger");
+        constraint.restore(gate_open);
+        constraint.commit(marker);
+        check(constraint.active(), "r7 soc 7: the restored gate-open state triggers");
+    }
+
+    // 8. Syntax x intent cross product: the gate is orthogonal to the syntax mode.
+    {
+        // (native, TC): prose + marker may trigger.
+        ToolCallGrammarConstraint native_tc(64, Mode::QwenWrappedNative);
+        native_tc.commit("Example: ");
+        native_tc.commit(marker);
+        check(native_tc.active(), "r7 xprod: (native, tc) prose + marker triggers");
+        // (native, SOC): prose + marker is content.
+        ToolCallGrammarConstraint native_soc(64, Mode::QwenWrappedNative, Intent::RequireToolAtContentStart);
+        native_soc.commit("Example: ");
+        native_soc.commit(marker);
+        check(!native_soc.active(), "r7 xprod: (native, soc) prose + marker is content");
+        // (compat, TC): a function_calls wrapper after prose may trigger.
+        ToolCallGrammarConstraint compat_tc;
+        compat_tc.commit("Example: ");
+        compat_tc.commit("<function_calls>");
+        check(compat_tc.active(), "r7 xprod: (compat, tc) wrapper after prose triggers");
+        // (compat, SOC): the same wrapper is content.
+        ToolCallGrammarConstraint compat_soc(64, Mode::Compatibility, Intent::RequireToolAtContentStart);
+        compat_soc.commit("Example: ");
+        compat_soc.commit("<function_calls>");
+        check(!compat_soc.active(), "r7 xprod: (compat, soc) wrapper after prose is content");
+    }
+}
 } // namespace
 
 int main() {
@@ -520,6 +629,7 @@ int main() {
     test_r6_constraint_syntax_mode_matrix();
     test_r6_constraint_parser_entry_cross_check();
     test_r6_constraint_checkpoint_restore_preserves_syntax();
+    test_r7_intent_content_start_gate();
     if (failures == 0) { std::puts("tool_call_grammar_state tests: all passed"); }
     return failures == 0 ? 0 : 1;
 }

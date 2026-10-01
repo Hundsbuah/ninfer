@@ -20,9 +20,10 @@ std::string marker_suffix(const std::string& text) {
 } // namespace
 
 ToolCallGrammarConstraint::ToolCallGrammarConstraint(std::size_t max_tool_name_length,
-                                                     ToolCallSyntaxMode syntax)
+                                                     ToolCallSyntaxMode syntax,
+                                                     ToolCallIntentPolicy intent)
     : max_tool_name_length_(max_tool_name_length == 0 ? 64 : max_tool_name_length),
-      syntax_(syntax) {}
+      syntax_(syntax), intent_(intent) {}
 
 ToolCallParsePolicy ToolCallGrammarConstraint::parse_policy() const {
     ToolCallParsePolicy policy;
@@ -92,6 +93,11 @@ ToolCallGrammarConstraint::advance(std::string_view decoded_bytes, ToolCallGramm
             const char byte = decoded_bytes[i];
             if (state.marker_prefix_.empty()) {
                 if (byte == '<') { state.marker_prefix_.push_back(byte); }
+                else if (state.intent_ == ToolCallIntentPolicy::RequireToolAtContentStart &&
+                         !state.latched_once_ && !is_tool_format_whitespace(byte)) {
+                    // R7-02: visible content before the first latch locks the gate for the turn.
+                    state.entry_locked_ = true;
+                }
                 ++i;
                 continue;
             }
@@ -100,13 +106,28 @@ ToolCallGrammarConstraint::advance(std::string_view decoded_bytes, ToolCallGramm
             const ToolMarkerStatus status =
                 classify_tool_marker_prefix(state.marker_prefix_, marker, state.syntax_);
             if (status == ToolMarkerStatus::Complete) {
+                if (state.intent_ == ToolCallIntentPolicy::RequireToolAtContentStart &&
+                    state.entry_locked_) {
+                    // R7-02: visible content before this marker has already locked the
+                    // gate: the complete marker is ordinary content (the parser publishes
+                    // it as content instead of latching).
+                    state.marker_prefix_.clear();
+                    ++i;
+                    continue;
+                }
                 state.triggered_ = true;
+                state.latched_once_ = true;  // R7-02: the first latch satisfies the content-start gate
                 state.buffer_ = state.marker_prefix_ + std::string(decoded_bytes.substr(i + 1));
                 state.marker_prefix_.clear();
                 offset = decoded_bytes.size();
                 break;  // re-enter: the full candidate is now region text
             }
             if (status == ToolMarkerStatus::NotMarker) {
+                if (state.intent_ == ToolCallIntentPolicy::RequireToolAtContentStart &&
+                    !state.latched_once_) {
+                    // R7-02: a failed marker candidate before the first latch is visible content.
+                    state.entry_locked_ = true;
+                }
                 // F8: a breaking '<' starts a fresh candidate (shared split rule).
                 const std::size_t rescan_start = failed_marker_candidate_rescan_start(state.marker_prefix_);
                 state.marker_prefix_ = rescan_start == std::string_view::npos
