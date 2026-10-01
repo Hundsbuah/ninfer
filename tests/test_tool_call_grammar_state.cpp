@@ -5,6 +5,7 @@
 #include <vector>
 
 #include "models/qwen3_5/frontend/tool_call_grammar_state.h"
+#include "models/qwen3_5/frontend/tool_call_parser.h"
 
 namespace {
 
@@ -385,6 +386,114 @@ void test_marker_stream_and_constraint_latch_equivalence() {
     }
 }
 
+
+// R6-01 (Round 6 §3.6): the constraint CPU core follows the selected syntax mode. Native:
+// only the wrapped <tool_call> entry triggers; the compatibility-only top-level entries
+// (bare function/invoke, function_calls) are ordinary prose. Compatibility: all historical
+// top-level markers retain their baseline trigger behavior.
+void test_r6_constraint_syntax_mode_matrix() {
+    using Mode = ninfer::ToolCallSyntaxMode;
+    // Native mode: the complete wrapper triggers.
+    {
+        ToolCallGrammarConstraint constraint(64, Mode::QwenWrappedNative);
+        const ToolCallConstraintVerdict verdict = constraint.check("<tool_call>");
+        check(verdict == ToolCallConstraintVerdict::Allowed,
+              "r6-01 native: complete wrapper is a legal trigger prefix");
+        check(!constraint.active(), "r6-01 native: check leaves state untouched");
+        constraint.commit("<tool_call>");
+        check(constraint.active(), "r6-01 native: active after the complete wrapper");
+    }
+    // Native mode: every proper prefix of the wrapper stays NeedMore and never triggers.
+    {
+        const std::string_view full = "<tool_call>";
+        for (std::size_t length = 1; length < full.size(); ++length) {
+            ToolCallGrammarConstraint constraint(64, Mode::QwenWrappedNative);
+            const ToolCallConstraintVerdict verdict = constraint.check(full.substr(0, length));
+            check(verdict == ToolCallConstraintVerdict::NeedMore,
+                  "r6-01 native: wrapper prefix held as NeedMore");
+            check(!constraint.active(), "r6-01 native: wrapper prefix never triggers");
+        }
+    }
+    // Native mode: compatibility-only entries are unconstrained content, never active.
+    {
+        for (const std::string_view entry :
+             {std::string_view("<function=read>"), std::string_view("<invoke=read>"),
+              std::string_view("<function_calls>")}) {
+            ToolCallGrammarConstraint constraint(64, Mode::QwenWrappedNative);
+            const ToolCallConstraintVerdict verdict = constraint.check(entry);
+            check(verdict == ToolCallConstraintVerdict::Allowed,
+                  "r6-01 native: compatibility-only entry is unconstrained content");
+            check(!constraint.active(), "r6-01 native: compatibility-only entry never activates");
+            constraint.commit(entry);
+            check(!constraint.active(), "r6-01 native: still inactive after commit");
+        }
+    }
+    // Compatibility mode: every historical top-level marker retains the baseline verdicts.
+    {
+        for (const std::string_view entry :
+             {std::string_view("<tool_call>"), std::string_view("<function_calls>"),
+              std::string_view("<function=read>"), std::string_view("<invoke=read>")}) {
+            ToolCallGrammarConstraint constraint(64, Mode::Compatibility);
+            const ToolCallConstraintVerdict verdict = constraint.check(entry);
+            check(verdict == ToolCallConstraintVerdict::Allowed,
+                  "r6-01 compat: historical marker remains a legal trigger");
+            constraint.commit(entry);
+            check(constraint.active(), "r6-01 compat: historical marker activates");
+        }
+    }
+}
+
+// R6-01 (Round 6 §3.7): for each top-level entry, the parser's entry decision and the
+// constraint's trigger decision must agree in the same syntax mode (one syntax mode means
+// one syntax mode, R6-I1). CPU only: the one-shot parse is the shared incremental machine.
+void test_r6_constraint_parser_entry_cross_check() {
+    using Mode = ninfer::ToolCallSyntaxMode;
+    const ninfer::models::qwen3_5::frontend::ToolCallOutputContract contract;
+    struct Entry {
+        std::string_view marker;
+        std::string_view region;
+    };
+    const Entry entries[] = {
+        {"<tool_call>", "<tool_call>\n<function=read>\n</function>\n</tool_call>"},
+        {"<function_calls>",
+         "<function_calls>\n<function=read>\n</function>\n</function_calls>"},
+        {"<function=read>", "<function=read>\n</function>"},
+        {"<invoke=read>", "<invoke=read>\n</invoke>"},
+    };
+    for (const Mode mode : {Mode::QwenWrappedNative, Mode::Compatibility}) {
+        for (const Entry& entry : entries) {
+            const auto parsed = ninfer::models::qwen3_5::frontend::parse_qwen_tool_call_output(
+                entry.region, 64, contract, false, ninfer::FinishReason::StopToken, mode,
+                ninfer::ToolCallAmbiguityPolicy::PayloadFidelity);
+            ToolCallGrammarConstraint constraint(64, mode);
+            constraint.commit(entry.marker);
+            check(parsed.is_tool_call_response == constraint.active(),
+                  "r6-01 cross-check: parser and constraint entry decisions agree per mode");
+        }
+    }
+}
+
+// R6-01 (Round 6 §3.5): checkpoint/restore is value-semantic and must carry the syntax mode
+// with the state words: a restored native instance still treats a bare <function=...> as
+// ordinary prose (a future restore that copies buffer state but not policy state is caught).
+void test_r6_constraint_checkpoint_restore_preserves_syntax() {
+    using Mode = ninfer::ToolCallSyntaxMode;
+    ToolCallGrammarConstraint constraint(64, Mode::QwenWrappedNative);
+    constraint.commit("<tool_call>\n<function=read>\n");
+    check(constraint.active(), "r6-01 restore: active before checkpoint");
+    const ToolCallGrammarConstraint checkpoint = constraint.checkpoint();
+    constraint.commit("</function>\n</tool_call>");
+    check(!constraint.active(), "r6-01 restore: region closed");
+    constraint.restore(checkpoint);
+    check(constraint.active(), "r6-01 restore: active after restore");
+    constraint.commit("</function>\n</tool_call>\n");
+    check(!constraint.active(), "r6-01 restore: region re-closed after restore");
+    const ToolCallConstraintVerdict verdict = constraint.check("<function=read>");
+    check(verdict == ToolCallConstraintVerdict::Allowed,
+          "r6-01 restore: bare function stays content under the restored native mode");
+    check(!constraint.active(),
+          "r6-01 restore: restored native mode does not latch a bare function");
+}
 } // namespace
 
 int main() {
@@ -408,6 +517,9 @@ int main() {
     test_marker_breaking_angle_restarts_candidate();
     test_marker_stream_and_constraint_latch_equivalence();
     test_quoted_angle_bracket_in_header_keeps_candidate();
+    test_r6_constraint_syntax_mode_matrix();
+    test_r6_constraint_parser_entry_cross_check();
+    test_r6_constraint_checkpoint_restore_preserves_syntax();
     if (failures == 0) { std::puts("tool_call_grammar_state tests: all passed"); }
     return failures == 0 ? 0 : 1;
 }
