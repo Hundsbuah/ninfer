@@ -70,10 +70,20 @@ build_tool_call_output_contract(std::span<const std::string> tool_jsons, bool en
 // executability boundary: a missing function close never makes the call executable, whatever
 // its parameter values show; a cut parameter value of an open call is never committed), while
 // strict mode keeps its all-or-nothing behavior.
+// Parse Qwen's XML-like tool-call format. The parse itself is policy-free: it reports the
+// complete calls, the state of the open call, and where the input ended. The recovery policy
+// (decide_tool_call_recovery) then decides what may be committed: tolerant mode commits a
+// call only when its function close has been consumed (the function close is the
+// executability boundary: a missing function close never makes the call executable, whatever
+// its parameter values show; a cut parameter value of an open call is never committed), while
+// strict mode keeps its all-or-nothing behavior. R5-07: the syntax mode selects the top-level
+// entry set (native: the wrapped <tool_call> form only); the default keeps the historical
+// compatibility entry set for this low-level entry.
 [[nodiscard]] ParsedToolCallOutput
 parse_qwen_tool_call_output(const std::string& text, std::size_t max_tool_name_length,
                             const ToolCallOutputContract& contract, bool tolerant = false,
-                            FinishReason finish_reason = FinishReason::None);
+                            FinishReason finish_reason = FinishReason::None,
+                            ToolCallSyntaxMode syntax = ToolCallSyntaxMode::Compatibility);
 
 // Incrementally publishes bytes that are provably outside a possible terminal Qwen tool-call
 // suffix. At terminal time, valid calls are retained structurally; malformed output is restored
@@ -85,9 +95,11 @@ public:
         std::vector<GeneratedToolCall> tool_calls;
         ToolCallParseDiagnostics diagnostics;
     };
-
+    // R5-07: the syntax mode is stored with the decoder; the streaming session constructs the
+    // decoder from OutputOptions (the production Qwen3.8 default is the native mode).
     ToolCallOutputDecoder(std::shared_ptr<const ToolCallOutputContract> contract,
-                          std::size_t max_tool_name_length, bool tolerant = false);
+                          std::size_t max_tool_name_length, bool tolerant = false,
+                          ToolCallSyntaxMode syntax = ToolCallSyntaxMode::Compatibility);
 
     [[nodiscard]] std::string feed(std::string_view text);
     [[nodiscard]] Terminal finish(FinishReason finish_reason = FinishReason::None);
@@ -100,6 +112,7 @@ private:
     ToolCallStreamParser machine_{ToolCallParsePolicy{}};
     std::size_t max_tool_name_length_ = 0;
     bool tolerant_                    = false;
+    ToolCallSyntaxMode syntax_        = ToolCallSyntaxMode::QwenWrappedNative;
     bool finished_                    = false;
 };
 

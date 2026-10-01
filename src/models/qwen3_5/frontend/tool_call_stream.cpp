@@ -94,7 +94,8 @@ enum class FunctionCloseContinuation : std::uint8_t {
 
 FunctionCloseContinuation classify_function_close_continuation(std::string_view text,
                                                                std::size_t after,
-                                                               ToolWrapperKind wrapper) noexcept {
+                                                               ToolWrapperKind wrapper,
+                                                               ToolCallSyntaxMode syntax) noexcept {
     const std::size_t at = skip_ws(text, after);
     if (at >= text.size()) { return FunctionCloseContinuation::Legal; }
     if (wrapper == ToolWrapperKind::ToolCall) {
@@ -115,7 +116,8 @@ FunctionCloseContinuation classify_function_close_continuation(std::string_view 
     // prefixes agree on the previous call's boundary. A wrapper open inside an open
     // wrapper proves the close was payload (a nesting break, F5); only at top level
     // (wrapper == None) is a complete wrapper open a legal next entry.
-    const TopLevelEntryInfo entry = classify_top_level_entry(text, at);
+    const TopLevelEntryInfo entry =
+        classify_top_level_entry(text, at, syntax, wrapper != ToolWrapperKind::None);
     if (entry.kind == TopLevelEntry::NeedMore) {
         // A next entry in progress at the slice end (F4/I3).
         return FunctionCloseContinuation::Legal;
@@ -149,7 +151,8 @@ enum class CloseContinuation : std::uint8_t {
 
 CloseContinuation classify_close_continuation(std::string_view text, std::size_t after,
                                               ToolTagKind fn_family,
-                                              ToolWrapperKind wrapper) noexcept {
+                                              ToolWrapperKind wrapper,
+                                              ToolCallSyntaxMode syntax) noexcept {
     const std::size_t at = skip_ws(text, after);
     if (at >= text.size()) { return CloseContinuation::NeedMore; }
     ToolOpenTag opener = {};
@@ -162,7 +165,7 @@ CloseContinuation classify_close_continuation(std::string_view text, std::size_t
     }
     if (starts_with_at(text, at, tool_close_literal(fn_family))) {
         return classify_function_close_continuation(
-                   text, at + tool_close_literal(fn_family).size(), wrapper) ==
+                   text, at + tool_close_literal(fn_family).size(), wrapper, syntax) ==
                    FunctionCloseContinuation::Legal
                    ? CloseContinuation::Complete
                    : CloseContinuation::Invalid;
@@ -384,7 +387,8 @@ Stage2Verdict run_stage2_base(Stage2Context& cx, std::size_t base, Stage2Path& p
                 if (cx.budget.charge()) { return Stage2Verdict::Exhausted; } // one unit per candidate
                 if (skipped_viable && (c == 0 || cx.text[c - 1] != '\n')) { continue; } // canonical framing
                 const std::size_t after = c + tool_close_literal(s.param_family).size();
-                if (classify_close_continuation(cx.text, after, s.fn_family, s.wrapper) ==
+                if (classify_close_continuation(cx.text, after, s.fn_family, s.wrapper,
+                                                cx.policy.syntax) ==
                     CloseContinuation::Invalid) {
                     continue;
                 }
@@ -520,7 +524,8 @@ ToolCallParseProgress parse_region_at(std::string_view text, const ToolCallParse
             // R2-I4 (CR4): top-level entries are classified by the shared classifier, the
             // same authority the function-close continuation lookahead consumes, so complete
             // and partial next entries agree on the previous call's boundary.
-            const TopLevelEntryInfo entry = classify_top_level_entry(text, i);
+            const TopLevelEntryInfo entry =
+                classify_top_level_entry(text, i, policy.syntax, s.wrapper != ToolWrapperKind::None);
             if (entry.kind == TopLevelEntry::Entry &&
                 (entry.tag == ToolTagKind::ToolCall || entry.tag == ToolTagKind::FunctionCalls)) {
                 if (s.wrapper != ToolWrapperKind::None) {
@@ -773,7 +778,8 @@ ToolCallParseProgress parse_region_at(std::string_view text, const ToolCallParse
                     return out;
                 }
                 const CloseContinuation continuation = classify_close_continuation(
-                    text, candidate + required_close.size(), s.fn_family, s.wrapper);
+                    text, candidate + required_close.size(), s.fn_family, s.wrapper,
+                    policy.syntax);
                 if (continuation == CloseContinuation::Invalid) {
                     // A quoted closer (echoed markup, command text): keep scanning.
                     scan = candidate + required_close.size();
@@ -960,7 +966,8 @@ bool ToolCallStreamParser::marker_byte(char byte, std::string& visible) {
     if (!marker_prefix_.empty()) {
         marker_prefix_.push_back(byte);
         ToolOpenTag marker = {};
-        const ToolMarkerStatus state = classify_tool_marker_prefix(marker_prefix_, marker);
+        const ToolMarkerStatus state = classify_tool_marker_prefix(marker_prefix_, marker,
+                                                                  policy_.syntax);
         if (state == ToolMarkerStatus::Complete) {
             latch(marker_prefix_);
             return true;
@@ -1054,6 +1061,8 @@ namespace {
 struct ShadowMarkerScan {
     std::string candidate;
     std::uint32_t complete = 0;
+    explicit ShadowMarkerScan(ToolCallSyntaxMode syntax) : syntax_(syntax) {}
+    ToolCallSyntaxMode syntax_;
     void consume(char byte) {
         if (candidate.empty()) {
             if (byte == '<') { candidate.push_back(byte); }
@@ -1061,7 +1070,7 @@ struct ShadowMarkerScan {
         }
         candidate.push_back(byte);
         ToolOpenTag marker = {};
-        const ToolMarkerStatus state = classify_tool_marker_prefix(candidate, marker);
+        const ToolMarkerStatus state = classify_tool_marker_prefix(candidate, marker, syntax_);
         if (state == ToolMarkerStatus::Complete) {
             ++complete;
             candidate.clear();
@@ -1086,11 +1095,12 @@ std::vector<char> fence_mask(std::string_view region) {
 }
 
 FenceDiagnostics compute_fence_diagnostics(std::string_view pre_latch,
-                                           std::string_view region) {
+                                           std::string_view region,
+                                           ToolCallSyntaxMode syntax) {
     FenceDiagnostics diagnostics;
     auto scan = [&](std::string_view bytes) {
         ToolCallStreamParser::FenceTracker tracker;
-        ShadowMarkerScan shadow;
+        ShadowMarkerScan shadow(syntax);
         for (const char byte : bytes) {
             if (tracker.consume(byte) == ToolCallStreamParser::FenceTracker::Verdict::Content) {
                 shadow.consume(byte);
@@ -1113,12 +1123,14 @@ ToolCallStreamResult ToolCallStreamParser::finish(FinishReason finish_reason) co
     // part is added only on the paths that return the region as text (Stage-2 ambiguity and
     // the final reject), so accepting paths no longer scan the accepted call's values.
     const std::string pre_latch = content_ + pending_ws_ + marker_prefix_;
-    FenceDiagnostics fence_diag = compute_fence_diagnostics(pre_latch, std::string_view{});
+    FenceDiagnostics fence_diag = compute_fence_diagnostics(pre_latch, std::string_view{},
+                                                            policy_.syntax);
     if (latched_) { fence_diag.ended_in_unclosed_fence = false; }
     result.fenced_markers_suppressed = fence_diag.suppressed_markers;
     result.ended_in_unclosed_fence   = fence_diag.ended_in_unclosed_fence;
     auto add_region_fence_part = [&result, this]() {
-        const FenceDiagnostics region_diag = compute_fence_diagnostics(std::string_view{}, region_);
+        const FenceDiagnostics region_diag =
+            compute_fence_diagnostics(std::string_view{}, region_, policy_.syntax);
         result.fenced_markers_suppressed += region_diag.suppressed_markers;
         result.ended_in_unclosed_fence   = result.ended_in_unclosed_fence ||
                                            region_diag.ended_in_unclosed_fence;
@@ -1198,15 +1210,16 @@ ToolCallStreamResult ToolCallStreamParser::finish(FinishReason finish_reason) co
         // the break byte when the break proved itself deeper in the structure.
         ToolOpenTag entry_marker = {};
         const ToolMarkerStatus entry_status =
-            classify_tool_marker_prefix(std::string_view(region_).substr(base), entry_marker);
+            classify_tool_marker_prefix(std::string_view(region_).substr(base), entry_marker,
+                                        policy_.syntax);
         const std::size_t entry_end =
             base + (entry_status == ToolMarkerStatus::Complete ? entry_marker.consumed : 1);
         // R3-04: never base + 1 — EndOfInput retries from the break offset (the open
         // value's start when a value is open, the input-end position otherwise).
         const std::size_t from = std::max(last.progress.break_offset, entry_end);
-        std::size_t next = find_tool_marker(region_, from);
+        std::size_t next = find_tool_marker(region_, from, policy_.syntax);
         while (next != std::string_view::npos && fenced[next]) {
-            next = find_tool_marker(region_, next + 1); // R3-06: skip fenced markers
+            next = find_tool_marker(region_, next + 1, policy_.syntax); // R3-06: skip fenced markers
         }
         if (next == std::string_view::npos || next <= base) { break; }
         base = next;

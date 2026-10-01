@@ -82,6 +82,12 @@ struct ToolCallParsePolicy {
     // default max(100000, 4 x region bytes); a positive value overrides it (tests pin the
     // fail-closed behavior with a tiny budget).
     std::uint64_t stage2_step_budget = 0;
+    // R5-07: the top-level entry syntax (ToolCallSyntaxMode). Native latches only the wrapped
+    // "<tool_call>" entry; compatibility keeps the legacy bare/function_calls top-level forms.
+    // The product boundary (OutputOptions) defaults to QwenWrappedNative for the Qwen3.8
+    // production path; this internal default keeps the parser entry API at the historical
+    // compatibility behavior for existing callers.
+    ToolCallSyntaxMode syntax = ToolCallSyntaxMode::Compatibility;
 };
 // Objective parse outcome of one tool region (P3.1): what was safely recognized, where the
 // input ended, which state was complete and which was incomplete. It carries no policy
@@ -273,7 +279,8 @@ struct FenceDiagnostics {
     bool ended_in_unclosed_fence = false;
 };
 [[nodiscard]] FenceDiagnostics compute_fence_diagnostics(std::string_view pre_latch,
-                                                         std::string_view region);
+                                                         std::string_view region,
+                                                         ToolCallSyntaxMode syntax);
 
 class ToolCallStreamParser {
 public:

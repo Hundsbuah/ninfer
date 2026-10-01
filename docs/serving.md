@@ -271,7 +271,10 @@ followed by a line break or the end of the turn, so a marker the model quotes wh
 by a space, punctuation or an escaped `
 `) stays in the reasoning channel.
 
-By default the parser keeps that all-or-nothing behaviour. Strict and tolerant parsing run the same
+By default the parser keeps that all-or-nothing behaviour and parses the native syntax: the only
+executable top-level entry is the wrapped `<tool_call>` form, while `<function_calls>`, bare
+`<function=...>` and `<invoke=...>` are ordinary text at top level (`--tool-call-syntax compat`
+restores the wider historical entry set). Strict and tolerant parsing run the same
 Stage-2 consistent-completion pass; tolerant mode only changes what a syntax break or a cut-off tail
 may commit, and it never authorizes a tool name outside the declared tools — an undeclared call is a
 break in both modes and is never returned as a structured call. With `--tolerant-tool-calls` a
@@ -974,6 +977,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--no-thinking` | disable thinking by default | thinking on |
 | `--preserve-thinking` | preserve closed-turn assistant reasoning by default | off |
 | `--tolerant-tool-calls` | keep function-closed Qwen calls before a cut-off or malformed tail when the recovery policy proves them independent of the missing bytes; never an open value, and an undeclared tool/name is never returned as a call | off |
+| `--tool-call-syntax` | top-level tool-call syntax: `qwen-wrapped` (default; latches only the wrapped `<tool_call>` entry) or `compat` (also accepts the legacy bare `<function=...>`/`<invoke=...>` and `<function_calls>` top-level entries) | `qwen-wrapped` |
 | `--cors` | permissive browser CORS headers | off |
 | `--usage-chunk-choice` | give the streamed usage chunk a zero-delta choice, for strict client parsers that reject the OpenAI-conformant empty `choices` array | off |
 | `--temperature F` | process-level temperature override | unset |

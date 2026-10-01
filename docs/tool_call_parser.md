@@ -147,6 +147,24 @@ per region byte, at least 100 000); a region that exhausts it is returned as tex
 the example as the turn (R3-04), and a degenerate output made only of prose and unfenced complete
 examples commits its last example in strict mode.
 
+## Native and compatibility syntax
+
+The top-level entry syntax is the output contract's `ToolCallSyntaxMode` (serving:
+`--tool-call-syntax`; the production Qwen3.8 default is the native mode):
+
+- `QwenWrappedNative`: the only executable top-level entry is the wrapped `<tool_call>` form.
+  `<function_calls>`, bare `<function=...>` and `<invoke=...>` are ordinary text at top level.
+  Inside the wrapper, the canonical `<function=...>` / `<parameter=...>` tags are unchanged.
+- `Compatibility`: the wider historical entry set — the `<tool_call>` and `<function_calls>`
+  wrappers and bare `<function=...>` / `<invoke=...>` openers all latch as top-level tool
+  regions.
+
+The mode is a single grammar decision shared by the streaming pre-latch scan, the marker
+retry search, and the top-level entry transitions after a closed wrapper; the Phase-4
+constraint core tracks the compatibility superset. It is an explicit configuration choice,
+never inferred from template filenames or other metadata substrings, and a canonical wrapped
+Qwen3.8 call parses identically in both modes.
+
 ## Constrained tool decoding
 
 `--constrained-tool-decoding off|tool-calls-only` (default `off`) reserves
@@ -159,7 +177,8 @@ implemented and tested (it tracks the marker trigger, advances on decoded bytes,
 re-validates the open region with the same strict parser in prefix mode), but the sampling
 integration and its GPU verification are not part of the delivered scope, so malformed native tool
 syntax can still be generated: the parser is the post-generation consistency boundary, not a
-generator constraint. Selecting
+generator constraint. Selecting `tool-calls-only` therefore fails at engine startup — before any
+device work, on the CLI
 and the server alike — with
 `--constrained-tool-decoding=tool-calls-only is not implemented in this build; use off`;
 `off` is accepted and leaves the sampling path bit-identical. The design and the

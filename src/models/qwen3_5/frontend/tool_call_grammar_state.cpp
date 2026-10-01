@@ -32,6 +32,9 @@ ToolCallParsePolicy ToolCallGrammarConstraint::parse_policy() const {
     // concern, not wire syntax.
     policy.tolerant = false;
     policy.enforce_declared_names = false;
+    // R5-07: the constraint trigger tracks the compatibility superset; the region re-parse
+    // must use the same entry set or a compatibility latch would be re-read as prose.
+    policy.syntax = ToolCallSyntaxMode::Compatibility;
     return policy;
 }
 
@@ -90,7 +93,8 @@ ToolCallGrammarConstraint::advance(std::string_view decoded_bytes, ToolCallGramm
             }
             state.marker_prefix_.push_back(byte);
             ToolOpenTag marker = {};
-            const ToolMarkerStatus status = classify_tool_marker_prefix(state.marker_prefix_, marker);
+            const ToolMarkerStatus status = classify_tool_marker_prefix(state.marker_prefix_, marker,
+                                                                        ToolCallSyntaxMode::Compatibility);
             if (status == ToolMarkerStatus::Complete) {
                 state.triggered_ = true;
                 state.buffer_ = state.marker_prefix_ + std::string(decoded_bytes.substr(i + 1));
@@ -114,7 +118,8 @@ ToolCallGrammarConstraint::advance(std::string_view decoded_bytes, ToolCallGramm
     // The candidate ended inside a marker trigger: the grammar cannot decide yet.
     if (!state.triggered_ && !state.marker_prefix_.empty()) {
         ToolOpenTag marker = {};
-        if (classify_tool_marker_prefix(state.marker_prefix_, marker) == ToolMarkerStatus::NeedMore) {
+        if (classify_tool_marker_prefix(state.marker_prefix_, marker,
+                                        ToolCallSyntaxMode::Compatibility) == ToolMarkerStatus::NeedMore) {
             return ToolCallConstraintVerdict::NeedMore;
         }
     }

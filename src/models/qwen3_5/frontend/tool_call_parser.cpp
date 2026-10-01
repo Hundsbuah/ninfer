@@ -467,7 +467,8 @@ ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text,
                                                  std::size_t max_tool_name_length,
                                                  const ToolCallOutputContract& contract,
                                                  bool tolerant,
-                                                 FinishReason finish_reason) {
+                                                 FinishReason finish_reason,
+                                                 ToolCallSyntaxMode syntax) {
     ToolCallParsePolicy policy;
     policy.max_name_length        = max_tool_name_length;
     policy.tolerant               = tolerant;
@@ -475,6 +476,7 @@ ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text,
     policy.declared_check         = declared_tool_name_check;
     policy.contract               = &contract;
     policy.parameter_plausible    = declared_parameter_plausible;
+    policy.syntax                 = syntax;
 
     // One-shot and streaming share the same incremental parser: this feeds the whole output
     // and finishes once; the streaming decoder feeds chunks of the same machine.
@@ -594,9 +596,14 @@ ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text,
 }
 
 ToolCallOutputDecoder::ToolCallOutputDecoder(std::shared_ptr<const ToolCallOutputContract> contract,
-                                             std::size_t max_tool_name_length, bool tolerant)
+                                             std::size_t max_tool_name_length, bool tolerant,
+                                             ToolCallSyntaxMode syntax)
     : contract_(std::move(contract)), max_tool_name_length_(max_tool_name_length),
-      tolerant_(tolerant) {}
+      tolerant_(tolerant), syntax_(syntax) {
+    ToolCallParsePolicy machine_policy;
+    machine_policy.syntax = syntax_;
+    machine_ = ToolCallStreamParser(machine_policy);
+}
 
 std::string ToolCallOutputDecoder::feed(std::string_view text) {
     if (finished_) { throw std::logic_error("tool-call output decoder is already finished"); }
@@ -613,14 +620,15 @@ ToolCallOutputDecoder::Terminal ToolCallOutputDecoder::finish(FinishReason finis
     std::string region;
     if (machine_.latched()) { region.assign(machine_.latched_region()); }
     ParsedToolCallOutput parsed = parse_qwen_tool_call_output(region, max_tool_name_length_,
-                                                              *contract_, tolerant_, finish_reason);
+                                                              *contract_, tolerant_, finish_reason,
+                                                              syntax_);
     // R3-06: the entry re-parse sees only the region; the pre-latch fence diagnostic comes
     // from this machine (the same pre-latch bytes, deterministic over the byte stream).
     // N-06: apply the same latch rule as the one-shot entry — a latch only happens outside a
     // fence, so the pre-latch stream cannot end inside one; force its unclosed-fence flag to
     // false when latched so streaming stays equal to one-shot.
     FenceDiagnostics pre_fence = compute_fence_diagnostics(
-        machine_.content_prefix() + machine_.held_tail(), std::string_view{});
+        machine_.content_prefix() + machine_.held_tail(), std::string_view{}, syntax_);
     if (machine_.latched()) { pre_fence.ended_in_unclosed_fence = false; }
     parsed.diagnostics.fenced_markers_suppressed += pre_fence.suppressed_markers;
     parsed.diagnostics.ended_in_unclosed_fence   |= pre_fence.ended_in_unclosed_fence;

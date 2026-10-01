@@ -59,6 +59,10 @@ struct ServeOptions {
     std::optional<bool> preserve_thinking;
     // Recover complete Qwen calls with malformed wrapper/suffix output (opt-in; strict by default).
     bool tolerant_tool_calls = false;
+    // R5-07: --tool-call-syntax qwen-wrapped|compat: the top-level tool-call syntax the parser
+    // accepts. qwen-wrapped (default) latches only the wrapped <tool_call> entry; compat keeps
+    // the legacy bare <function=...>/<invoke=...> and <function_calls> top-level entries.
+    ToolCallSyntaxMode tool_call_syntax = ToolCallSyntaxMode::QwenWrappedNative;
     std::optional<std::uint32_t> default_thinking_budget;
     // End-of-thinking message fed to the model when it hits the thinking budget; empty
     // preserves the model's built-in control suffix.

@@ -728,6 +728,29 @@ int main() {
     failures += check(tolerant_help.find("keep a final call cut by the output") ==
                           std::string::npos,
                       "R5-05: the help must not claim an output-budget cut keeps a call");
+    // R5-07: --tool-call-syntax qwen-wrapped|compat.
+    failures += check(parse({"ninfer-serve", "model.ninfer"}).tool_call_syntax ==
+                          ninfer::ToolCallSyntaxMode::QwenWrappedNative,
+                      "R5-07: the serving syntax mode must default to qwen-wrapped");
+    const auto compat_syntax =
+        parse({"ninfer-serve", "model.ninfer", "--tool-call-syntax", "compat"});
+    failures += check(compat_syntax.tool_call_syntax == ninfer::ToolCallSyntaxMode::Compatibility,
+                      "R5-07: --tool-call-syntax compat must reach serving options");
+    const auto wrapped_syntax =
+        parse({"ninfer-serve", "model.ninfer", "--tool-call-syntax", "qwen-wrapped"});
+    failures += check(
+        wrapped_syntax.tool_call_syntax == ninfer::ToolCallSyntaxMode::QwenWrappedNative,
+        "R5-07: --tool-call-syntax qwen-wrapped must reach serving options");
+    bool bad_syntax_rejected = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--tool-call-syntax", "auto"});
+    } catch (const std::invalid_argument&) {
+        bad_syntax_rejected = true;
+    }
+    failures += check(bad_syntax_rejected,
+                      "R5-07: an unknown --tool-call-syntax value must be rejected");
+    failures += check(tolerant_help.find("--tool-call-syntax") != std::string::npos,
+                      "R5-07: the serve help must document --tool-call-syntax");
 
     const ServeOptions inherited = parse(
         {"ninfer-serve", "model.ninfer", "--max-context", "16384", "--use-original-prefix-caching"});

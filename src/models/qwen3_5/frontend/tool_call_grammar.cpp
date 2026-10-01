@@ -212,8 +212,25 @@ ToolHeaderStatus parse_tool_parameter_open(std::string_view text, ToolOpenTag& o
     return parse_tool_open_header(text, ToolTagKind::Param, out);
 }
 
-ToolMarkerStatus classify_tool_marker_prefix(std::string_view text, ToolOpenTag& out) noexcept {
-    const std::string_view tool_call      = tool_open_literal(ToolTagKind::ToolCall);
+ToolMarkerStatus classify_tool_marker_prefix(std::string_view text, ToolOpenTag& out,
+                                             ToolCallSyntaxMode syntax) noexcept {
+    const std::string_view tool_call = tool_open_literal(ToolTagKind::ToolCall);
+    if (syntax == ToolCallSyntaxMode::QwenWrappedNative) {
+        // R5-07: the native entry marker set is exactly the wrapped literal; the legacy
+        // bare/function_calls forms are ordinary text at top level.
+        if (!text.empty()) {
+            if (text.size() >= tool_call.size()) {
+                if (text.substr(0, tool_call.size()) == tool_call) {
+                    out.kind     = ToolTagKind::ToolCall;
+                    out.consumed = tool_call.size();
+                    return ToolMarkerStatus::Complete;
+                }
+                return ToolMarkerStatus::NotMarker;
+            }
+            if (is_literal_prefix(text, tool_call)) { return ToolMarkerStatus::NeedMore; }
+        }
+        return ToolMarkerStatus::NotMarker;
+    }
     const std::string_view function_calls = tool_open_literal(ToolTagKind::FunctionCalls);
     if (!text.empty() && text[0] == '<') {
         if (text.size() >= tool_call.size()) {
@@ -241,7 +258,12 @@ ToolMarkerStatus classify_tool_marker_prefix(std::string_view text, ToolOpenTag&
     return ToolMarkerStatus::NotMarker;
 }
 
-std::size_t find_tool_marker(std::string_view text, std::size_t search_from) noexcept {
+std::size_t find_tool_marker(std::string_view text, std::size_t search_from,
+                             ToolCallSyntaxMode syntax) noexcept {
+    if (syntax == ToolCallSyntaxMode::QwenWrappedNative) {
+        // R5-07: the wrapped literal is the only complete native marker.
+        return text.find(tool_open_literal(ToolTagKind::ToolCall), search_from);
+    }
     for (std::size_t index = search_from; index < text.size(); ++index) {
         if (text[index] != '<') { continue; }
         if (index + 1 < text.size()) {
@@ -251,14 +273,17 @@ std::size_t find_tool_marker(std::string_view text, std::size_t search_from) noe
             }
         }
         ToolOpenTag marker = {};
-        if (classify_tool_marker_prefix(text.substr(index), marker) == ToolMarkerStatus::Complete) {
+        if (classify_tool_marker_prefix(text.substr(index), marker, syntax) ==
+            ToolMarkerStatus::Complete) {
             return index;
         }
     }
     return std::string_view::npos;
 }
 
-TopLevelEntryInfo classify_top_level_entry(std::string_view text, std::size_t at) noexcept {
+TopLevelEntryInfo classify_top_level_entry(std::string_view text, std::size_t at,
+                                           ToolCallSyntaxMode syntax, bool inside_wrapper)
+    noexcept {
     TopLevelEntryInfo info;
     std::size_t i = at;
     skip_ws(text, i);
@@ -270,18 +295,27 @@ TopLevelEntryInfo classify_top_level_entry(std::string_view text, std::size_t at
     const std::string_view tool_call      = tool_open_literal(ToolTagKind::ToolCall);
     const std::string_view function_calls = tool_open_literal(ToolTagKind::FunctionCalls);
     if (rest.size() >= tool_call.size() && rest.substr(0, tool_call.size()) == tool_call) {
-        info.kind          = TopLevelEntry::Entry;
-        info.tag           = ToolTagKind::ToolCall;
-        info.opener.kind   = ToolTagKind::ToolCall;
-        info.opener.consumed = tool_call.size();
+        info.kind             = TopLevelEntry::Entry;
+        info.tag              = ToolTagKind::ToolCall;
+        info.opener.kind      = ToolTagKind::ToolCall;
+        info.opener.consumed  = tool_call.size();
         return info;
+    }
+    if (syntax == ToolCallSyntaxMode::QwenWrappedNative && !inside_wrapper) {
+        // R5-07: at true top level the compatibility entries (function_calls, bare
+        // function/invoke) are ordinary text; inside an open wrapper the canonical
+        // function/parameter syntax is unchanged.
+        const bool strict_prefix =
+            rest.size() < tool_call.size() && tool_call.compare(0, rest.size(), rest) == 0;
+        if (strict_prefix) { info.kind = TopLevelEntry::NeedMore; }
+        return info; // NoEntry otherwise
     }
     if (rest.size() >= function_calls.size() &&
         rest.substr(0, function_calls.size()) == function_calls) {
-        info.kind          = TopLevelEntry::Entry;
-        info.tag           = ToolTagKind::FunctionCalls;
-        info.opener.kind   = ToolTagKind::FunctionCalls;
-        info.opener.consumed = function_calls.size();
+        info.kind             = TopLevelEntry::Entry;
+        info.tag              = ToolTagKind::FunctionCalls;
+        info.opener.kind      = ToolTagKind::FunctionCalls;
+        info.opener.consumed  = function_calls.size();
         return info;
     }
     ToolOpenTag opener = {};

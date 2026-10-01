@@ -226,6 +226,10 @@ std::string serve_usage_text(const char* argv0) {
            "                             independent of the missing bytes; never an open value;\n"
            "                             undeclared tool/name is never returned as a call\n"
            "                             (strict by default)\n"
+           "  --tool-call-syntax MODE    top-level tool-call syntax: qwen-wrapped (default;\n"
+           "                             latches only the wrapped <tool_call> entry) or compat\n"
+           "                             (also accepts the legacy bare <function=...>/\n"
+           "                             <invoke=...> and <function_calls> entries)\n"
            "\n"
            "NETWORKING & RESOURCES\n"
            "  --host H                   listen address (default 127.0.0.1)\n"
@@ -576,6 +580,16 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.preserve_thinking = true;
         } else if (arg == "--tolerant-tool-calls") {
             options.tolerant_tool_calls = true;
+        } else if (arg == "--tool-call-syntax") {
+            const std::string value = require_value("--tool-call-syntax");
+            if (value == "qwen-wrapped") {
+                options.tool_call_syntax = ToolCallSyntaxMode::QwenWrappedNative;
+            } else if (value == "compat") {
+                options.tool_call_syntax = ToolCallSyntaxMode::Compatibility;
+            } else {
+                throw std::invalid_argument(
+                    "--tool-call-syntax must be qwen-wrapped or compat");
+            }
         } else if (arg == "--cors") {
             options.enable_cors = true;
         } else if (arg == "--usage-chunk-choice") {

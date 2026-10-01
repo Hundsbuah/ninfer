@@ -1,5 +1,7 @@
 #pragma once
 
+#include "ninfer/types.h"
+
 #include <cstddef>
 #include <cstdint>
 #include <string_view>
@@ -150,16 +152,19 @@ parse_tool_header_after_keyword(std::string_view text, ToolTagKind kind, ToolOpe
 [[nodiscard]] ToolHeaderStatus parse_tool_parameter_open(std::string_view text, ToolOpenTag& out)
     noexcept;
 
-// Classify a top-level tool-region marker prefix. `text` starts at the marker's '<'.
-// Complete: the full `<tool_call>` / `<function_calls>` literal or a syntactically complete
-// function/invoke opener header (bare openers count; name validity is the region parser's job).
+// Classify a top-level tool-region marker prefix. `text` starts at the marker's '<'. In
+// QwenWrappedNative syntax only the wrapped `<tool_call>` literal latches (R5-07); in
+// Compatibility syntax a complete top-level marker is the `<tool_call>` / `<function_calls>`
+// literal or a syntactically complete function/invoke opener header (bare openers count;
+// name validity is the region parser's job).
 [[nodiscard]] ToolMarkerStatus
-classify_tool_marker_prefix(std::string_view text, ToolOpenTag& out) noexcept;
+classify_tool_marker_prefix(std::string_view text, ToolOpenTag& out,
+                            ToolCallSyntaxMode syntax) noexcept;
 
-// First position at or after `search_from` at which a complete top-level marker starts,
-// or npos.
-[[nodiscard]] std::size_t find_tool_marker(std::string_view text, std::size_t search_from = 0)
-    noexcept;
+// First position at or after `search_from` at which a complete top-level marker starts for the
+// given syntax mode, or npos.
+[[nodiscard]] std::size_t find_tool_marker(std::string_view text, std::size_t search_from,
+                                           ToolCallSyntaxMode syntax) noexcept;
 
 // R2-I4 (CR4): the single top-level entry classification. The region parser's Top state and the
 // function-close continuation lookahead both consume this, so a complete next entry and its
@@ -179,9 +184,13 @@ struct TopLevelEntryInfo {
     ToolOpenTag opener; // the parsed entry (function/invoke: name and consumed bytes)
 };
 
-// What a byte sequence at a top-level position is: a wrapper literal, a complete function/
-// invoke opener, a strict prefix of either at the input end, the input end itself, or nothing.
-[[nodiscard]] TopLevelEntryInfo classify_top_level_entry(std::string_view text,
-                                                         std::size_t at) noexcept;
+// What a byte sequence at a top-level position is, for the given syntax mode and wrapper
+// context: a wrapper literal, a complete function/invoke opener (compatibility mode, or
+// inside an open wrapper where the canonical syntax is unchanged), a strict prefix of a legal
+// top-level entry at the input end, the input end itself, or nothing. R5-07: in native syntax
+// the compatibility entries are ordinary text only at true top level (inside_wrapper false).
+[[nodiscard]] TopLevelEntryInfo classify_top_level_entry(std::string_view text, std::size_t at,
+                                                         ToolCallSyntaxMode syntax,
+                                                         bool inside_wrapper) noexcept;
 
 } // namespace ninfer::models::qwen3_5::frontend

@@ -237,8 +237,9 @@ int test_marker_prefixes() {
     for (const char* text : {"<tool_call>", "<function_calls>", "<function=write>",
                              "<function name=\"write\">", "<invoke=write>", "<function>",
                              "<function=\"write\">", "<function=very-long-tool-name-0123456789>"}) {
-        expect_marker(classify_tool_marker_prefix(text, marker), ToolMarkerStatus::Complete,
-                      "complete marker", text);
+        expect_marker(
+            classify_tool_marker_prefix(text, marker, ninfer::ToolCallSyntaxMode::Compatibility),
+            ToolMarkerStatus::Complete, "complete marker", text);
     }
     for (const char* text : {"<", "<t", "<to", "<tool_call", "<function", "<function=",
                              "<function=w", "<function=write", "<function name",
@@ -246,39 +247,79 @@ int test_marker_prefixes() {
                              "<function name=\"write", "<invoke", "<invoke=", "<function_c",
                              "<function_ca", "<function_call", "<function_calls", "<function\t",
                              "<function\tname=\"write\"", "<function\n", "<function name=\"w"}) {
-        expect_marker(classify_tool_marker_prefix(text, marker), ToolMarkerStatus::NeedMore,
-                      "marker prefix needs more", text);
+        expect_marker(
+            classify_tool_marker_prefix(text, marker, ninfer::ToolCallSyntaxMode::Compatibility),
+            ToolMarkerStatus::NeedMore, "marker prefix needs more", text);
     }
     for (const char* text : {"<foo=bar>", "<functionx=write>", "<function\"x\">",
                              "<parameter=content>", "<param=content>", "<function_call>",
                              "<function#write>"}) {
-        expect_marker(classify_tool_marker_prefix(text, marker), ToolMarkerStatus::NotMarker,
-                      "not a marker", text);
+        expect_marker(
+            classify_tool_marker_prefix(text, marker, ninfer::ToolCallSyntaxMode::Compatibility),
+            ToolMarkerStatus::NotMarker, "not a marker", text);
     }
+    // R5-07: in native syntax only the wrapped <tool_call> literal latches at top level;
+    // the legacy bare/function_calls forms are ordinary text.
+    for (const char* text : {"<function=write>", "<function name=\"write\">", "<invoke=write>",
+                             "<function>", "<function_calls>", "<function_call>"}) {
+        expect_marker(
+            classify_tool_marker_prefix(text, marker, ninfer::ToolCallSyntaxMode::QwenWrappedNative),
+            ToolMarkerStatus::NotMarker, "native: compatibility entry is not a marker", text);
+    }
+    expect_marker(classify_tool_marker_prefix("<tool_call>", marker,
+                                              ninfer::ToolCallSyntaxMode::QwenWrappedNative),
+                  ToolMarkerStatus::Complete, "native: wrapped entry latches", "<tool_call>");
+    expect_marker(classify_tool_marker_prefix("<tool_call", marker,
+                                              ninfer::ToolCallSyntaxMode::QwenWrappedNative),
+                  ToolMarkerStatus::NeedMore, "native: wrapped prefix needs more", "<tool_call");
+    expect_marker(classify_tool_marker_prefix("<", marker,
+                                              ninfer::ToolCallSyntaxMode::QwenWrappedNative),
+                  ToolMarkerStatus::NeedMore, "native: bare '<' may still be the wrapper", "<");
+    expect_marker(classify_tool_marker_prefix("<function", marker,
+                                              ninfer::ToolCallSyntaxMode::QwenWrappedNative),
+                  ToolMarkerStatus::NotMarker, "native: '<function' cannot become the wrapper",
+                  "<function");
     return 0;
 }
 
 int test_marker_discovery() {
     const std::string_view none = "plain prose without markers";
-    check(find_tool_marker(none) == std::string_view::npos, "no marker in prose");
+    check(find_tool_marker(none, 0, ninfer::ToolCallSyntaxMode::Compatibility) == std::string_view::npos,
+          "no marker in prose");
+    check(find_tool_marker(none, 0, ninfer::ToolCallSyntaxMode::QwenWrappedNative) == std::string_view::npos,
+          "native: no marker in prose");
 
     const std::string_view early = "prefix <function=write> rest";
-    check(find_tool_marker(early) == 7, "marker position found");
+    check(find_tool_marker(early, 0, ninfer::ToolCallSyntaxMode::Compatibility) == 7,
+          "marker position found");
+    check(find_tool_marker(early, 0, ninfer::ToolCallSyntaxMode::QwenWrappedNative) == std::string_view::npos,
+          "R5-07: native discovery ignores the bare function entry");
 
     const std::string_view later = "prose then <tool_call> wrapper";
-    check(find_tool_marker(later) == 11, "wrapper position found");
+    check(find_tool_marker(later, 0, ninfer::ToolCallSyntaxMode::Compatibility) == 11,
+          "wrapper position found");
+    check(find_tool_marker(later, 0, ninfer::ToolCallSyntaxMode::QwenWrappedNative) == 11,
+          "native: the wrapped entry is discovered");
 
     const std::string_view after = "<function=write> tail <invoke=other>";
-    check(find_tool_marker(after) == 0, "earliest marker wins");
-    check(find_tool_marker(after, 1) == 22, "search from position");
+    check(find_tool_marker(after, 0, ninfer::ToolCallSyntaxMode::Compatibility) == 0,
+          "earliest marker wins");
+    check(find_tool_marker(after, 1, ninfer::ToolCallSyntaxMode::Compatibility) == 22,
+          "search from position");
+    check(find_tool_marker(after, 0, ninfer::ToolCallSyntaxMode::QwenWrappedNative) == std::string_view::npos,
+          "R5-07: native discovery finds nothing in compatibility-only entries");
 
     // A quoted opener inside prose is a complete marker too: discovery is syntax only, and
     // identity/declaredness is a policy decision made later by the region parser.
     const std::string_view quoted = "see <function=shell> and the real <tool_call>";
-    check(find_tool_marker(quoted) == 4, "quoted opener is discovered first");
+    check(find_tool_marker(quoted, 0, ninfer::ToolCallSyntaxMode::Compatibility) == 4,
+          "quoted opener is discovered first");
+    check(find_tool_marker(quoted, 0, ninfer::ToolCallSyntaxMode::QwenWrappedNative) == 34,
+          "native: only the wrapped entry is discovered");
 
     const std::string_view parameter_only = "text <parameter=content> more";
-    check(find_tool_marker(parameter_only) == std::string_view::npos,
+    check(find_tool_marker(parameter_only, 0, ninfer::ToolCallSyntaxMode::Compatibility) ==
+              std::string_view::npos,
           "parameter opener is not a top-level marker");
     return 0;
 }

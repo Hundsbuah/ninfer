@@ -4036,8 +4036,77 @@ int test_round4_r1_residual_pinned() {
 }
 
 
+// R5-07: the top-level entry syntax is an explicit policy. Native (the production Qwen3.8
+// default) latches only the wrapped <tool_call> entry; compatibility keeps the legacy
+// bare-function, invoke and function_calls top-level forms. The canonical wrapped call
+// parses identically in both modes.
+int test_r5_syntax_mode_native_vs_compatibility() {
+    int failures = 0;
+    const fi::ToolCallOutputContract contract = contract_for("read", Json{
+                                                        {"path", Json{{"type", "string"}}},
+                                                        {"command", Json{{"type", "string"}}}});
+    const std::vector<std::pair<std::string, std::string>> compat_entries = {
+        {"<function=read>\n<parameter=path>\n/tmp/x\n</parameter>\n</function>\n",
+         "{\"path\":\"/tmp/x\"}"},
+        {"<invoke=read>\n<parameter=path>\n/tmp/x\n</parameter>\n</invoke>\n",
+         "{\"path\":\"/tmp/x\"}"},
+        {"<function_calls>\n<function=read>\n<parameter=path>\n/tmp/x\n</parameter>\n</function>"
+         "\n</function_calls>\n",
+         "{\"path\":\"/tmp/x\"}"},
+    };
+    for (const auto& [text, expected_args] : compat_entries) {
+        const auto native = fi::parse_qwen_tool_call_output(
+            text, 64, contract, false, ninfer::FinishReason::None, ninfer::ToolCallSyntaxMode::QwenWrappedNative);
+        failures += check(
+            !native.is_tool_call_response && native.tool_calls.empty() &&
+                native.diagnostics.marker_seen == false &&
+                native.diagnostics.fallback_reason == ninfer::ToolCallParseFallbackReason::None,
+            "R5-07 native: a compatibility-only entry never latches as a tool region");
+        failures += check(native.content == text,
+                          "R5-07 native: the entry returns verbatim as text content");
+        const auto compat = fi::parse_qwen_tool_call_output(
+            text, 64, contract, false, ninfer::FinishReason::None, ninfer::ToolCallSyntaxMode::Compatibility);
+        failures += check(compat.is_tool_call_response && compat.tool_calls.size() == 1 &&
+                              compat.tool_calls.front().name == "read" &&
+                              compat.tool_calls.front().arguments_json == expected_args,
+                          "R5-07 compatibility: the legacy entry keeps its structured call");
+    }
+
+    // The product boundary (OutputOptions) defaults to the native syntax for the Qwen3.8
+    // production path; this low-level entry keeps the historical compatibility entry set.
+    failures += check(ninfer::OutputOptions{}.tool_call_syntax ==
+                          ninfer::ToolCallSyntaxMode::QwenWrappedNative,
+                      "R5-07: the production OutputOptions default is the native syntax");
+    const auto defaulted = fi::parse_qwen_tool_call_output(
+        "<function=read>\n<parameter=path>\n/tmp/x\n</parameter>\n</function>\n", 64, contract);
+    failures += check(defaulted.is_tool_call_response && defaulted.tool_calls.size() == 1,
+                      "R5-07: the low-level entry default keeps the compatibility entry set");
+
+    // The canonical wrapped Qwen3.8 call is identical in both modes.
+    const std::string wrapped = "<tool_call>\n<function=read>\n<parameter=command>\ncat /tmp/x\n"
+                                "</parameter>\n</function>\n</tool_call>\n";
+    const auto native = fi::parse_qwen_tool_call_output(
+        wrapped, 64, contract, false, ninfer::FinishReason::None, ninfer::ToolCallSyntaxMode::QwenWrappedNative);
+    const auto compat = fi::parse_qwen_tool_call_output(
+        wrapped, 64, contract, false, ninfer::FinishReason::None, ninfer::ToolCallSyntaxMode::Compatibility);
+    failures += check(native.is_tool_call_response && native.tool_calls.size() == 1 &&
+                          native.tool_calls.front().name == "read" &&
+                          native.tool_calls.front().arguments_json ==
+                              "{\"command\":\"cat /tmp/x\"}",
+                      "R5-07 native: the canonical wrapped call parses");
+    failures += check(compat.is_tool_call_response && compat.tool_calls.size() == 1 &&
+                          compat.tool_calls.front().name == "read" &&
+                          compat.tool_calls.front().arguments_json ==
+                              "{\"command\":\"cat /tmp/x\"}" &&
+                          native.content == compat.content &&
+                          native.diagnostics == compat.diagnostics,
+                      "R5-07: the canonical wrapped call is identical in both modes");
+    return failures;
+}
+
 int main() {
     int failures = 0;
+    failures += test_r5_syntax_mode_native_vs_compatibility();
     failures += test_duplicate_parameter_keeps_last_value();
     failures += test_basic_legacy_parsing();
     failures += test_multiple_calls();

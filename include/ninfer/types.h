@@ -407,6 +407,15 @@ struct ExecutionOptions {
     ThinkingControlOptions thinking;
 };
 
+// R5-07: the tool-call wire syntax accepted at top level by the Qwen parser. QwenWrappedNative
+// is the selected Qwen3.8 native template: only the wrapped "<tool_call>" entry latches as an
+// executable tool region. Compatibility also accepts the legacy bare "<function=...>" /
+// "<invoke=...>" and "<function_calls>" top-level entries.
+enum class ToolCallSyntaxMode : std::uint8_t {
+    QwenWrappedNative,
+    Compatibility,
+};
+
 struct OutputOptions {
     bool raw                     = false;
     bool preserve_special_tokens = false;
@@ -416,6 +425,9 @@ struct OutputOptions {
     // Opt-in recovery of complete Qwen calls whose wrapper or suffix markup is malformed; see the
     // tool-call parser tolerant mode. Off preserves the strict all-or-nothing behavior.
     bool tolerant_tool_calls = false;
+    // R5-07: the top-level tool-call syntax policy. QwenWrappedNative is the production
+    // Qwen3.8 default; Compatibility widens the entry set to the legacy forms.
+    ToolCallSyntaxMode tool_call_syntax = ToolCallSyntaxMode::QwenWrappedNative;
 };
 
 struct NgramSessionHints {
