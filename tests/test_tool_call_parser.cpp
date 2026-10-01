@@ -4574,6 +4574,197 @@ int test_r7_decoder_intent_parity() {
     }
     return failures;
 }
+
+// R7-01 extended corpus (Round 7 §12-§15): the intent cutoff must leave the initial-entry
+// stages (Stage 2, tolerant Stage 3), the fence rules, consecutive wrappers, finish reasons
+// and the syntax x intent combinations intact.
+int test_r7_intent_retry_cross_matrix() {
+    using Intent = ninfer::ToolCallIntentPolicy;
+    using Finish = ninfer::FinishReason;
+    const auto contract = contract_from_definitions(
+        {tool_definition("read", Json{{"path", Json{{"type", "string"}}}}),
+         tool_definition("bash", Json{{"command", Json{{"type", "string"}}}})});
+    const auto contract_write = contract_from_definitions(
+        {tool_definition("write",
+                         Json{{"path", Json{{"type", "string"}}},
+                              {"content", Json{{"type", "string"}}}})});
+    const std::string R = tool_call("read", {{"path", "example.txt"}});
+    const std::string B = tool_call("bash", {{"command", "echo REAL"}});
+    const std::string B_trunc =
+        "<tool_call>\n<function=bash>\n<parameter=command>\necho REAL\n</parameter>\n</function>";
+    int failures = 0;
+
+    const auto parse = [&](const std::string& text, Intent intent, bool tolerant = false,
+                           Finish finish = Finish::StopToken,
+                           ninfer::ToolCallSyntaxMode syntax =
+                               ninfer::ToolCallSyntaxMode::QwenWrappedNative) {
+        return fi::parse_qwen_tool_call_output(text, 64, *contract, tolerant, finish, syntax,
+                                               ninfer::ToolCallAmbiguityPolicy::FailClosed,
+                                               intent);
+    };
+    const auto streaming = [&](const std::string& text, Intent intent, std::size_t chunk,
+                               bool tolerant = false) {
+        fi::ToolCallOutputDecoder decoder(
+            contract, 64, tolerant, ninfer::ToolCallSyntaxMode::QwenWrappedNative,
+            ninfer::ToolCallAmbiguityPolicy::FailClosed, intent);
+        std::string visible;
+        for (std::size_t i = 0; i < text.size(); i += chunk) {
+            visible += decoder.feed(text.substr(i, std::min(chunk, text.size() - i)));
+        }
+        const auto terminal = decoder.finish(Finish::StopToken);
+        return fi::ParsedToolCallOutput{.is_tool_call_response = !terminal.tool_calls.empty(),
+                                        .content              = visible + terminal.content,
+                                        .tool_calls           = terminal.tool_calls,
+                                        .diagnostics          = terminal.diagnostics};
+    };
+    const auto equal = [](const fi::ParsedToolCallOutput& a, const fi::ParsedToolCallOutput& b) {
+        return a.content == b.content && a.tool_calls.size() == b.tool_calls.size() &&
+               a.diagnostics == b.diagnostics && a.is_tool_call_response == b.is_tool_call_response;
+    };
+
+    // C4: the initial entry needs Stage 2 (consistent value-boundary resolution, the P-H
+    // nested-example fixture): both modes must agree and keep the Stage-2 completion.
+    {
+        const std::string text =
+            tool_call("write",
+                      {{"path", "d.md"},
+                       {"content",
+                        tool_call("write", {{"path", "x"}, {"content", "hello"}})}});
+        const auto parsed = fi::parse_qwen_tool_call_output(
+            text, 64, *contract_write, false, Finish::StopToken,
+            ninfer::ToolCallSyntaxMode::QwenWrappedNative,
+            ninfer::ToolCallAmbiguityPolicy::FailClosed, Intent::RequireToolAtContentStart);
+        const auto parsed_tc = fi::parse_qwen_tool_call_output(
+            text, 64, *contract_write, false, Finish::StopToken,
+            ninfer::ToolCallSyntaxMode::QwenWrappedNative,
+            ninfer::ToolCallAmbiguityPolicy::FailClosed, Intent::TemplateCompatible);
+        failures += check(parsed.is_tool_call_response && parsed.tool_calls.size() == 1 &&
+                              parsed.tool_calls.front().name == "write",
+                          "R7 C4: Stage 2 at the initial entry stays intact in hardened mode");
+        failures += check(equal(parsed, parsed_tc), "R7 C4: hardened equals the baseline");
+    }
+    // C5: the initial entry is tolerant-recoverable (function close consumed, wrapper close
+    // cut off): both modes must agree and keep the recovery verdict.
+    {
+        const std::string text =
+            "<tool_call>\n<function=bash>\n<parameter=command>\nls\n</parameter>\n</function>";
+        const auto parsed = fi::parse_qwen_tool_call_output(
+            text, 64, *contract, true, Finish::StopToken,
+            ninfer::ToolCallSyntaxMode::QwenWrappedNative,
+            ninfer::ToolCallAmbiguityPolicy::FailClosed, Intent::RequireToolAtContentStart);
+        const auto parsed_tc = fi::parse_qwen_tool_call_output(
+            text, 64, *contract, true, Finish::StopToken,
+            ninfer::ToolCallSyntaxMode::QwenWrappedNative,
+            ninfer::ToolCallAmbiguityPolicy::FailClosed, Intent::TemplateCompatible);
+        failures += check(parsed.is_tool_call_response && parsed.tool_calls.size() == 1 &&
+                              parsed.diagnostics.fallback_reason ==
+                                  ninfer::ToolCallParseFallbackReason::TruncatedTail,
+                          "R7 C5: base-zero tolerant recovery stays intact in hardened mode");
+        failures += check(equal(parsed, parsed_tc), "R7 C5: hardened equals the baseline");
+    }
+    // C6: a failed initial region followed by a later tolerant-recoverable call: the later
+    // recovery stays the historical TemplateCompatible behavior; hardened mode keeps 0 calls.
+    {
+        const std::string text = "<tool_call>\nordinary prose\n</tool_call>\n" + B_trunc;
+        const auto tc = fi::parse_qwen_tool_call_output(text, 64, *contract, true, Finish::StopToken,
+                                                        ninfer::ToolCallSyntaxMode::QwenWrappedNative,
+                                                        ninfer::ToolCallAmbiguityPolicy::FailClosed,
+                                                        Intent::TemplateCompatible);
+        failures += check(tc.is_tool_call_response && tc.tool_calls.size() == 1 &&
+                              tc.tool_calls.front().name == "bash",
+                          "R7 C6: TemplateCompatible preserves the later tolerant recovery");
+        const auto soc = fi::parse_qwen_tool_call_output(text, 64, *contract, true, Finish::StopToken,
+                                                         ninfer::ToolCallSyntaxMode::QwenWrappedNative,
+                                                         ninfer::ToolCallAmbiguityPolicy::FailClosed,
+                                                         Intent::RequireToolAtContentStart);
+        failures += check(!soc.is_tool_call_response && soc.tool_calls.empty(),
+                          "R7 C6: hardened mode never recovers at a later base");
+        failures += check(soc.content == text, "R7 C6: the region returns verbatim");
+    }
+    // C9: a fenced later call must never become an executable retry base. The fenced
+    // marker is a read call and the real later marker a bash call, so the executed name
+    // proves the fenced marker was skipped, not used as a base. (Fence markers inside a
+    // latched region are not counted by the fence diagnostic: that field covers marker
+    // candidates, per the pinned Round-4 scope.)
+    {
+        const std::string text = "<tool_call>\nordinary prose\n</tool_call>\n```xml\n" + R +
+                                 "\n```\n" + B;
+        const auto tc = parse(text, Intent::TemplateCompatible);
+        failures += check(tc.is_tool_call_response && tc.tool_calls.size() == 1 &&
+                              tc.tool_calls.front().name == "bash",
+                          "R7 C9: TemplateCompatible skips the fenced marker and retries");
+        failures += check(!tc.diagnostics.ended_in_unclosed_fence,
+                          "R7 C9: the fence is closed in the region");
+        const auto soc = parse(text, Intent::RequireToolAtContentStart);
+        failures += check(!soc.is_tool_call_response && soc.tool_calls.empty(),
+                          "R7 C9: hardened mode never executes after the initial region");
+        failures += check(soc.content == text, "R7 C9: the region returns verbatim");
+    }
+    // C10: consecutive valid wrappers at the initial structured suffix stay supported in
+    // both modes (the initial entry alone carries the whole structured suffix).
+    {
+        const std::string text = R + "\n" + B;
+        const auto tc = parse(text, Intent::TemplateCompatible);
+        const auto soc = parse(text, Intent::RequireToolAtContentStart);
+        failures += check(tc.is_tool_call_response && tc.tool_calls.size() == 2,
+                          "R7 C10: the baseline keeps the consecutive structured calls");
+        failures += check(equal(soc, tc), "R7 C10: hardened mode keeps the consecutive calls");
+    }
+    // Finish-reason matrix (Round 7 §13): the intent restriction is orthogonal to the
+    // terminal reason; base-zero recovery stays finish-reason-sensitive as before.
+    {
+        const std::string text = R + "\nNow the real action:\n" + B;
+        const std::vector<Finish> reasons = {Finish::StopToken, Finish::StopString,
+                                             Finish::OutputLimit, Finish::ContextCapacity,
+                                             Finish::Cancelled, Finish::None};
+        for (const Finish reason : reasons) {
+            const auto soc = parse(text, Intent::RequireToolAtContentStart, false, reason);
+            failures += check(!soc.is_tool_call_response && soc.tool_calls.empty() &&
+                                  soc.content == text,
+                              "R7 finish matrix: hardened mode is reason-independent");
+            const auto tc = parse(text, Intent::TemplateCompatible, false, reason);
+            failures += check(tc.is_tool_call_response && tc.tool_calls.size() == 1 &&
+                                  tc.tool_calls.front().name == "bash",
+                              "R7 finish matrix: the baseline later call is reason-independent");
+        }
+    }
+    // Syntax x intent matrix (Round 7 §14): a bare function entry is not a native top-level
+    // entry; in compatibility syntax it is eligible under TemplateCompatible and locked by
+    // visible prose under the hardened intent.
+    {
+        const std::string bare = "<function=bash>\n<parameter=command>\necho REAL\n</parameter>\n</function>";
+        const std::string text = "Example:\n" + bare;
+        const auto tc_compat = parse(text, Intent::TemplateCompatible, false, Finish::StopToken,
+                                     ninfer::ToolCallSyntaxMode::Compatibility);
+        failures += check(tc_compat.is_tool_call_response && tc_compat.tool_calls.size() == 1,
+                          "R7 syntax matrix: the compat baseline accepts the bare entry");
+        const auto soc_compat = parse(text, Intent::RequireToolAtContentStart, false, Finish::StopToken,
+                                      ninfer::ToolCallSyntaxMode::Compatibility);
+        failures += check(!soc_compat.is_tool_call_response && soc_compat.tool_calls.empty(),
+                          "R7 syntax matrix: hardened mode locks the bare entry after prose");
+        const auto soc_native = parse(text, Intent::RequireToolAtContentStart, false, Finish::StopToken,
+                                      ninfer::ToolCallSyntaxMode::QwenWrappedNative);
+        failures += check(!soc_native.is_tool_call_response && soc_native.tool_calls.empty() &&
+                              soc_native.content == text,
+                          "R7 syntax matrix: the bare entry stays text in native syntax");
+    }
+    // Streaming invariance (Round 7 §3.13) for the hardened cutoff across the bypass corpus.
+    {
+        const std::string texts[] = {R + "\nNow the real action:\n" + B,
+                                    "<tool_call>\nordinary prose\n</tool_call>\n" + B_trunc,
+                                    "<tool_call>\nordinary prose\n</tool_call>\n```xml\n" + B +
+                                        "\n```\n" + B};
+        for (const auto& text : texts) {
+            const auto one_shot = parse(text, Intent::RequireToolAtContentStart);
+            for (const std::size_t chunk : {1, 2, 5, 7, 4096}) {
+                const auto streamed = streaming(text, Intent::RequireToolAtContentStart, chunk);
+                failures += check(equal(streamed, one_shot),
+                                  "R7 streaming matrix: hardened streaming equals one-shot");
+            }
+        }
+    }
+    return failures;
+}
 int main() {
     int failures = 0;
     failures += test_r5_syntax_mode_native_vs_compatibility();
@@ -4653,6 +4844,7 @@ int main() {
     failures += test_r6_complete_unfenced_in_set_example_residual();
     failures += test_r6_intent_policy_matrix();
     failures += test_r7_decoder_intent_parity();
+    failures += test_r7_intent_retry_cross_matrix();
     failures += test_r7_hardened_intent_blocks_later_retry_base();
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
