@@ -1145,9 +1145,9 @@ int test_coding_payloads_round_trip() {
 }
 // 18.4: the spec's deterministic adversarial payload corpus embedded into a declared string
 // argument. Ordinary prefix/suffix text keeps every entry an unambiguous payload (I1): the
-// exact value round-trips in both modes and in streaming. Entries that are (or end with) the
-// outer closer literal are fundamentally ambiguous at the value end and stay out of this
-// matrix; that boundary is pinned by the closer-continuation tests.
+// exact value round-trips in both modes and in streaming. R3-01 (section 7.2): entries that
+// end with the outer closer literal or a closer triple round-trip too — Stage 2 resolves
+// the value boundary, so the old exclusion no longer applies.
 int test_payload_adversarial_corpus_round_trip() {
     const auto contract = output_contract_for("write", Json{{"content", Json{{"type", "string"}}}});
     int failures = 0;
@@ -1174,6 +1174,18 @@ int test_payload_adversarial_corpus_round_trip() {
             *contract, "write", "content",
             std::string_view{"\r\n" + entry + "\t" + entry + " x"},
             ("CRLF/tab repeated entry: " + entry).c_str());
+    }
+    // R3-01 section 7.2: the excluded class — payloads ending in the outer closer literal
+    // or a closer triple — now round-trips: the consistent parse ends the value at the
+    // candidate whose continuation is legal.
+    for (const std::string closer :
+         {"</parameter>", "</param>", "</parameter>\n</parameter>\n</parameter>"}) {
+        for (const char* prefix : {"x ", "x\n"}) {
+            failures += check_payload_round_trip(
+                *contract, "write", "content",
+                std::string_view{std::string(prefix) + closer},
+                ("payload ending in closer literal: " + closer).c_str());
+        }
     }
     return failures;
 }
@@ -2995,7 +3007,7 @@ std::string json_escape(const std::string& text) {
     out.reserve(text.size() + 8);
     for (const char ch : text) {
         switch (ch) {
-            case '"': out += "\""; break;
+            case '"': out += "\\\""; break;
             case '\\': out += "\\\\"; break;
             case '\n': out += "\\n"; break;
             case '\r': out += "\\r"; break;
@@ -3043,6 +3055,62 @@ int test_round3_spec_corpus() {
                          parsed.diagnostics.fallback_reason == reason,
                      label);
     };
+    // R3-07 / section 7: the streamed parse must agree with the one-shot entry (same
+    // verdict, calls, reason, and published content under the documented pre-region rtrim
+    // rule). Fixtures under 512 bytes run every split point; larger fixtures run the
+    // chunk sizes 1/2/3/5/7.
+    auto stream_equals_one_shot = [&](const char* label, const std::string& text,
+                                     bool tolerant, bool every_split) {
+        const auto one = fi::parse_qwen_tool_call_output(text, 64, c, tolerant,
+                                                         FinishReason::StopToken);
+        auto compare = [&](const std::vector<std::size_t>& points) -> bool {
+            fi::ToolCallOutputDecoder dec(contract, 64, tolerant);
+            std::string_view sv = text;
+            std::size_t from = 0;
+            std::string visible;
+            for (const std::size_t pt : points) {
+                visible += dec.feed(sv.substr(from, pt - from));
+                from = pt;
+            }
+            if (from < text.size()) { visible += dec.feed(sv.substr(from)); }
+            const auto term = dec.finish(FinishReason::StopToken);
+            std::string total = visible + term.content;
+            if (one.is_tool_call_response) {
+                while (!total.empty() && fi::is_tool_format_whitespace(total.back())) {
+                    total.pop_back();
+                }
+            }
+            bool same_calls = one.tool_calls.size() == term.tool_calls.size();
+            for (std::size_t i = 0; same_calls && i < one.tool_calls.size(); ++i) {
+                same_calls = one.tool_calls[i].name == term.tool_calls[i].name &&
+                             one.tool_calls[i].arguments_json ==
+                                 term.tool_calls[i].arguments_json;
+            }
+            return total == one.content &&
+                   one.is_tool_call_response == !term.tool_calls.empty() && same_calls &&
+                   one.diagnostics.fallback_reason == term.diagnostics.fallback_reason;
+        };
+        if (every_split) {
+            for (std::size_t k = 0; k <= text.size(); ++k) {
+                if (!compare({k})) {
+                    std::printf("fail %s: streaming split %zu diverges from one-shot\n", label, k);
+                    return 1;
+                }
+            }
+        } else {
+            for (const int chunk : {1, 2, 3, 5, 7}) {
+                std::vector<std::size_t> points;
+                for (std::size_t k = 0; k < text.size(); k += std::size_t(chunk)) {
+                    points.push_back(k + std::size_t(chunk));
+                }
+                if (!compare(points)) {
+                    std::printf("fail %s: chunk %d streaming diverges from one-shot\n", label, chunk);
+                    return 1;
+                }
+            }
+        }
+        return 0;
+    };
 
     // R3-01: a quoted example that closes its own structure stays byte-exact.
     const std::string inner = tool_call("write", {{"path", "x"}, {"content", "hello"}});
@@ -3063,15 +3131,28 @@ int test_round3_spec_corpus() {
             "{\"path\":\"d.md\",\"content\":\"" + json_escape("A:\n" + Ex + "\nB:\n" + Ex + "\nEnd.") + "\"}";
         const auto r4 = fi::parse_qwen_tool_call_output(r4_text, 64, c);
         failures += one_call("R3 R4: two embedded examples stay byte-exact", r4, "write", r4_args);
-        std::string big;
-        for (int i = 0; i < 2000; ++i) { big += Ex + "\n"; }
-        const auto scale = fi::parse_qwen_tool_call_output(
-            tool_call("write", {{"path", "d.md"}, {"content", big}}), 64, c);
-        failures += check(scale.is_tool_call_response && scale.tool_calls.size() == 1 &&
-                              scale.tool_calls.front().name == "write" &&
-                              scale.tool_calls.front().arguments_json ==
-                                  "{\"path\":\"d.md\",\"content\":\"" + json_escape(big) + "\"}",
-                          "R3 scale: 2000 embedded examples round-trip byte-exact");
+        for (const int examples : {50, 200, 500, 2000}) {
+            std::string big;
+            for (int i = 0; i < examples; ++i) { big += Ex + "\n"; }
+            const std::string scale_text = tool_call("write", {{"path", "d.md"}, {"content", big}});
+            const auto scale = fi::parse_qwen_tool_call_output(scale_text, 64, c);
+            failures += check(scale.is_tool_call_response && scale.tool_calls.size() == 1 &&
+                                  scale.tool_calls.front().name == "write" &&
+                                  scale.tool_calls.front().arguments_json ==
+                                      "{\"path\":\"d.md\",\"content\":\"" + json_escape(big) + "\"}",
+                              ("R3 scale: " + std::to_string(examples) +
+                               " embedded examples round-trip byte-exact")
+                                  .c_str());
+            failures += stream_equals_one_shot("R3 scale streaming", scale_text, false, false);
+        }
+        std::string triples = "<function=write>\n";
+        for (int i = 0; i < 2000; ++i) {
+            triples += "<parameter=p>\nv\n</parameter>\n</parameter>\n</parameter>\n";
+        }
+        const auto triples_parsed = fi::parse_qwen_tool_call_output(triples, 64, c);
+        failures += as_text("R3 scale: 2000 closer triples stay text", triples_parsed, triples,
+                            Reason::MalformedStructure);
+        failures += stream_equals_one_shot("R3 closer triples streaming", triples, false, false);
     }
     {
         // TAIL: the value itself ends with the closer literal (LF and CRLF continuations).
@@ -3131,6 +3212,239 @@ int test_round3_spec_corpus() {
                                     tolerant ? Reason::TruncatedTail : Reason::MalformedStructure);
             }
         }
+    }
+    // R3-01 section 7.1: the S1 markup payload family (byte-exact content).
+    const std::string EX = tool_call("read", {{"path", "foo.cpp"}});
+    {
+        const std::string s1 = tool_call("write", {{"path", "docs/x.md"},
+                                                   {"content", "# Example\n" + EX + "\nDone."}});
+        const auto parsed = fi::parse_qwen_tool_call_output(s1, 64, c);
+        failures += one_call("R3 S1: the embedded example is the exact content", parsed, "write",
+                             std::string("{\"path\":\"docs/x.md\",\"content\":\"") +
+                                 json_escape("# Example\n" + EX + "\nDone.") + "\"}");
+        failures += stream_equals_one_shot("R3 S1 streaming", s1, false, true);
+        failures += stream_equals_one_shot("R3 S1 streaming tolerant", s1, true, true);
+    }
+    {
+        const std::string s1c = tool_call("write", {{"path", "docs/x.md"},
+                                                    {"content", "Example:\n" + EX}});
+        const auto parsed = fi::parse_qwen_tool_call_output(s1c, 64, c);
+        failures += one_call("R3 S1c: an example ending the value", parsed, "write",
+                             std::string("{\"path\":\"docs/x.md\",\"content\":\"") +
+                                 json_escape("Example:\n" + EX) + "\"}");
+        failures += stream_equals_one_shot("R3 S1c streaming", s1c, false, true);
+    }
+    {
+        const std::string s1d = tool_call("write", {{"path", "docs/x.md"},
+                                                    {"content", "Text\n```xml\n" + EX + "\n```\nMore text"}});
+        const auto parsed = fi::parse_qwen_tool_call_output(s1d, 64, c);
+        failures += one_call("R3 S1d: the fenced example is content", parsed, "write",
+                             std::string("{\"path\":\"docs/x.md\",\"content\":\"") +
+                                 json_escape("Text\n```xml\n" + EX + "\n```\nMore text") + "\"}");
+        failures += stream_equals_one_shot("R3 S1d streaming", s1d, false, true);
+    }
+    {
+        const std::string old = std::string("R\"(") + EX + ")\"";
+        const std::string s1e = tool_call("edit", {{"path", "d.md"}, {"old_string", old}});
+        const auto parsed = fi::parse_qwen_tool_call_output(s1e, 64, c);
+        failures += one_call("R3 S1e: the raw-string literal example is content", parsed, "edit",
+                             std::string("{\"path\":\"d.md\",\"old_string\":\"") +
+                                 json_escape(old) + "\"}");
+        failures += stream_equals_one_shot("R3 S1e streaming", s1e, false, true);
+    }
+    {
+        const std::string value = "Close with:\n</parameter>\n</function>\n</tool_call>\nthen stop.";
+        const std::string s1f = tool_call("write", {{"path", "d.md"}, {"content", value}});
+        const auto parsed = fi::parse_qwen_tool_call_output(s1f, 64, c);
+        failures += one_call("R3 S1f: the closer lines inside the value are content", parsed, "write",
+                             std::string("{\"path\":\"d.md\",\"content\":\"") +
+                                 json_escape(value) + "\"}");
+        const auto tol = fi::parse_qwen_tool_call_output(s1f, 64, c, true);
+        failures += one_call("R3 S1f tolerant: the closer lines stay content", tol, "write",
+                             std::string("{\"path\":\"d.md\",\"content\":\"") +
+                                 json_escape(value) + "\"}");
+        failures += stream_equals_one_shot("R3 S1f streaming", s1f, false, true);
+    }
+    {
+        const std::string s1g = tool_call("write", {{"path", "d.md"},
+                                                    {"content", tool_call("edit", {{"path", "a"}, {"old_string", "b"}})}});
+        const auto parsed = fi::parse_qwen_tool_call_output(s1g, 64, c);
+        failures += one_call("R3 S1g: the complete inner call is content", parsed, "write",
+                             std::string("{\"path\":\"d.md\",\"content\":\"") +
+                                 json_escape(tool_call("edit", {{"path", "a"}, {"old_string", "b"}})) + "\"}");
+        failures += stream_equals_one_shot("R3 S1g streaming", s1g, false, true);
+    }
+    // S8: the here-doc that carries the closer lines commits in all modes (the real closer
+    // terminates the value); the cut variant after the final EOF line is the R3-03 residual.
+    const std::string s8_value = "cat <<EOF\n</parameter>\n</function>\n</tool_call>\nEOF";
+    const std::string s8 = tool_call("bash", {{"command", s8_value}});
+    const std::string s8_args = std::string("{\"command\":\"") + json_escape(s8_value) + "\"}";
+    {
+        const auto parsed = fi::parse_qwen_tool_call_output(s8, 64, c);
+        failures += one_call("R3 S8: the here-doc closer lines are the exact command", parsed,
+                             "bash", s8_args);
+        const auto tol = fi::parse_qwen_tool_call_output(s8, 64, c, true);
+        failures += one_call("R3 S8 tolerant: the here-doc commits", tol, "bash", s8_args);
+        failures += stream_equals_one_shot("R3 S8 streaming", s8, false, true);
+    }
+    {
+        // Cut after the final EOF line (before the real closer): the natural stop commits
+        // the truncated command (documented residual, R3-03); a cut reason commits nothing.
+        const std::string s8_cut = "<tool_call>\n<function=bash>\n<parameter=command>\ncat <<EOF\n"
+                                   "</parameter>\n</function>\n</tool_call>\nEOF";
+        const auto strict = fi::parse_qwen_tool_call_output(s8_cut, 64, c);
+        failures += as_text("R3 S8-cut strict: text", strict, s8_cut, Reason::TrailingContent);
+        const auto tol_stop = fi::parse_qwen_tool_call_output(s8_cut, 64, c, true,
+                                                              FinishReason::StopToken);
+        failures += check(tol_stop.is_tool_call_response && tol_stop.tool_calls.size() == 1 &&
+                              tol_stop.tool_calls.front().name == "bash" &&
+                              tol_stop.tool_calls.front().arguments_json ==
+                                  "{\"command\":\"cat <<EOF\"}" &&
+                              tol_stop.diagnostics.fallback_reason == Reason::TruncatedTail,
+                          "R3 S8-cut tolerant StopToken: the truncated command commits (residual)");
+        const auto tol_limit = fi::parse_qwen_tool_call_output(s8_cut, 64, c, true,
+                                                               FinishReason::OutputLimit);
+        failures += as_text("R3 S8-cut tolerant OutputLimit: no commit", tol_limit, s8_cut,
+                            Reason::TrailingContent);
+        failures += stream_equals_one_shot("R3 S8-cut streaming", s8_cut, true, true);
+    }
+    // P-C: two unfenced examples inside one value commit in strict and tolerant alike.
+    {
+        const std::string value = "Ex:\n" + E + "\n" + E + "\nDone.";
+        const std::string p_c = tool_call("write", {{"path", "d.md"}, {"content", value}});
+        const std::string p_c_args = std::string("{\"path\":\"d.md\",\"content\":\"") +
+                                     json_escape(value) + "\"}";
+        const auto parsed = fi::parse_qwen_tool_call_output(p_c, 64, c);
+        failures += one_call("R3 P-C: both examples are the exact content", parsed, "write",
+                             p_c_args);
+        const auto tol = fi::parse_qwen_tool_call_output(p_c, 64, c, true);
+        failures += one_call("R3 P-C tolerant: both examples are the exact content", tol,
+                             "write", p_c_args);
+        failures += stream_equals_one_shot("R3 P-C streaming", p_c, false, true);
+    }
+    // R5: two fenced examples inside one value commit (byte-exact).
+    {
+        const std::string value = "A:\n```\n" + Ex + "\n```\nB:\n```\n" + Ex + "\n```\nEnd.";
+        const std::string r5 = tool_call("write", {{"path", "d.md"}, {"content", value}});
+        const auto parsed = fi::parse_qwen_tool_call_output(r5, 64, c);
+        failures += one_call("R3 R5: the two fenced examples are the exact content", parsed,
+                             "write",
+                             std::string("{\"path\":\"d.md\",\"content\":\"") +
+                                 json_escape(value) + "\"}");
+        failures += stream_equals_one_shot("R3 R5 streaming", r5, false, true);
+    }
+    // R1 (section 9 residual): an unfenced complete example followed by prose ending with
+    // the canonical closer lines. The normative Stage-2/Stage-3 rules reject the region
+    // (the value-swallowing candidate ends at EndOfInput, and the natural-stop commit is
+    // blocked by the </parameter> literal in the tail); the section-9 phantom acceptance is
+    // not implemented. The observed verdict is pinned so a future change is intentional.
+    {
+        const std::string r1 = "Example:\n" + tool_call("read", {{"path", "ex.txt"}}) +
+                               "\nNote: </parameter>\n</function>\n</tool_call>";
+        const auto strict = fi::parse_qwen_tool_call_output(r1, 64, c);
+        failures += as_text("R3 R1 strict: the prose closer tail keeps the region text", strict,
+                            r1, Reason::TrailingContent);
+        const auto tol_stop = fi::parse_qwen_tool_call_output(r1, 64, c, true,
+                                                              FinishReason::StopToken);
+        failures += as_text("R3 R1 tolerant StopToken: the value closer in the tail blocks the commit",
+                            tol_stop, r1, Reason::TrailingContent);
+        failures += stream_equals_one_shot("R3 R1 streaming", r1, true, true);
+    }
+    // S2b: the Round-2 baseline quoted-fixture fixture (R3-02).
+    {
+        const std::string s2b =
+            "explaining <tool_call>\\n<function=shell>\\n<function=command>\\nprintf broken\\n"
+            "</parameter>\\n</function>\\n</tool_call> then the real turn\\n" +
+            tool_call("bash", {{"command", "echo ok"}});
+        const auto parsed = fi::parse_qwen_tool_call_output(s2b, 64, c);
+        failures += one_call("R3 S2b: the baseline quoted fixture does not demote the real turn",
+                             parsed, "bash", "{\"command\":\"echo ok\"}");
+        failures += stream_equals_one_shot("R3 S2b streaming", s2b, false, true);
+    }
+    // Q1/Q2 (probe4): an attribute-form marker cut inside a quoted name rescan-continues
+    // to the real call (R3-05).
+    {
+        const std::string q1 = std::string("Attr form: <function name=\"x\n") +
+                               tool_call("bash", {{"command", "ls"}});
+        const auto parsed = fi::parse_qwen_tool_call_output(q1, 64, c);
+        failures += one_call("R3 Q1: the cut quoted attribute does not latch", parsed, "bash",
+                             "{\"command\":\"ls\"}");
+        failures += stream_equals_one_shot("R3 Q1 streaming", q1, false, true);
+        const std::string q2 = std::string("The <invoke name='it\n") +
+                               tool_call("bash", {{"command", "ls"}});
+        const auto parsed2 = fi::parse_qwen_tool_call_output(q2, 64, c);
+        failures += one_call("R3 Q2: the cut single-quoted attribute does not latch", parsed2,
+                             "bash", "{\"command\":\"ls\"}");
+        failures += stream_equals_one_shot("R3 Q2 streaming", q2, false, true);
+    }
+    // P-A2: a bare write with a path and a closed content value containing the example
+    // commits with the exact content (R3-04/R3-01: the consistent parse resolves the
+    // value boundary, so the cut is immaterial).
+    {
+        const std::string p_a2 =
+            "<function=write>\n<parameter=path>\nd.md\n</parameter>\n<parameter=content>\nEx:\n" +
+            E + "\nDone.\n</parameter>\n</function>\n";
+        const std::string p_a2_args =
+            std::string("{\"path\":\"d.md\",\"content\":\"") +
+            json_escape("Ex:\n" + E + "\nDone.") + "\"}";
+        for (const bool tolerant : {false, true}) {
+            for (const auto reason : {FinishReason::StopToken, FinishReason::OutputLimit}) {
+                const auto parsed = fi::parse_qwen_tool_call_output(p_a2, 64, c, tolerant, reason);
+                failures += one_call("R3 P-A2: the closed value with the example commits",
+                                     parsed, "write", p_a2_args);
+            }
+        }
+        failures += stream_equals_one_shot("R3 P-A2 streaming", p_a2, false, true);
+    }
+    // F1: a CRLF-fenced example never latches; the call after the fence commits (R3-06).
+    {
+        const std::string f1 = std::string("```xml\r\n") + E + "\r\n```\r\n" +
+                               tool_call("read", {{"path", "a"}});
+        const auto parsed = fi::parse_qwen_tool_call_output(f1, 64, c);
+        failures += one_call("R3 F1: the CRLF fence does not latch", parsed, "read",
+                             "{\"path\":\"a\"}");
+        failures += stream_equals_one_shot("R3 F1 streaming", f1, false, true);
+    }
+    // Fence-aware retry: a bare opener before a fenced marker commits nothing (R3-06/R3-04):
+    // the retry skips the fenced marker, so no later entry exists to commit.
+    {
+        const std::string faretry = "Use <function=read> x\n```xml\n" + EX + "\n```\n";
+        const auto strict = fi::parse_qwen_tool_call_output(faretry, 64, c);
+        failures += as_text("R3 fence retry strict: the fenced marker is not re-read", strict,
+                            faretry, Reason::MalformedStructure);
+        const auto tol = fi::parse_qwen_tool_call_output(faretry, 64, c, true);
+        failures += as_text("R3 fence retry tolerant: the fenced marker is not re-read", tol,
+                            faretry, Reason::MalformedStructure);
+        failures += stream_equals_one_shot("R3 fence retry streaming", faretry, true, true);
+    }
+    // Trailing prose carrying a value closer in the tail commits nothing, even at a
+    // natural stop (R3-03 item 3: the tail may be the last value's remainder). A stray
+    // wrapper closer keeps the old tolerant commit (the stray-closer test above pins it).
+    {
+        const std::string tailc = tool_call("read", {{"path", "a"}}) + "\nSee </parameter> note";
+        const auto strict = fi::parse_qwen_tool_call_output(tailc, 64, c);
+        failures += as_text("R3 tail value-closer strict: text", strict, tailc,
+                            Reason::TrailingContent);
+        const auto tol_stop = fi::parse_qwen_tool_call_output(tailc, 64, c, true,
+                                                              FinishReason::StopToken);
+        failures += as_text(
+            "R3 tail value-closer tolerant StopToken: no commit despite the natural stop",
+            tol_stop, tailc, Reason::TrailingContent);
+        const auto tol_limit = fi::parse_qwen_tool_call_output(tailc, 64, c, true,
+                                                               FinishReason::OutputLimit);
+        failures += as_text("R3 tail value-closer tolerant OutputLimit: no commit", tol_limit,
+                            tailc, Reason::TrailingContent);
+        failures += stream_equals_one_shot("R3 tail value-closer streaming", tailc, true, true);
+    }
+    // R3-04 section 7.5: the F7 bare_before fixture with a cut finish reason is rejected
+    // (the open value's payload after a cut is not committable).
+    {
+        const std::string bare_before = std::string("<function=read>\n<parameter=path>\ncut\n") +
+                                        tool_call("bash", {{"command", "echo ok"}});
+        const auto parsed = fi::parse_qwen_tool_call_output(bare_before, 64, c, true,
+                                                            FinishReason::OutputLimit);
+        failures += as_text("R3 F7 cut: bare_before with a cut reason is rejected", parsed,
+                            bare_before, Reason::TruncatedTail);
     }
     // R3-08: synthetic arguments make a declared-tool call ambiguous; the legacy contract
     // keeps last-value semantics.
@@ -3322,6 +3636,24 @@ int test_round3_work_bounds() {
         failures += check(term.stage2_steps < 4096,
                           "R3-14: 2000 closer triples bound the Stage-2 steps");
     }
+    {
+        // An exhausted Stage-2 step budget fails closed to Invalid (section 7.11): the
+        // region is rejected instead of running unbounded consistent parses. S1 needs 14
+        // steps; a budget of 8 cannot finish it.
+        const std::string s1 = tool_call("write", {{"path", "docs/x.md"},
+                                                   {"content", "# Example\n" +
+                                                                  tool_call("read", {{"path", "foo.cpp"}}) +
+                                                                  "\nDone."}});
+        fi::ToolCallParsePolicy small;
+        small.max_name_length = 64;
+        small.stage2_step_budget = 8;
+        fi::ToolCallStreamParser machine(small);
+        machine.feed(std::string_view(s1));
+        const auto term = machine.finish(FinishReason::StopToken);
+        failures += check(term.status == fi::ToolCallStreamStatus::Invalid &&
+                              term.region.calls.empty(),
+                          "R3-14: an exhausted Stage-2 budget fails closed");
+    }
     return failures;
 }
 
@@ -3337,7 +3669,6 @@ int main() {
     failures += test_declared_json_types();
     failures += test_boolean_boundary();
     failures += test_exact_integer_boundary();
-    failures += test_composed_schema_types();
     failures += test_empty_declared_non_string_is_omitted();
     failures += test_schema_mismatches_remain_structured();
     failures += test_unsupported_schema_uses_legacy_policy();

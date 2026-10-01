@@ -206,6 +206,29 @@ int test_quote_aware_headers() {
         expect_status(parse_tool_function_open(text, tag), ToolHeaderStatus::NeedMore,
                       "unterminated function quote needs more", text);
     }
+    // R3-05: a quoted value is single-line. A CR or LF before the closing quote is
+    // Invalid (the header grammar is line-oriented).
+    for (const std::string text :
+         {std::string("<parameter name=\"a\nb\">"), std::string("<parameter name=\"a\rb\">"),
+          std::string("<parameter name=\"a\r\nb\">"), std::string("<function name=\"a\nb\">")}) {
+        tag = {};
+        const ToolHeaderStatus st = text.rfind("<parameter", 0) == 0
+                                         ? parse_tool_parameter_open(text, tag)
+                                         : parse_tool_function_open(text, tag);
+        expect_status(st, ToolHeaderStatus::Invalid, "quoted CR/LF before the close is invalid",
+                      text.c_str());
+    }
+    // R3-05 (F8): the maximal header bound (kMaxToolHeaderBytes after the keyword). A
+    // header whose terminating '>' is not reached inside the bound is Invalid, not
+    // NeedMore; one byte inside the bound stays NeedMore.
+    tag = {};
+    const std::string over = std::string("<function=") + std::string(1025, 'a');
+    expect_status(parse_tool_function_open(over, tag), ToolHeaderStatus::Invalid,
+                  "one byte over the 1024-byte bound is invalid", over.c_str());
+    tag = {};
+    const std::string at_bound = std::string("<function=") + std::string(1022, 'a') + ">";
+    expect_status(parse_tool_function_open(at_bound, tag), ToolHeaderStatus::Complete,
+                  "header at the 1024-byte bound is complete", at_bound.c_str());
     return 0;
 }
 

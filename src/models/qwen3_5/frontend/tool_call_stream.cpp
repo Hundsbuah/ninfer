@@ -1178,11 +1178,21 @@ ToolCallStreamResult ToolCallStreamParser::finish(FinishReason finish_reason) co
     // attempt: the tail from the break offset must carry no `</param>`/`</parameter>`
     // literal (a wrapper or function closer does not count: it cannot extend a value).
     for (const Attempt& attempt : chain) {
+        // R3-03 item 3: the tail from the break offset must carry no parameter closer
+        // literal. Both family forms count — '</param>' is not a substring of
+        // '</parameter>' — so each is checked separately. A wrapper or function closer
+        // does not extend a value and is not counted (a stray '</tool_call>' after a
+        // complete call stays recoverable).
+        const std::size_t tail_begin = attempt.base + attempt.progress.break_offset;
+        const bool tail_has_value_closer =
+            region_.find(tool_close_literal(ToolTagKind::Parameter), tail_begin) !=
+                std::string::npos ||
+            region_.find(tool_close_literal(ToolTagKind::Param), tail_begin) !=
+                std::string::npos;
         const ToolCallRecoveryPolicy decision_policy{
             policy_.tolerant,
             finish_reason,
-            region_.substr(attempt.base + attempt.progress.break_offset).find("</param>") !=
-                std::string_view::npos,
+            tail_has_value_closer,
         };
         const ToolCallRecoveryResult recovery =
             decide_tool_call_recovery(attempt.progress, decision_policy);

@@ -21,7 +21,8 @@
 - Branch: `new_parser_design`, local clone `E:/KI/ninfer-custom` (Windows 10 x64 worktree)
 - Starting HEAD: `4165d227` (`fix: tool-call parser round-2 bugfixes CR1-CR6`), i.e. the
   committed Round-2 tree
-- Date started / finished: 2026-10-01
+- Date started / finished: 2026-10-01 (session 1: implementation; session 2: Stage-3 tail-closer
+  defect, see "Follow-up findings")
 - Worktree state at start: not clean — the same four pre-existing user-local adaptations
   as in Round 2 (`CMakeLists.txt`, `build_native.bat`,
   `src/runtime/engine/context_cache/materialization_budget.h`,
@@ -79,6 +80,27 @@ step being split out.
    `ninfer_linear_fp8_a16_test`, and `ninfer_linear_bf16_a16_test` because ctest executed
    executables built from an earlier implementation state (ctest does not build). All three
    are green after rebuilding; none is a Round-3 behavior change.
+4. **Stage-3 tail-closer check: wrong literal set and a use-after-free in the first repair**
+   (session 2). The committed Stage-3 code (a34aceaa) precomputed the recovery flag with
+   `region_.substr(base + break).find("</param>")` only. `</param>` is not a substring of
+   `</parameter>` (the character after `</param` is `e`, not `>`), so a tail carrying the
+   `</parameter>` closer (the R1 reproducer and the TAILC case of section 7.3) did not block
+   the tolerant commit — against R3-03 item 3 ("contains no `</parameter>` or `</param>`
+   literal"). The first repair materialized the tail as
+   `std::string_view stage3_tail = region_.substr(…)` — a view bound to the temporary
+   `std::string`, destroyed at the end of the full expression — and read it (find/size) in
+   later statements: a use-after-free. Observed: Release builds flipped the R1/TAILC verdict
+   between runs (freed tail buffer sometimes re-reused with the literal still inside) and
+   access-violated inside the 136 KB work-bounds region (147964-byte tail copy) and at exit;
+   the `/Od` debug build judged deterministically wrong (R1/TAILC plus the two tolerant
+   no-commit tests failed). Final fix: `tail_has_value_closer` is computed directly as
+   `region_.find(tool_close_literal(Parameter), tail_begin)` or `…(Param), tail_begin)` — no
+   temporary, no view, both family forms; `tail_begin = base + break_offset` is `<=
+   region_.size()` for every Definitive/EndOfInput attempt, so `find` is in range. Pinned by
+   the R1 (strict, tolerant `StopToken`, streamed) and TAILC (strict, tolerant `StopToken`/
+   `OutputLimit`, streamed) cases of `test_round3_spec_corpus` and the R3-05 grammar-suite
+   assertions (quoted CR/LF invalid, 1024-byte header bound). After the fix: parser suite
+   exit 0 in five consecutive Release runs; no AV in the work-bounds 136 KB case.
 
 ## Test evidence
 
@@ -90,9 +112,15 @@ step being split out.
   confirms it.
 - **Section 7 tests** (in `tests/test_tool_call_parser.cpp`):
   - `test_round3_spec_corpus` — section 4 reproducers and Appendix-A payloads (S1/S1c-S1g,
-    S3, S40, P-A x {StopToken, OutputLimit} x {strict, tolerant}, P-B, P-C, P-D, P-H, R4,
-    TAIL LF/CRLF, E1, E2, E3, no-marker, scale 50/200/500/2000 examples and 2000 closer
-    triples), byte-exact arguments via an in-test JSON escaper.
+    S2b, S3, S40, P-A x {StopToken, OutputLimit} x {strict, tolerant}, P-B, P-C, P-D, P-H,
+    R1 (value-closer tail: strict and tolerant `StopToken` expect no commit,
+    `TrailingContent`), TAILC (trailing `</parameter>` note: no commit for strict and tolerant
+    `StopToken`/`OutputLimit`), F7-cut, R4, TAIL LF/CRLF, E1, E2, E3, no-marker, scale
+    50/200/500/2000 examples and 2000 closer triples), byte-exact arguments via an in-test
+    JSON escaper; the R1/TAILC cases also assert one-shot/streamed equivalence.
+  - `tests/test_tool_call_grammar.cpp` — R3-05 assertions: quoted values stay single-line
+    (CR/LF/CRLF before the closing quote is `Invalid`) and the maximal 1024-byte quoted
+    header bound (one byte over is `Invalid`, at the bound is `Complete`).
   - `test_round3_streaming_equivalence_fuzz` — section 10.3 fragment corpus,
     `std::mt19937(20260930)`, 2..14 fragments per text, tail appended with probability 1/3,
     512 texts; one-shot vs streamed (single feed + `StopToken` finish): content (under the
@@ -110,13 +138,16 @@ step being split out.
   `ninfer_qwen3_5_frontend_test`, `ninfer_request_log_test`, `ninfer_pretty_logging_test`,
   `ninfer_serve_options_test`, `ninfer_engine_options_validation_test` — all Passed
   (Release, 16 threads).
-- **Full CPU suite** (`ctest -C Release -j 16 --exclude-regex "_real"`, `build-new-parser`):
-  148/149 Passed, 149 tests, real time 1086 s. The single failure is
-  `ninfer_kv_capacity_test` — pre-existing user-local worktree adaptation (commented-out
-  capacity error throw), documented in the Round-2 progress file and re-confirmed by
-  `git diff src/runtime/engine/kv_capacity.cpp` (the throw block is commented out locally).
-  The three initially failing non-parser tests were stale binaries (finding 3 above) and
-  are green after rebuild.
+- **Full CPU suite, rule-conformant re-run (session 2).** Session 1's full-suite run
+  ("148/149, real time 1086 s") executed the four `linear_swiglu_*` GPU Op-oracle tests on
+  the physical GPU (no `CUDA_VISIBLE_DEVICES` pin), which contradicts the no-GPU rule of this
+  round; its result is not cited. Re-run under the rule (`CUDA_VISIBLE_DEVICES=99`,
+  `ctest --test-dir build-new-parser -C Release -E "_real" --parallel 16`): 149 tests — 129
+  passed, 5 failed, 15 skipped — identical to the Round-2 baseline. The five failures are the
+  documented environmental set: `ninfer_kv_capacity_test` (user-local commented-out throw) and
+  the four `linear_swiglu_*` tests (no usable CUDA device; their main() treats skip return 77
+  as failure). No parser-related or new failure; the four swiglu tests perform no GPU work
+  under the pin.
 
 ## Acceptance checklist (section 10.4)
 
@@ -153,6 +184,17 @@ step being split out.
 - `src/runtime/engine/engine_core.h`
 - `src/serve/operational_log.cpp`, `src/serve/request_log.cpp`, `src/serve/serve_options.cpp`
 - `tests/test_tool_call_parser.cpp`
+
+## Session 2 delta (2026-10-01)
+
+- `src/models/qwen3_5/frontend/tool_call_stream.cpp` — Stage-3 tail-closer check: both
+  family forms via `region_.find(tool_close_literal(Parameter|Param), tail_begin)` (R3-03
+  item 3); replaces the committed `</param>`-only check and the dangling-view intermediate.
+- `tests/test_tool_call_parser.cpp` — the section 7 regression cases missing from a34aceaa
+  (R1, TAILC, S2b, F7-cut, plus corpus/fuzz/work-bounds cases) and their registration in
+  `main()`.
+- `tests/test_tool_call_grammar.cpp` — R3-05 quoted-header assertions.
+- `docs/NInfer_new_parser_design_round3_bugfix_progress.md` (this file).
 
 Not committed (user-local worktree adaptations, preserved): `CMakeLists.txt`,
 `build_native.bat`, `src/runtime/engine/context_cache/materialization_budget.h`,
