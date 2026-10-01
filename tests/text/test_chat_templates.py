@@ -14,7 +14,7 @@ ROOT = Path(__file__).resolve().parents[2]
 RENDERER = ROOT / "build" / "tests" / "ninfer_jinja_test"
 SOURCES = {
     version: (ROOT / "tools" / "chat_templates" / f"{version}.jinja").read_text()
-    for version in ("qwen3_6", "qwen3_8")
+    for version in ("qwen3_6", "qwen3_8", "qwen3_8_hardened_tools")
 }
 
 
@@ -137,6 +137,43 @@ class ChatTemplates(unittest.TestCase):
                 self.assertTrue(
                     text.endswith("<|im_start|>system\ndiagnostic<|im_end|>\n")
                 )
+
+    def test_tool_instruction_policies(self):
+        # R7-03: the default local template keeps the upstream-compatible preamble
+        # wording; the hardened template requires the tool block at the content start.
+        # The two prompt policies are explicit files, not a hidden rendering switch.
+        tools = [
+            {
+                "type": "function",
+                "function": {"name": "inspect", "parameters": {"type": "object"}},
+            }
+        ]
+        history = [message("system", "policy"), message("user", "inspect")]
+        compatible = self.render("qwen3_8", history, tools=tools)
+        hardened = self.render("qwen3_8_hardened_tools", history, tools=tools)
+        self.assertIn(
+            "You may provide optional reasoning for your function call in natural "
+            "language BEFORE the function call",
+            compatible,
+        )
+        self.assertNotIn("emit the <tool_call> block immediately", compatible)
+        self.assertIn(
+            "emit the <tool_call> block immediately in the assistant content channel",
+            hardened,
+        )
+        self.assertIn(
+            "Do not emit visible natural-language content before or after the tool call",
+            hardened,
+        )
+        self.assertNotIn(
+            "You may provide optional reasoning for your function call", hardened
+        )
+        # Without tools both templates render the non-tool history identically.
+        self.assertEqual(
+            self.render("qwen3_8", history),
+            self.render("qwen3_8_hardened_tools", history),
+        )
+
 
     def test_tool_result_without_original_user(self):
         results = [message("tool", "one"), message("tool", "two")]
