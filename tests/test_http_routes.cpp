@@ -3,6 +3,9 @@
 #include <nlohmann/json.hpp>
 
 #include <iostream>
+#include "serve/openai_chat.h"
+#include "serve/openai_common.h"
+#include "serve/request.h"
 #include <string>
 #include <thread>
 
@@ -17,6 +20,37 @@ int check(bool condition, const char* message) {
 }
 
 } // namespace
+
+// R8-02 (Round 8 §4.17): HTTP-level capability error for POST /v1/chat/completions with
+// tool_choice=required. The request is rejected while the handler parses the body — before
+// any generation starts — and the rendered error body carries the external shape.
+int test_r8_chat_capability_error_payload() {
+    using namespace ninfer::serve;
+    int failures = 0;
+    const Json body = Json{{"model", "qwen"},
+                           {"messages", Json::array({Json{{"role", "user"}, {"content", "hi"}}})},
+                           {"tool_choice", "required"}};
+    ApiError error;
+    bool rejected = false;
+    try {
+        (void)parse_chat_completion_request(body, RequestLimits{});
+    } catch (const ApiException& exception) {
+        rejected = true;
+        error    = exception.error();
+    }
+    failures += check(rejected, "R8 http: required tool_choice is rejected before generation");
+    failures += check(error.status == 400 && error.type == "invalid_request_error",
+                      "R8 http: the capability error is a 400 invalid_request_error");
+    failures += check(error.param == "tool_choice" && error.code == "tool_choice_not_supported",
+                      "R8 http: the exception state carries the capability param and code");
+    const Json rendered = Json::parse(make_error_body(error));
+    failures += check(rendered.at("error").at("type").get<std::string>() == "invalid_request_error" &&
+                          rendered.at("error").at("param").get<std::string>() == "tool_choice" &&
+                          rendered.at("error").at("code").get<std::string>() ==
+                              "tool_choice_not_supported",
+                      "R8 http: the rendered body has the external error shape");
+    return failures;
+}
 
 int main() {
     int failures = 0;
@@ -94,6 +128,7 @@ int main() {
         listener.join();
     }
 
+    failures += test_r8_chat_capability_error_payload();
     if (failures == 0) { std::cout << "http routes tests passed\n"; }
     return failures == 0 ? 0 : 1;
 }
