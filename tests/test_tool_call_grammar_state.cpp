@@ -789,6 +789,119 @@ void test_r8_post_call_chunk_checkpoint_matrix() {
     }
 }
 
+// R9-01: once a strict tool sequence has started, the grammar constraint must reject the
+// visible suffix content that the strict final parser would demote as TrailingContent (a
+// complete call followed by non-whitespace parses to zero structured calls). Lazy
+// pre-trigger semantics are unchanged: prose before the first call never rejects.
+void test_r9_constraint_post_call_suffix() {
+    using Mode   = ninfer::ToolCallSyntaxMode;
+    using Intent = ninfer::ToolCallIntentPolicy;
+    const Mode syntax = Mode::QwenWrappedNative;
+    const std::string call_a =
+        "<tool_call><function=weather><parameter=city>Paris</parameter></function></tool_call>";
+    const std::string call_b =
+        "<tool_call><function=bash><parameter=command>ls</parameter></function></tool_call>";
+    const std::string marker = "<tool_call>";
+    const std::string open_a =
+        "<tool_call><function=weather><parameter=city>Paris</parameter></function>";
+
+    // G1: a complete call is a legal continuation and leaves the state inactive.
+    {
+        ToolCallGrammarConstraint constraint(64, syntax, Intent::RequireToolAtContentStart);
+        check(constraint.check(call_a) == ToolCallConstraintVerdict::Allowed && !constraint.active(),
+              "r9 G1: a complete call is a legal continuation");
+    }
+    // G2: a formatting-whitespace suffix after a completed call stays legal.
+    {
+        ToolCallGrammarConstraint constraint(64, syntax, Intent::RequireToolAtContentStart);
+        constraint.commit(call_a);
+        check(constraint.check("\n\t \r\n") == ToolCallConstraintVerdict::Allowed &&
+                  !constraint.active(),
+              "r9 G2: a whitespace suffix after a call stays allowed");
+    }
+    // G3: visible prose after a completed call is rejected (the strict parser would demote
+    // the complete call to TrailingContent).
+    {
+        ToolCallGrammarConstraint constraint(64, syntax, Intent::RequireToolAtContentStart);
+        constraint.commit(call_a);
+        check(constraint.check("\nDone") == ToolCallConstraintVerdict::Rejected,
+              "r9 G3: visible prose after a call is rejected");
+    }
+    // G4: a form-feed suffix is rejected (visible, not formatting whitespace).
+    {
+        ToolCallGrammarConstraint constraint(64, syntax, Intent::RequireToolAtContentStart);
+        constraint.commit(call_a);
+        check(constraint.check("\f") == ToolCallConstraintVerdict::Rejected,
+              "r9 G4: a form-feed suffix after a call is rejected");
+    }
+    // G5: a directly consecutive second call is legal and closes cleanly.
+    {
+        ToolCallGrammarConstraint constraint(64, syntax, Intent::RequireToolAtContentStart);
+        constraint.commit(call_a);
+        constraint.commit(call_b);
+        check(constraint.finished() && !constraint.active(),
+              "r9 G5: a directly consecutive second call is allowed");
+    }
+    // G6: a whitespace-separated second call is legal and closes cleanly.
+    {
+        ToolCallGrammarConstraint constraint(64, syntax, Intent::RequireToolAtContentStart);
+        constraint.commit(call_a);
+        constraint.commit("\n");
+        constraint.commit(call_b);
+        check(constraint.finished() && !constraint.active(),
+              "r9 G6: a whitespace-separated second call is allowed");
+    }
+    // G7: a partial second marker is a legal prefix (NeedMore; EOS is illegal).
+    {
+        ToolCallGrammarConstraint constraint(64, syntax, Intent::RequireToolAtContentStart);
+        check(constraint.check(call_a + "\n<tool_") == ToolCallConstraintVerdict::NeedMore,
+              "r9 G7: a partial second marker needs more bytes");
+    }
+    // G8: a failed second marker is rejected (illegal suffix content, not a text lock).
+    {
+        ToolCallGrammarConstraint constraint(64, syntax, Intent::RequireToolAtContentStart);
+        constraint.commit(call_a);
+        check(constraint.check("\n<tool_x>") == ToolCallConstraintVerdict::Rejected,
+              "r9 G8: a failed second marker is rejected");
+    }
+    // G9: a same-token close plus prose candidate is rejected atomically and is never
+    // committed (a constrained sampler cannot accept only the legal prefix of a token).
+    {
+        ToolCallGrammarConstraint constraint(64, syntax, Intent::RequireToolAtContentStart);
+        constraint.commit(open_a);
+        check(constraint.active() &&
+                  constraint.check("</tool_call>\nDone") == ToolCallConstraintVerdict::Rejected,
+              "r9 G9: a same-token close plus prose is rejected atomically");
+    }
+    // G10: a same-token close plus next-marker candidate stays legal and reactivates the
+    // second region.
+    {
+        ToolCallGrammarConstraint constraint(64, syntax, Intent::RequireToolAtContentStart);
+        constraint.commit(open_a);
+        check(constraint.check("</tool_call>\n<tool_call>") ==
+                  ToolCallConstraintVerdict::Allowed,
+              "r9 G10: a same-token close plus next marker is legal");
+        constraint.commit("</tool_call>\n<tool_call>");
+        check(constraint.active(),
+              "r9 G10: the committed candidate reactivates the second region");
+    }
+    // G11: TemplateCompatible still allows a preamble-prose first call to trigger.
+    {
+        ToolCallGrammarConstraint constraint(64, syntax, Intent::TemplateCompatible);
+        constraint.commit("Sure, let me check.\n");
+        constraint.commit(marker);
+        check(constraint.active(), "r9 G11: the preamble-prose first call still triggers");
+    }
+    // G12: hardened pre-trigger locking is unchanged: the marker never triggers.
+    {
+        ToolCallGrammarConstraint constraint(64, syntax, Intent::RequireToolAtContentStart);
+        constraint.commit("Sure, let me check.\n");
+        constraint.commit(marker);
+        check(!constraint.active(),
+              "r9 G12: a locked preamble keeps the marker from triggering");
+    }
+}
+
 } // namespace
 
 int main() {
@@ -818,6 +931,7 @@ int main() {
     test_r7_intent_content_start_gate();
     test_r8_constraint_post_call_gate();
     test_r8_post_call_chunk_checkpoint_matrix();
+    test_r9_constraint_post_call_suffix();
     if (failures == 0) { std::puts("tool_call_grammar_state tests: all passed"); }
     return failures == 0 ? 0 : 1;
 }
