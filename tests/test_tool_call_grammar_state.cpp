@@ -694,6 +694,18 @@ void test_r8_constraint_post_call_gate() {
         check(constraint.active(), "r8 M: the restore keeps the post-call gate open");
     }
 
+    // R8-01b (marker-suffix skip): CALL1 + prose + partial CALL2 in one commit — the
+    // region parser reports TrailingContent and the bytes from its break offset must
+    // replay through the ordinary inactive gate; the rfind('<') suffix must not skip the
+    // prose that carries the lock (Round 8 §3.5/§3.7).
+    {
+        ToolCallGrammarConstraint constraint(64, Mode::Compatibility, Intent::RequireToolAtContentStart);
+        constraint.commit(std::string(call1) + "\nvisible prose\n<tool_");
+        check(!constraint.active(), "r8 01b: the single-chunk region breaks at the prose");
+        constraint.commit("call>");
+        check(!constraint.active(), "r8 01b: the replayed prose keeps CALL2 from triggering");
+    }
+
     // TC control: the same E text under TemplateCompatible keeps the historical entry
     // semantics (the marker after prose still triggers; Round 8 §3.18).
     {
@@ -703,6 +715,80 @@ void test_r8_constraint_post_call_gate() {
         check(constraint.active(), "r8 TC: TemplateCompatible keeps the post-prose entry");
     }
 }
+
+// R8-01 (Round 8 §6/§7/§8): the post-call chunk/checkpoint matrix. Every fixture runs
+// whole-chunk and bytewise with an agreeing final state; consecutive wrappers keep
+// eligibility, visible content (including form feed) locks, and checkpoint/restore
+// recovers the exact post-call gate including a partial second marker.
+void test_r8_post_call_chunk_checkpoint_matrix() {
+    using Mode = ninfer::ToolCallSyntaxMode;
+    using Intent = ninfer::ToolCallIntentPolicy;
+    const char* marker = "<tool_call>";
+    const char* call1 =
+        "<tool_call><function=bash><parameter=command>echo hi</parameter></function></tool_call>";
+    const char* call2 =
+        "<tool_call><function=bash><parameter=command>echo again</parameter></function></tool_call>";
+
+    // C/D/K: no gap, mixed-whitespace gap, and CRLF gap — the second wrapper stays
+    // eligible (R8-I4), and whole-chunk vs bytewise commits agree (Round 8 §3.12/§7).
+    for (const std::string& gap : {std::string{}, std::string("\n\t \r\n"), std::string("\r\n")}) {
+        const std::string text = std::string(call1) + gap + call2;
+        ToolCallGrammarConstraint whole(64, Mode::Compatibility, Intent::RequireToolAtContentStart);
+        whole.commit(text);
+        check(!whole.active(), "r8 matrix C/D/K: the whole-chunk region ends closed");
+        ToolCallGrammarConstraint bytewise(64, Mode::Compatibility, Intent::RequireToolAtContentStart);
+        for (std::size_t i = 0; i < text.size(); ++i) { bytewise.commit(text.substr(i, 1)); }
+        check(bytewise.active() == whole.active() && bytewise.finished() == whole.finished(),
+              "r8 matrix C/D/K: the bytewise final state agrees with the whole chunk");
+        ToolCallGrammarConstraint split(64, Mode::Compatibility, Intent::RequireToolAtContentStart);
+        split.commit(std::string(call1) + gap);
+        split.commit(marker);
+        check(split.active(), "r8 matrix C/D/K: the second wrapper marker stays eligible");
+    }
+
+    // E/L: visible prose and form feed after the first call lock in both whole-chunk and
+    // bytewise form (form feed is visible content, not format whitespace; Round 8 §3.21).
+    for (const std::string& suffix : {std::string("\nvisible prose\n"), std::string("\f")}) {
+        const std::string text = std::string(call1) + suffix + call2;
+        ToolCallGrammarConstraint whole(64, Mode::Compatibility, Intent::RequireToolAtContentStart);
+        whole.commit(text);
+        whole.commit(marker);
+        check(!whole.active(), "r8 matrix E/L: visible content keeps later markers content");
+        ToolCallGrammarConstraint bytewise(64, Mode::Compatibility, Intent::RequireToolAtContentStart);
+        for (std::size_t i = 0; i < text.size(); ++i) { bytewise.commit(text.substr(i, 1)); }
+        bytewise.commit(marker);
+        check(!bytewise.active() && bytewise.finished() == whole.finished(),
+              "r8 matrix E/L: the bytewise form agrees and stays locked");
+    }
+
+    // N (checkpoint inside a partial second marker): the failed draft locks; the restore
+    // recovers the exact partial marker state so the marker can still complete.
+    {
+        ToolCallGrammarConstraint constraint(64, Mode::Compatibility, Intent::RequireToolAtContentStart);
+        constraint.commit(std::string(call1) + "\n<tool_");
+        const ToolCallGrammarConstraint cp = constraint.checkpoint();
+        constraint.commit("x>");
+        constraint.commit(marker);
+        check(!constraint.active(), "r8 N: the failed draft locks the gate");
+        constraint.restore(cp);
+        constraint.commit("call>");
+        check(constraint.active(), "r8 N: the restore keeps the partial marker completable");
+    }
+
+    // Syntax cross: the post-call gate is orthogonal to the entry syntax (Round 8 §3.19).
+    {
+        const std::string text = std::string(call1) + "\nvisible prose\n" + call2;
+        ToolCallGrammarConstraint native(64, Mode::QwenWrappedNative, Intent::RequireToolAtContentStart);
+        native.commit(text);
+        native.commit(marker);
+        check(!native.active(), "r8 xprod: (native, soc) post-call prose locks");
+        ToolCallGrammarConstraint native_ws(64, Mode::QwenWrappedNative, Intent::RequireToolAtContentStart);
+        native_ws.commit(std::string(call1) + "\n");
+        native_ws.commit(marker);
+        check(native_ws.active(), "r8 xprod: (native, soc) post-call whitespace stays open");
+    }
+}
+
 } // namespace
 
 int main() {
@@ -731,6 +817,7 @@ int main() {
     test_r6_constraint_checkpoint_restore_preserves_syntax();
     test_r7_intent_content_start_gate();
     test_r8_constraint_post_call_gate();
+    test_r8_post_call_chunk_checkpoint_matrix();
     if (failures == 0) { std::puts("tool_call_grammar_state tests: all passed"); }
     return failures == 0 ? 0 : 1;
 }
