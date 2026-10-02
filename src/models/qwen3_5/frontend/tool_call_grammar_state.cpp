@@ -71,11 +71,13 @@ ToolCallGrammarConstraint::advance(std::string_view decoded_bytes, ToolCallGramm
                 return ToolCallConstraintVerdict::Rejected;
             }
             if (progress.termination == ToolCallRegionTermination::Complete) {
-                // The region closed cleanly: the syntax is unconstrained again and a later
-                // region may retrigger (the parser accepts consecutive wrappers).
+                // R8-01: the region closed cleanly; the hardened gate stays open for a
+                // directly consecutive wrapper. The closing tag is not retained as a future
+                // marker candidate: a stale closer would flush as a failed candidate and
+                // lock the gate (Round 8 §3.6).
                 state.triggered_ = false;
-                state.marker_prefix_ = marker_suffix(combined);
                 state.buffer_.clear();
+                state.marker_prefix_.clear();
                 continue;
             }
             // EndOfInput: the candidate ends inside an open structure — a legal prefix.
@@ -94,8 +96,9 @@ ToolCallGrammarConstraint::advance(std::string_view decoded_bytes, ToolCallGramm
             if (state.marker_prefix_.empty()) {
                 if (byte == '<') { state.marker_prefix_.push_back(byte); }
                 else if (state.intent_ == ToolCallIntentPolicy::RequireToolAtContentStart &&
-                         !state.latched_once_ && !is_tool_format_whitespace(byte)) {
-                    // R7-02: visible content before the first latch locks the gate for the turn.
+                         !is_tool_format_whitespace(byte)) {
+                    // R8-01: visible content locks the gate at any point (R8-I2: the first
+                    // latch is not permanent permission).
                     state.entry_locked_ = true;
                 }
                 ++i;
@@ -116,16 +119,14 @@ ToolCallGrammarConstraint::advance(std::string_view decoded_bytes, ToolCallGramm
                     continue;
                 }
                 state.triggered_ = true;
-                state.latched_once_ = true;  // R7-02: the first latch satisfies the content-start gate
                 state.buffer_ = state.marker_prefix_ + std::string(decoded_bytes.substr(i + 1));
                 state.marker_prefix_.clear();
                 offset = decoded_bytes.size();
                 break;  // re-enter: the full candidate is now region text
             }
             if (status == ToolMarkerStatus::NotMarker) {
-                if (state.intent_ == ToolCallIntentPolicy::RequireToolAtContentStart &&
-                    !state.latched_once_) {
-                    // R7-02: a failed marker candidate before the first latch is visible content.
+                if (state.intent_ == ToolCallIntentPolicy::RequireToolAtContentStart) {
+                    // R8-01: a failed marker candidate is visible content at any point.
                     state.entry_locked_ = true;
                 }
                 // F8: a breaking '<' starts a fresh candidate (shared split rule).
