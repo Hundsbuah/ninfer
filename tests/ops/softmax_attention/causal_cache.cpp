@@ -2845,9 +2845,10 @@ int run_wide_batch_copy_cases(KvCacheStorage storage) {
 }
 
 // The fast INT8 prompt kernel over prompt-route widths: partial row blocks, both CTA shapes (its
-// launcher picks four or eight warps from the width), V magnitudes on either side of its
-// FP16-partial scale limit, graph replay, and the production 3584-token prefill chunk as a first
-// chunk and after a long history.
+// launcher picks four or eight warps from the width), launches over enough key pages to split them
+// across CTAs (including an envelope far past the populated keys, so late splits own no visible
+// key), V magnitudes on either side of its FP16-partial scale limit, graph replay, masked rows, and
+// the production 3584-token prefill chunk as a first chunk and after a long history.
 int run_int8_fast_prompt_cases(bool pv8) {
     constexpr KvCacheStorage storage = KvCacheStorage::Int8Group64;
     int failures                     = 0;
@@ -2869,6 +2870,8 @@ int run_int8_fast_prompt_cases(bool pv8) {
     failures += run_a1_case(h16, storage, fast({1500, 500, 2000, 905u}), MappingPattern::Identity);
     failures +=
         run_a3_case(h16, storage, fast({257, 2000, 2257, 906u}), MappingPattern::Fragmented);
+    failures += run_a3_case(h24, storage, fast({300, 1900, 8192, 917u}), MappingPattern::Offset);
+    failures += run_a1_case(h16, storage, fast({600, 5000, 9000, 918u}), MappingPattern::Identity);
     // |V| up to 2048 puts group scales near 16, whose FP16 partials would overflow without the
     // power-of-two rescale; |V| up to 900 keeps scales near 7, inside the unscaled path's margin.
     failures += run_a1_case(h24, storage, values({300, 1000, 1300, 907u}, 2048.0f),
@@ -2896,6 +2899,11 @@ int run_int8_fast_prompt_cases(bool pv8) {
     masked.fast_prompt_kernel = true;
     masked.fast_prompt_pv8    = pv8;
     failures += run_batch_case(h24, storage, masked);
+    BatchAttentionCase split_masked{300, {3000}, {211}, {0}, MappingPattern::Fragmented, 919u};
+    split_masked.graph_replay       = true;
+    split_masked.fast_prompt_kernel = true;
+    split_masked.fast_prompt_pv8    = pv8;
+    failures += run_batch_case(h24, storage, split_masked);
     return failures;
 }
 
