@@ -648,6 +648,7 @@ enum class ToolSelectionKind {
 struct ToolSelection {
     ToolSelectionKind kind = ToolSelectionKind::Auto;
     std::string name;
+    bool disable_parallel_tool_use = false;
 };
 
 ToolSelection parse_tool_choice(const Json& body) {
@@ -670,7 +671,8 @@ ToolSelection parse_tool_choice(const Json& body) {
     } else {
         bad_request("unsupported tool_choice type: " + type, "tool_choice");
     }
-    (void)optional_bool(choice, "disable_parallel_tool_use", false);
+    result.disable_parallel_tool_use =
+        optional_bool(choice, "disable_parallel_tool_use", false);
     return result;
 }
 
@@ -685,6 +687,7 @@ struct ParsedTool {
     ToolSource source = ToolSource::UserDefined;
     std::string source_type;
     bool defer_loading = false;
+    bool strict = false;
     std::optional<std::vector<std::string>> allowed_callers;
 };
 
@@ -742,6 +745,7 @@ std::vector<ParsedTool> parse_tool_definitions(const Json& body) {
             if (!item.at("strict").is_boolean()) {
                 bad_request("tool strict must be a boolean", "tools");
             }
+            parsed.strict = item.at("strict").get<bool>();
         }
         if (item.contains("defer_loading") && !item.at("defer_loading").is_null()) {
             if (!item.at("defer_loading").is_boolean()) {
@@ -777,15 +781,32 @@ void lower_tools(const Json& body, GenerationRequest& request) {
         return tool.definition.name == selection.name;
     };
 
-    // Forced choices are advisory, as on the OpenAI endpoints: the Engine cannot force a call, so a
-    // named choice is checked against the declared tools and automatic selection proceeds. Qwen
-    // Code, for one, sends tool_choice any for every JSON side query (docs/serving.md).
+    // R9-04: forced choices and single-call guarantees are guarantees NInfer cannot
+    // provide. A named choice validates the declared name first (unknown names keep the
+    // existing unknown-tool error), then a known name or any is rejected; prompting or
+    // post-generation filtering would fake the guarantee (Round 9 §6.2/§6.3/§6.4/§6.6/§6.7).
     if (selection.kind == ToolSelectionKind::Named &&
         std::none_of(definitions.begin(), definitions.end(), named)) {
         bad_request("tool_choice references unknown tool: " + selection.name, "tool_choice");
     }
     if (selection.kind == ToolSelectionKind::Any && definitions.empty()) {
         bad_request("tool_choice requires tools", "tool_choice");
+    }
+    if (selection.kind == ToolSelectionKind::Any || selection.kind == ToolSelectionKind::Named) {
+        bad_request(
+            selection.kind == ToolSelectionKind::Any
+                ? "tool_choice 'any' forces a tool call, which NInfer cannot guarantee"
+                : "tool_choice 'tool' forces an exact tool call, which NInfer cannot guarantee",
+            "tool_choice", "tool_choice_not_supported");
+    }
+    const bool callable =
+        std::any_of(definitions.begin(), definitions.end(),
+                    [](const ParsedTool& tool) { return tool.source == ToolSource::UserDefined; });
+    if (selection.disable_parallel_tool_use && selection.kind != ToolSelectionKind::None &&
+        callable) {
+        bad_request("disable_parallel_tool_use limits tool execution to a single call, which "
+                    "NInfer cannot guarantee",
+                    "tool_choice.disable_parallel_tool_use", "parallel_tool_calls_not_supported");
     }
 
     request.tool_choice.mode =
@@ -799,7 +820,8 @@ void lower_tools(const Json& body, GenerationRequest& request) {
         return;
     }
 
-    for (ParsedTool& tool : definitions) {
+    for (std::size_t index = 0; index < definitions.size(); ++index) {
+        ParsedTool& tool = definitions[index];
         if (tool.source == ToolSource::Toolset) {
             bad_request("Anthropic toolsets require a tool loader that NInfer does not provide",
                         "tools", "toolsets_not_supported");
@@ -810,7 +832,14 @@ void lower_tools(const Json& body, GenerationRequest& request) {
                             "NInfer does not provide",
                         "tools", "anthropic_tools_not_supported");
         }
-        // strict=true is advisory: generation is not constrained to the declared JSON Schema.
+        if (tool.strict) {
+            // R9-04: strict=true is a schema-adherence guarantee that requires constrained
+            // decoding; it is neutral only under tool_choice:none (handled above).
+            bad_request("strict function schema enforcement requires constrained decoding, "
+                        "which the Engine does not provide",
+                        "tools[" + std::to_string(index) + "].strict",
+                        "strict_tools_not_supported");
+        }
         if (tool.defer_loading) {
             bad_request("defer_loading=true requires a deferred tool loader that NInfer does not "
                         "provide",
@@ -825,7 +854,6 @@ void lower_tools(const Json& body, GenerationRequest& request) {
         }
         request.tools.push_back(std::move(tool.definition));
     }
-    // disable_parallel_tool_use=true is advisory: the model may still emit several calls.
 }
 
 void parse_thinking(const Json& body, GenerationRequest& request, ParsePurpose purpose) {

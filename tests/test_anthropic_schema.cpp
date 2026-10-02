@@ -392,43 +392,70 @@ int test_tools() {
                              rendered["function"]["input_examples"].is_array(),
                          "Anthropic tool schema/examples did not reach the Qwen prompt");
 
-    // strict=true is advisory, as on the OpenAI endpoints: the tool is served unconstrained.
-    body["tools"]                        = Json::array({ordinary_tool(true)});
-    const GenerationRequest strict_tools = parse(body).generation;
-    failures += check(strict_tools.uses_tools() && strict_tools.tools.size() == 1,
-                      "an advisory strict tool was rejected or dropped");
-    body["tool_choice"]               = Json{{"type", "none"}, {"disable_parallel_tool_use", true}};
-    body["tools"][0]["defer_loading"] = true;
+    // R9-04: strict=true is a schema-adherence guarantee that requires constrained
+    // decoding: reject for callable tools, neutral under tool_choice:none.
+    body["tools"] = Json::array({ordinary_tool(true)});
+    failures += check(api_code([&] { (void)parse(body); }) == "strict_tools_not_supported" &&
+                          api_param([&] { (void)parse(body); }) == "tools[0].strict",
+                      "R9-04: strict true with callable tools is rejected");
+    body["tool_choice"] = Json{{"type", "none"}};
+    failures += check(!parse(body).generation.uses_tools(),
+                      "R9-04: strict true under tool_choice:none stays neutral");
+    body["tools"][0]["strict"]             = "yes";
+    body["tools"][0]["defer_loading"]      = true;
     body["tools"][0]["allowed_callers"] = Json::array({"code_execution"});
+    failures += check(api_param([&] { (void)parse(body); }) == "tools",
+                      "a non-boolean strict keeps the field-type error");
+    body["tools"][0]["strict"] = false;
     const GenerationRequest disabled    = parse(body).generation;
     failures += check(!disabled.uses_tools() && prompt(disabled).options.tool_jsons.empty(),
                       "tool_choice:none did not neutralize inactive tool guarantees");
 
-    // Forced, named and single-call choices are advisory: the Engine cannot force a call, so the
-    // tools stay offered under automatic selection. Qwen Code sends any for its JSON side queries.
+    // R9-04: forced choices and the single-call guarantee are rejected fail-fast instead of
+    // being faked by prompting or post-generation filtering.
     body          = base_request();
     body["tools"] = Json::array({ordinary_tool()});
-    for (const Json& choice : {Json{{"type", "any"}}, Json{{"type", "tool"}, {"name", "weather"}},
-                               Json{{"type", "auto"}, {"disable_parallel_tool_use", true}},
-                               Json{{"type", "any"}, {"disable_parallel_tool_use", true}}}) {
-        body["tool_choice"]              = choice;
-        const GenerationRequest advisory = parse(body).generation;
-        failures += check(advisory.uses_tools() &&
-                              advisory.tool_choice.mode == ToolChoiceMode::Auto &&
-                              prompt(advisory).options.tool_jsons.size() == 1,
-                          "an advisory tool choice was rejected or did not keep the tools offered");
-    }
+    body["tool_choice"] = Json{{"type", "any"}};
+    failures += check(api_code([&] { (void)parse(body); }) == "tool_choice_not_supported" &&
+                          api_param([&] { (void)parse(body); }) == "tool_choice",
+                      "R9-04: tool_choice any is rejected as unguaranteeable forcing");
+    body["tool_choice"] = Json{{"type", "tool"}, {"name", "weather"}};
+    failures += check(api_code([&] { (void)parse(body); }) == "tool_choice_not_supported",
+                      "R9-04: a named declared tool is rejected as unguaranteeable forcing");
+    body["tool_choice"] = Json{{"type", "auto"}, {"disable_parallel_tool_use", true}};
+    failures += check(
+        api_code([&] { (void)parse(body); }) == "parallel_tool_calls_not_supported" &&
+            api_param([&] { (void)parse(body); }) == "tool_choice.disable_parallel_tool_use",
+        "R9-04: auto + disable_parallel_tool_use + callable tools is rejected");
+    body["tool_choice"] = Json{{"type", "none"}, {"disable_parallel_tool_use", true}};
+    failures += check(!parse(body).generation.uses_tools(),
+                      "R9-04: none + disable_parallel_tool_use stays accepted neutral");
     body["tool_choice"] = Json{{"type", "tool"}, {"name", "forecast"}};
     failures += check(api_param([&] { (void)parse(body); }) == "tool_choice",
-                      "a named choice of an undeclared tool was accepted");
+                      "a named choice of an undeclared tool keeps the unknown-tool error");
     body["tool_choice"] = Json{{"type", "tool"}, {"name", "weather"},
                                {"disable_parallel_tool_use", "yes"}};
     failures += check(api_param([&] { (void)parse(body); }) == "disable_parallel_tool_use",
-                      "a non-boolean disable_parallel_tool_use was accepted");
+                      "a non-boolean disable_parallel_tool_use keeps the field-type error");
     body          = base_request();
     body["tool_choice"] = Json{{"type", "any"}};
     failures += check(api_param([&] { (void)parse(body); }) == "tool_choice",
-                      "tool_choice any without tools was accepted");
+                      "tool_choice any without tools keeps the param error");
+
+    // R9-04 §6.10: Count Tokens shares the Messages prompt normalization
+    // (parse_common_prompt -> lower_tools), so the tool-choice guarantees are rejected
+    // identically on both endpoints.
+    body          = base_request();
+    body["tools"] = Json::array({ordinary_tool()});
+    body["tool_choice"] = Json{{"type", "any"}};
+    failures += check(api_code([&] { (void)parse_anthropic_count_tokens_request(body); }) ==
+                          "tool_choice_not_supported",
+                      "R9-04: Count Tokens rejects tool_choice any like Messages");
+    body["tools"] = Json::array({ordinary_tool(true)});
+    body["tool_choice"] = Json{{"type", "auto"}};
+    failures += check(api_code([&] { (void)parse_anthropic_count_tokens_request(body); }) ==
+                          "strict_tools_not_supported",
+                      "R9-04: Count Tokens rejects strict true like Messages");
 
     body          = base_request();
     body["tools"] = Json::array({Json{{"type", "web_search_20250305"}, {"name", "web_search"}}});

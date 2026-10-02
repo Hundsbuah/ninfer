@@ -884,12 +884,28 @@ closed-turn reasoning history. `output_config.effort` passes its protocol-valida
 selected template, substituting the nearest value the template accepts as described above.
 
 User-defined tools support `name`, `description`, object `input_schema`, and `input_examples`.
-`tool_choice:auto` and `none` are executable. As on the OpenAI endpoints, `tool_choice` `any` and
-named `tool`, `strict:true`, and `disable_parallel_tool_use:true` are accepted as advisory: the
-Engine cannot force a call, constrain arguments to the schema, or limit the model to one call, so
-the tools stay offered under automatic selection. A named choice must name a declared tool, and
-`any` requires tools. Qwen Code sends `any` for its JSON side queries (permission classifier,
-session title, next-speaker check). Deferred tools, tools that exclude direct model calls,
+`tool_choice:auto` and `none` are executable. Round 9 (R9-04) rejects the tool guarantees the
+Engine cannot provide with HTTP 400 instead of the previous silent advisory downgrade:
+
+| Anthropic field | Round-9 behavior |
+|---|---|
+| `tool_choice:auto` | supported |
+| `tool_choice:none` | supported |
+| `tool_choice:any` + tools | rejected (`tool_choice_not_supported`) |
+| `tool_choice:tool` + declared name | rejected (`tool_choice_not_supported`) |
+| `tool_choice:tool` + unknown name | rejected (unknown-tool error, unchanged) |
+| `disable_parallel_tool_use:false` | supported |
+| `disable_parallel_tool_use:true` + callable tools | rejected (`parallel_tool_calls_not_supported`) |
+| `disable_parallel_tool_use:true` + `tool_choice:none` | accepted neutral |
+| `strict:false` / omitted | supported |
+| `strict:true` + callable tools | rejected (`strict_tools_not_supported`) |
+| `strict:true` + `tool_choice:none` | accepted neutral |
+
+Count Tokens shares this validation: the same guarantees are rejected on both endpoints.
+Qwen Code sends `any` for its JSON side queries (permission classifier, session title,
+next-speaker check); if that compatibility path is required, an explicit non-standard opt-in is
+introduced with recorded compatibility evidence (Round 9 §6.8). Deferred tools, tools that
+exclude direct model calls,
 Anthropic-provided/server tools, toolsets, MCP, and containers are rejected because their executor
 is absent. `tool_result` preserves text/image order and marks
 `is_error:true` explicitly in the model prompt. For a visible Assistant tool-use turn, the next

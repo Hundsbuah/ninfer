@@ -3,6 +3,7 @@
 #include <nlohmann/json.hpp>
 
 #include <iostream>
+#include "serve/anthropic_messages.h"
 #include "serve/openai_chat.h"
 #include "serve/openai_common.h"
 #include "serve/request.h"
@@ -124,6 +125,43 @@ int test_r9_chat_custom_error_payload() {
     return failures;
 }
 
+// R9-04 / R9-12 (Round 9 §6.9/§12): HTTP-level error for POST /v1/messages with
+// tool_choice=any. The Anthropic external envelope renders type/error/message/request_id
+// (param and code are internal-only), so the body test asserts the envelope and the
+// message while the internal state keeps param/code.
+int test_r9_anthropic_tool_choice_error_payload() {
+    using namespace ninfer::serve;
+    int failures = 0;
+    const Json body = Json{{"model", "claude-local"},
+                           {"max_tokens", 4096},
+                           {"messages", Json::array({Json{{"role", "user"}, {"content", "hi"}}})},
+                           {"tools",
+                            Json::array({Json{{"name", "weather"},
+                                              {"input_schema", Json{{"type", "object"}}}}})},
+                           {"tool_choice", Json{{"type", "any"}}}};
+    ApiError error;
+    bool rejected = false;
+    try {
+        (void)parse_anthropic_messages_request(body, RequestLimits{});
+    } catch (const ApiException& exception) {
+        rejected = true;
+        error    = exception.error();
+    }
+    failures += check(rejected, "R9 http: tool_choice any is rejected before generation");
+    failures += check(error.status == 400 && error.type == "invalid_request_error",
+                      "R9 http: the Anthropic error carries the 400 status");
+    failures += check(error.param == "tool_choice" && error.code == "tool_choice_not_supported",
+                      "R9 http: the internal state carries param and code");
+    const Json rendered = Json::parse(make_anthropic_error_body(error, "req_r9_test"));
+    failures += check(rendered.at("type").get<std::string>() == "error" &&
+                          rendered.at("error").at("type").get<std::string>() ==
+                              "invalid_request_error" &&
+                          rendered.at("error").at("message").is_string() &&
+                          rendered.at("request_id").get<std::string>() == "req_r9_test",
+                      "R9 http: the Anthropic envelope renders type/message/request_id");
+    return failures;
+}
+
 int main() {
     int failures = 0;
     using ninfer::serve::api_route_pattern;
@@ -203,6 +241,7 @@ int main() {
     failures += test_r8_chat_capability_error_payload();
     failures += test_r9_chat_strict_error_payload();
     failures += test_r9_chat_custom_error_payload();
+    failures += test_r9_anthropic_tool_choice_error_payload();
     if (failures == 0) { std::cout << "http routes tests passed\n"; }
     return failures == 0 ? 0 : 1;
 }
