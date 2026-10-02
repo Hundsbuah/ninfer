@@ -765,9 +765,12 @@ void parse_tool_choice(const Json& body, GenerationRequest& output) {
         } else if (value == "none") {
             output.tool_choice.mode = ToolChoiceMode::None;
         } else if (value == "required") {
-            // Advisory: accepted without forcing a call, because the engine cannot guarantee that
-            // the model emits one (docs/serving.md). Automatic selection remains in force.
-            output.tool_choice.mode = ToolChoiceMode::Auto;
+            // R8-02: OpenAI's "required" semantics force at least one tool call, which the
+            // Engine cannot guarantee: reject it instead of silently weakening it to
+            // automatic selection (consistent with the Responses adapter).
+            bad_request("tool_choice 'required' forces at least one tool call, which NInfer "
+                        "cannot guarantee",
+                        "tool_choice", "tool_choice_not_supported");
         } else {
             bad_request("tool_choice must be 'auto', 'none', 'required', or a function choice",
                         "tool_choice");
@@ -784,18 +787,23 @@ void parse_tool_choice(const Json& body, GenerationRequest& output) {
             if (!choice.contains("function") || !choice.at("function").is_object()) {
                 bad_request("function tool_choice must contain a function object", "tool_choice");
             }
-            // A named choice is advisory: the engine cannot force that exact function, so the
-            // declared name is validated and automatic selection proceeds (docs/serving.md).
+            // R8-02: a named function choice forces that specific tool call. A one-tool set
+            // still permits no tool call, so the forcing is unguaranteeable: validate the
+            // name first, then reject it.
             (void)require_function_name(choice.at("function"), "tool_choice.function.name");
-            output.tool_choice.mode = ToolChoiceMode::Auto;
+            bad_request("a named tool_choice forces an exact tool call, which NInfer cannot "
+                        "guarantee",
+                        "tool_choice", "tool_choice_not_supported");
         } else if (type == "custom") {
             if (!choice.contains("custom") || !choice.at("custom").is_object()) {
                 bad_request("custom tool_choice must contain a custom object", "tool_choice");
             }
-            // Custom tools are served as functions with one string input, so a custom choice is
-            // validated and then handled like any other advisory named choice.
+            // R8-02: a named custom choice forces that specific custom tool call: the same
+            // unguaranteeable forcing as the named function choice.
             (void)require_function_name(choice.at("custom"), "tool_choice.custom.name");
-            output.tool_choice.mode = ToolChoiceMode::Auto;
+            bad_request("a named tool_choice forces an exact tool call, which NInfer cannot "
+                        "guarantee",
+                        "tool_choice", "tool_choice_not_supported");
         } else {
             bad_request("unsupported tool_choice type: " + type, "tool_choice");
         }
