@@ -320,14 +320,26 @@ int test_tools() {
         check(!none.generation.uses_tools() && prompt(none.generation).options.tool_jsons.empty(),
               "tool_choice none makes parallel_tool_calls neutral and removes executable tools");
 
+    // R8-02: required guarantees at least one tool call, which the Engine cannot
+    // guarantee: reject it instead of silently weakening to automatic selection.
     body["tool_choice"] = "required";
-    const GenerationRequest required_choice = parse(body).generation;
-    failures += check(required_choice.uses_tools() &&
-                          prompt(required_choice).options.tool_jsons.size() == 1,
-                      "required tool choice is accepted as advisory auto selection");
+    const ApiError required_error = api_error([&] { (void)parse(body); });
+    failures += check(required_error.param == "tool_choice" &&
+                          required_error.code == "tool_choice_not_supported",
+                      "required tool choice is rejected as an unguaranteeable guarantee");
+    // R8-02: a named choice forces one exact tool call. A one-tool set still permits no
+    // tool call, so the forcing is rejected (valid declared name: the failure proves
+    // unsupported forcing, not malformed input).
     body["tool_choice"] = Json{{"type", "function"}, {"function", Json{{"name", "weather"}}}};
-    failures += check(parse(body).generation.uses_tools(),
-                      "named tool choice is accepted as advisory auto selection");
+    const ApiError named_error = api_error([&] { (void)parse(body); });
+    failures += check(named_error.param == "tool_choice" &&
+                          named_error.code == "tool_choice_not_supported",
+                      "named function tool choice is rejected as an unguaranteeable forcing");
+    body["tool_choice"] = Json{{"type", "custom"}, {"custom", Json{{"name", "shell"}}}};
+    const ApiError named_custom_error = api_error([&] { (void)parse(body); });
+    failures += check(named_custom_error.param == "tool_choice" &&
+                          named_custom_error.code == "tool_choice_not_supported",
+                      "named custom tool choice is rejected as an unguaranteeable forcing");
 
     body          = base_request();
     body["tools"] = Json::array({function_tool(), function_tool("search")});
@@ -348,11 +360,12 @@ int test_tools() {
     const GenerationRequest direct_allowed = parse(body).generation;
     failures += check(direct_allowed.tools.size() == 1 && direct_allowed.tools[0].name == "weather",
                       "direct allowed_tools compatibility shape is accepted");
-    body["tool_choice"]["mode"] = "required";
-    const GenerationRequest required_allowed = parse(body).generation;
-    failures += check(required_allowed.tools.size() == 1 &&
-                          required_allowed.tools[0].name == "weather",
-                      "required allowed_tools is accepted as advisory auto selection");
+    // R8-02: required invocation from an allowed subset cannot be guaranteed (the
+    // filtered set still permits no tool call): reject before mutating the effective set.
+    const ApiError required_allowed_error = api_error([&] { (void)parse(body); });
+    failures += check(required_allowed_error.param == "tool_choice" &&
+                          required_allowed_error.code == "tool_choice_not_supported",
+                      "required allowed_tools is rejected as an unguaranteeable guarantee");
     body["tool_choice"]["mode"]             = "auto";
     body["tool_choice"]["tools"][0]["name"] = "missing";
     failures += check(
@@ -383,8 +396,12 @@ int test_tools() {
     body                        = base_request();
     body["tools"]               = Json::array({function_tool()});
     body["parallel_tool_calls"] = false;
-    failures += check(parse(body).generation.uses_tools(),
-                      "parallel_tool_calls=false is accepted as advisory with tools enabled");
+    // R8-02: parallel_tool_calls=false limits the response to zero or one tool call, which
+    // NInfer cannot guarantee while callable tools are enabled: reject it.
+    const ApiError parallel_error = api_error([&] { (void)parse(body); });
+    failures += check(parallel_error.param == "parallel_tool_calls" &&
+                          parallel_error.code == "parallel_tool_calls_not_supported",
+                      "parallel_tool_calls=false with callable tools is rejected");
     body.erase("tools");
     failures += check(parse(body).generation.tools.empty(),
                       "parallel_tool_calls=false is neutral without tools");
