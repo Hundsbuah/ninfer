@@ -2,6 +2,7 @@
 
 
 #include "models/qwen3_5/frontend/tool_call_parser.h"
+#include "models/qwen3_5/frontend/tool_call_grammar_state.h"
 #include <nlohmann/json.hpp>
 
 #include <initializer_list>
@@ -4765,6 +4766,86 @@ int test_r7_intent_retry_cross_matrix() {
     }
     return failures;
 }
+
+// R8-01 (Round 8 §3.20): the post-call eligibility corpus pinning the production parser
+// and the grammar constraint to the same outcome: a completed call keeps the next entry
+// eligible only across formatting whitespace; visible content (prose, a failed marker,
+// or form feed) makes every later marker ordinary text. The production parser corpus is
+// unchanged; the constraint second-entry outcome must agree (no contradiction may
+// remain, R8-I1).
+int test_r8_parser_constraint_post_call_cross_check() {
+    using Intent = ninfer::ToolCallIntentPolicy;
+    using Finish = ninfer::FinishReason;
+    using Syntax = ninfer::ToolCallSyntaxMode;
+    const auto contract = contract_from_definitions(
+        {tool_definition("read", Json{{"path", Json{{"type", "string"}}}}),
+         tool_definition("bash", Json{{"command", Json{{"type", "string"}}}})});
+    const std::string R = tool_call("read", {{"path", "example.txt"}});
+    const std::string B = tool_call("bash", {{"command", "echo REAL"}});
+    int failures = 0;
+
+    const auto parse = [&](const std::string& text, Syntax syntax) {
+        return fi::parse_qwen_tool_call_output(text, 64, *contract, false, Finish::StopToken,
+                                               syntax, ninfer::ToolCallAmbiguityPolicy::FailClosed,
+                                               Intent::RequireToolAtContentStart);
+    };
+    // The constraint's second-entry trigger outcome: after the full corpus text, a fresh
+    // wrapper is eligible (active) only while the tool-sequence gate is open.
+    const auto constraint_eligible = [&](const std::string& text, Syntax syntax) {
+        fi::ToolCallGrammarConstraint constraint(64, syntax, Intent::RequireToolAtContentStart);
+        constraint.commit(text);
+        constraint.commit("<tool_call>");
+        return constraint.active();
+    };
+
+    struct Entry {
+        const char* name;
+        std::string text;
+        int parser_calls; // the production parser's structured outcome
+        bool eligible;    // the constraint's second-entry trigger outcome
+    };
+    const std::vector<Entry> corpus = {
+        {"P1", "\n \t\n" + R, 1, true},                        // whitespace + CALL
+        {"P2", "Example:\n" + R, 0, false},                   // prose + CALL
+        {"P3", R + "\n\t \r\n" + B, 2, true},                 // CALL1 + whitespace + CALL2
+        {"P4", R + "\nNow the real action:\n" + B, 0, false}, // CALL1 + prose + CALL2
+        {"P5", R + "<tool_x>" + B, 0, false},                 // CALL1 + failed marker + CALL2
+        {"P7", R + "\r\n" + B, 2, true},                      // CRLF-separated
+        {"P8", R + "\t" + B, 2, true},                        // tab-separated
+        {"P9", R + "\f" + B, 0, false},                       // form-feed-separated (visible)
+    };
+    for (const Syntax syntax : {Syntax::QwenWrappedNative, Syntax::Compatibility}) {
+        for (const Entry& entry : corpus) {
+            const auto parsed = parse(entry.text, syntax);
+            const int calls   = static_cast<int>(parsed.tool_calls.size());
+            const bool eligible = constraint_eligible(entry.text, syntax);
+            failures += check(calls == entry.parser_calls,
+                              std::string("R8 cross ") + entry.name +
+                                  ": the parser outcome is unchanged");
+            failures += check(eligible == entry.eligible,
+                              std::string("R8 cross ") + entry.name +
+                                  ": the constraint second-entry outcome agrees");
+            failures += check(eligible == (calls >= 1),
+                              std::string("R8 cross ") + entry.name +
+                                  ": no contradiction between parser and constraint");
+        }
+    }
+
+    // P6: CALL1 + partial immediate CALL2 (input ends inside the second wrapper): the
+    // strict parser commits nothing, and the constraint keeps the open prefix legal.
+    {
+        const std::string text = R + "\n<tool_";
+        const auto parsed = parse(text, Syntax::QwenWrappedNative);
+        failures += check(parsed.tool_calls.empty(),
+                          "R8 cross P6: the strict parser commits nothing");
+        fi::ToolCallGrammarConstraint constraint(64, Syntax::QwenWrappedNative,
+                                                 Intent::RequireToolAtContentStart);
+        constraint.commit(text);
+        failures += check(constraint.active(),
+                          "R8 cross P6: the partial second entry stays a legal prefix");
+    }
+    return failures;
+}
 int main() {
     int failures = 0;
     failures += test_r5_syntax_mode_native_vs_compatibility();
@@ -4846,6 +4927,7 @@ int main() {
     failures += test_r7_decoder_intent_parity();
     failures += test_r7_intent_retry_cross_matrix();
     failures += test_r7_hardened_intent_blocks_later_retry_base();
+    failures += test_r8_parser_constraint_post_call_cross_check();
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }
