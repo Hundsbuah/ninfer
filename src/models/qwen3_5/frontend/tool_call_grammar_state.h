@@ -21,7 +21,8 @@ namespace ninfer::models::qwen3_5::frontend {
 // prose and reasoning are always legal (a candidate that ends inside a marker trigger
 // reports NeedMore rather than a decision). A complete trigger activates the region
 // machine, which stays constraining until the region closes cleanly; afterwards the
-// constraint is inactive again and a later region may retrigger.
+// the suffix is constrained: visible content after a completed region is illegal, only
+// formatting whitespace, the next legal tool entry, and EOS remain legal (R9-01).
 enum class ToolCallConstraintVerdict : std::uint8_t {
     Allowed,   // the bytes are a legal continuation (the state advances; the region may close)
     Rejected,  // the bytes break the wire syntax where a legal continuation existed before
@@ -29,6 +30,26 @@ enum class ToolCallConstraintVerdict : std::uint8_t {
                // so far: treat as Allowed when masking, the state stays pending)
 };
 
+// R9-01 (Round 9 §3.4): the explicit phase of the constraint state machine. It replaces
+// the old `triggered_` + `entry_locked_` boolean pair: pre-trigger and post-call
+// between-regions are different states (R9-I2), and TextLocked is the hardened
+// pre-trigger lock (R8-01).
+enum class ToolConstraintPhase : std::uint8_t {
+    PreTrigger,    // no tool has begun (lazy: prose may precede the first entry)
+    TextLocked,    // hardened mode committed visible text before a tool entry; later
+                   // bytes stay ordinary text and later markers never trigger
+    InRegion,      // parse_tool_call_region() is validating a triggered tool sequence
+    BetweenCalls,  // at least one strict tool region completed; only formatting
+                   // whitespace (' ' '\t' '\r' '\n'), the next legal tool marker, and
+                   // EOS are legal — visible suffix content is rejected (R9-I1)
+};
+
+// R9-01: the outcome of one inactive-phase scan over a byte run.
+enum class InactiveScanResult : std::uint8_t {
+    Continued,  // the bytes were consumed; no trigger, no rejection
+    Triggered,  // a complete marker fired (phase_ is InRegion, buffer_ seeded)
+    Rejected,   // a strict-scan illegal byte (between-calls visible suffix content)
+};
 class ToolCallGrammarConstraint {
 public:
     // `max_tool_name_length` mirrors the model's tool-name limit for the strict structural
@@ -80,6 +101,11 @@ public:
     // True while no region is open: initially (nothing has triggered) and after a region
     // closed (a new region may retrigger).
     [[nodiscard]] bool finished() const noexcept;
+    // R9-01 (Round 9 §3.13): true when the input stream may legally end here (an EOS/EOT
+    // candidate is admissible): no open region and no pending marker candidate. A
+    // constrained decoder masks the EOS/EOT candidate while this is false instead of
+    // feeding EOS as decoded bytes.
+    [[nodiscard]] bool can_terminate() const noexcept;
     // Diagnostics only: the open region's byte count while active, otherwise the length
     // of the pending marker candidate (not a count of all bytes observed).
     [[nodiscard]] std::size_t observed_bytes() const noexcept;
@@ -91,14 +117,21 @@ private:
     // the byte rules on a copy of the state words.
     [[nodiscard]] ToolCallConstraintVerdict
     advance(std::string_view decoded_bytes, ToolCallGrammarConstraint* target) const;
-    // R8-01 (Round 8 §3.8): the single authority for the inactive intent-state transitions
-    // (formatting whitespace, marker start/continuation, candidate classification,
-    // failed-candidate rescan, hardened text lock, complete-marker trigger). Shared by
-    // ordinary inactive bytes and the post-call trailing replay. Returns true once a
-    // complete trigger fired (the region buffer is seeded with the marker plus the
-    // remaining bytes).
-    [[nodiscard]] static bool advance_inactive(ToolCallGrammarConstraint& state,
-                                               std::string_view text);
+    // R9-01 (Round 9 §3.5): the pre-trigger lazy scan. Under TemplateCompatible any byte
+    // is ordinary prose; under RequireToolAtContentStart the first visible non-whitespace
+    // byte or a failed marker candidate transitions the phase to TextLocked (R8-01), and
+    // a complete marker under a locked gate is ordinary content (never a trigger). A
+    // complete marker in PreTrigger seeds the region buffer and returns Triggered.
+    [[nodiscard]] static InactiveScanResult
+    advance_pretrigger(ToolCallGrammarConstraint& state, std::string_view text);
+    // R9-01 (Round 9 §3.5): the between-calls strict scan. Only ' ' '\t' '\r' '\n', the
+    // next legal tool marker (shared classifier, §3.6), and EOS are legal; any visible
+    // byte and any failed marker candidate return Rejected — the strict parser would
+    // demote the completed region as TrailingContent, and a constrained sampler must not
+    // admit that continuation (R9-I1). No failed-candidate rescan: a stale leading '<'
+    // is itself illegal suffix content.
+    [[nodiscard]] static InactiveScanResult
+    advance_between_calls(ToolCallGrammarConstraint& state, std::string_view text);
     std::size_t max_tool_name_length_;
     // R6-01: the selected top-level entry syntax (shared by the marker trigger, the
     // pending-prefix classification, and the region re-parse policy). Value-semantic:
@@ -110,13 +143,12 @@ private:
     // Bytes of the open region since the trigger (empty while inactive).
     std::string buffer_;
     // The accumulating marker-trigger candidate while inactive (starts with '<'; may
-    // contain further '<' bytes inside a quoted header value).
+    // contain further '<' bytes inside a quoted header value). Never tracked in
+    // TextLocked (later bytes are ordinary text, R9-I2) or across a completed region
+    // (a stale closer would flush as a failed candidate and reject the gate).
     std::string marker_prefix_;
-    bool triggered_ = false;  // a complete marker fired; the region machine is live
-    // R7-02/R8-01: the content-start gate is locked (visible non-formatting-whitespace
-    // content appeared at any point, before or after a completed call). While locked under
-    // RequireToolAtContentStart a complete marker is ordinary content and never triggers.
-    bool entry_locked_ = false;
+    // R9-01: the explicit phase (replaces the old triggered_ + entry_locked_ booleans).
+    ToolConstraintPhase phase_ = ToolConstraintPhase::PreTrigger;
 };
 
 

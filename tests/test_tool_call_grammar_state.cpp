@@ -160,12 +160,15 @@ void test_string_argument_handling() {
     check(h.constraint.finished(), "string args: the region closed");
 }
 
-// P4.12: multiple tool calls retrigger after a wrapper close.
+// P4.12: multiple tool calls retrigger after a wrapper close. R9-01: visible prose
+// between the regions is rejected suffix content; only formatting whitespace and a
+// directly consecutive wrapper stay legal.
 void test_multiple_tool_calls() {
     Harness h;
     h.allowed("<tool_call><function=a></function></tool_call>", "multi: first region");
     check(h.constraint.active() == false, "multi: inactive between regions");
-    h.allowed(" prose between regions ", "multi: prose after a region");
+    h.allowed(" \n", "multi: whitespace between regions stays legal");
+    h.rejected(" prose between regions ", "multi: prose after a region is rejected (R9-01)");
     h.allowed("<tool_call><function=b><parameter=x></parameter></function></tool_call>",
               "multi: second region");
     check(h.constraint.finished(), "multi: finished after the second region");
@@ -201,7 +204,8 @@ void test_reasoning_before_trigger() {
     check(h.constraint.active(), "reasoning: active after the trigger");
 }
 
-// P4.12: the grammar completes at the correct boundary; subsequent prose is free.
+// P4.12 / R9-01: the grammar completes at the correct boundary; subsequent visible
+// content is rejected suffix content (the constrained sampler cannot admit it).
 void test_grammar_completes_at_correct_boundary() {
     Harness h;
     h.allowed("<tool_call><function=a><parameter=x>v</parameter></function>",
@@ -209,9 +213,9 @@ void test_grammar_completes_at_correct_boundary() {
     check(h.constraint.active(), "boundary: active before the wrapper close");
     h.allowed("</tool_call>", "boundary: the wrapper close completes the region");
     check(h.constraint.finished(), "boundary: finished at the boundary");
-    h.allowed("follow-up prose with < markers <tool_caller and </function> inside",
-              "boundary: prose after completion is free");
-    check(h.constraint.finished(), "boundary: still finished after prose");
+    h.rejected("follow-up prose with < markers <tool_caller and </function> inside",
+               "boundary: prose after completion is rejected (R9-01)");
+    check(h.constraint.finished(), "boundary: still finished after the rejected prose");
 }
 
 // P4.12: UTF-8 multi-byte characters split across token boundaries (byte-oriented syntax).
@@ -307,6 +311,7 @@ void test_all_byte_splits_of_valid_region() {
                 if (constraint.check(second) == ToolCallConstraintVerdict::Rejected) { legal = false; break; }
                 constraint.commit(second);
                 if (was_active && constraint.finished()) { saw_finish = true; }
+                break;  // R9-01: the remainder is fully committed; re-reading committed bytes would re-enter the strict between-calls state
             }
         }
         if (!legal) {
@@ -381,8 +386,7 @@ void test_marker_stream_and_constraint_latch_equivalence() {
                 constraint_trigger = static_cast<int>(i);
             }
         }
-        check(stream_latch == constraint_trigger,
-              ("latch equivalence diverged for \"" + text + "\"").c_str());
+        check(stream_latch == constraint_trigger, "latch equivalence diverged");
     }
 }
 
@@ -474,8 +478,9 @@ void test_r6_constraint_parser_entry_cross_check() {
 }
 
 // R6-01 (Round 6 §3.5): checkpoint/restore is value-semantic and must carry the syntax mode
-// with the state words: a restored native instance still treats a bare <function=...> as
-// ordinary prose (a future restore that copies buffer state but not policy state is caught).
+// with the state words: a restored native instance still rejects a bare <function=...> as
+// non-wrapped suffix content after a closed region (a restore that copies buffer state but
+// not policy state is caught; R9-01 §3.15 sharpens "stays content" to "is rejected").
 void test_r6_constraint_checkpoint_restore_preserves_syntax() {
     using Mode = ninfer::ToolCallSyntaxMode;
     ToolCallGrammarConstraint constraint(64, Mode::QwenWrappedNative);
@@ -489,10 +494,10 @@ void test_r6_constraint_checkpoint_restore_preserves_syntax() {
     constraint.commit("</function>\n</tool_call>\n");
     check(!constraint.active(), "r6-01 restore: region re-closed after restore");
     const ToolCallConstraintVerdict verdict = constraint.check("<function=read>");
-    check(verdict == ToolCallConstraintVerdict::Allowed,
-          "r6-01 restore: bare function stays content under the restored native mode");
+    check(verdict == ToolCallConstraintVerdict::Rejected,
+          "r6-01 restore: bare function after a closed native region is rejected suffix content");
     check(!constraint.active(),
-          "r6-01 restore: restored native mode does not latch a bare function");
+          "r6-01 restore: the rejected bare function does not latch a region");
 }
 
 // R7 (Round 7 §5.7): the tool-entry intent policy is shared between constraint and
@@ -553,15 +558,15 @@ void test_r7_intent_content_start_gate() {
         check(constraint.active(), "r7 soc: consecutive wrapper re-triggers after whitespace");
     }
 
-    // 6. SOC: visible prose after a completed call locks the gate again (R8-01: the first
-    //    latch is not permanent permission): a later marker is ordinary content.
+    // 6. SOC: visible prose after a completed call is rejected (R9-01: the R8 gate lock
+    //    becomes a hard rejection); a rejected candidate never commits.
     {
         ToolCallGrammarConstraint constraint(64, Mode::Compatibility, Intent::RequireToolAtContentStart);
         constraint.commit(full_call);
         check(!constraint.active(), "r8 soc 6: first wrapper closed");
-        constraint.commit("\nor so.\n");
-        constraint.commit(marker);
-        check(!constraint.active(), "r8 soc 6: prose after a completed call locks the gate");
+        check(constraint.check("\nor so.\n") == ToolCallConstraintVerdict::Rejected,
+              "r9 soc 6: prose after a completed call is rejected");
+        check(!constraint.active(), "r9 soc 6: the rejected suffix leaves the state inactive");
     }
 
     // 7. Checkpoint: a speculative draft that emitted prose must not permanently lock
@@ -633,86 +638,91 @@ void test_r8_constraint_post_call_gate() {
         check(constraint.active(), "r8 B: the gate is open after a closed region");
     }
 
-    // E (split): CALL1 + prose + partial CALL2 — the prose locks the gate before the
-    // second marker completes; CALL2 must never trigger (same-token evidence replayed
-    // through the ordinary inactive transitions, Round 8 §3.11).
+    // E (split): CALL1 + prose + partial CALL2 — R9-01: the visible prose between the
+    // calls rejects the whole candidate (a rejected candidate never commits; Round 9
+    // §3.8/§3.11).
     {
         ToolCallGrammarConstraint constraint(64, Mode::Compatibility, Intent::RequireToolAtContentStart);
         constraint.commit(call1);
         check(!constraint.active(), "r8 E: first region closed");
-        constraint.commit("\nvisible prose\n<tool_");
-        constraint.commit("call>");
-        check(!constraint.active(), "r8 E: prose after CALL1 keeps CALL2 from triggering");
-        constraint.commit(marker);
-        check(!constraint.active(), "r8 E: the locked gate keeps a later marker content");
+        check(constraint.check(std::string("\nvisible prose\n<tool_") + "call>") ==
+                  ToolCallConstraintVerdict::Rejected,
+              "r9 E: the prose suffix rejects the whole candidate");
+        check(!constraint.active(), "r9 E: the rejected candidate leaves the state inactive");
     }
 
     // J (same commit): CALL1 + prose + CALL2 in one chunk — no token boundary may hide
-    // the visible content between the calls (Round 8 §3.10).
+    // the visible content between the calls; R9-01: the chunk rejects (Round 8 §3.10,
+    // Round 9 §3.8).
     {
         ToolCallGrammarConstraint constraint(64, Mode::Compatibility, Intent::RequireToolAtContentStart);
-        constraint.commit(std::string(call1) + "\nvisible prose\n" + call2);
-        check(!constraint.active(), "r8 J: the region breaks at the visible content");
-        constraint.commit(marker);
-        check(!constraint.active(), "r8 J: CALL2 and any later marker stay content");
+        check(constraint.check(std::string(call1) + "\nvisible prose\n" + call2) ==
+                  ToolCallConstraintVerdict::Rejected,
+              "r9 J: the visible content between the calls rejects the chunk");
+        check(!constraint.active(), "r9 J: the rejected chunk leaves the state inactive");
     }
 
-    // I (partial failed marker): CALL1 + \n<tool_ then x> then CALL2 — the failed
-    // candidate is visible content and locks the gate (Round 8 §3.15).
+    // I (partial failed marker): CALL1 + \n<tool_ then x> — R9-01: the partial second
+    // marker is a legal prefix (NeedMore, not an open region); the failed continuation
+    // rejects; a rejected candidate never commits, so the pending marker survives for
+    // the good continuation (Round 8 §3.15, Round 9 §3.11).
     {
         ToolCallGrammarConstraint constraint(64, Mode::Compatibility, Intent::RequireToolAtContentStart);
         constraint.commit(std::string(call1) + "\n<tool_");
-        check(constraint.active(), "r8 I: the partial second entry stays a legal prefix");
-        constraint.commit("x>");
-        check(!constraint.active(), "r8 I: the failed candidate closes the region");
-        constraint.commit(call2);
-        constraint.commit(marker);
-        check(!constraint.active(), "r8 I: the failed candidate keeps later markers content");
+        check(constraint.check("x>") == ToolCallConstraintVerdict::Rejected,
+              "r9 I: the failed second marker is rejected suffix content");
+        check(constraint.check("call>") == ToolCallConstraintVerdict::Allowed,
+              "r9 I: the good continuation completes the second entry");
+        constraint.commit("call>");
+        check(constraint.active(), "r9 I: the second region is active");
     }
 
     // H (control, partial immediate CALL2): no visible content between the calls — the
-    // second wrapper resumes as a legal prefix and then triggers (Round 8 §3.14).
+    // pending second marker keeps the chunk a legal prefix (R9-01: the state is
+    // BetweenCalls with a pending marker, not an open region; Round 8 §3.14).
     {
         ToolCallGrammarConstraint constraint(64, Mode::Compatibility, Intent::RequireToolAtContentStart);
         constraint.commit(std::string(call1) + "\n<tool_");
-        check(constraint.active(), "r8 H: the partial immediate CALL2 stays a legal prefix");
+        check(!constraint.active(), "r9 H: the partial CALL2 is a pending marker, not an open region");
         constraint.commit("call>");
-        check(constraint.active(), "r8 H: the second wrapper resumes and triggers");
+        check(constraint.active(), "r9 H: the second wrapper resumes and triggers");
     }
 
-    // M (checkpoint): the post-call gate is value-semantic — a draft that emitted prose
-    // locks the draft, and the restore recovers the exact pre-draft eligibility.
+    // M (checkpoint): the post-call state is value-semantic — a draft that emitted prose
+    // is rejected (the draft never commits it); the restore recovers the clean post-call
+    // state, where the next wrapper still triggers (Round 9 §3.14).
     {
         ToolCallGrammarConstraint constraint(64, Mode::Compatibility, Intent::RequireToolAtContentStart);
         constraint.commit(call1);
         const ToolCallGrammarConstraint cp = constraint.checkpoint();
-        constraint.commit("visible prose");
-        constraint.commit(marker);
-        check(!constraint.active(), "r8 M: the draft prose locks the draft gate");
+        check(constraint.check("visible prose") == ToolCallConstraintVerdict::Rejected,
+              "r9 M: a draft that emits prose after a call is rejected");
         constraint.restore(cp);
         constraint.commit(std::string("\n") + marker);
         check(constraint.active(), "r8 M: the restore keeps the post-call gate open");
     }
 
-    // R8-01b (marker-suffix skip): CALL1 + prose + partial CALL2 in one commit — the
-    // region parser reports TrailingContent and the bytes from its break offset must
-    // replay through the ordinary inactive gate; the rfind('<') suffix must not skip the
-    // prose that carries the lock (Round 8 §3.5/§3.7).
+    // R8-01b (marker-suffix skip): CALL1 + prose + partial CALL2 in one commit — R9-01:
+    // the TrailingContent tail replays through the strict between-calls scan and the
+    // prose rejects the chunk; the rejected chunk never commits (Round 8 §3.5/§3.7,
+    // Round 9 §3.8).
     {
         ToolCallGrammarConstraint constraint(64, Mode::Compatibility, Intent::RequireToolAtContentStart);
-        constraint.commit(std::string(call1) + "\nvisible prose\n<tool_");
-        check(!constraint.active(), "r8 01b: the single-chunk region breaks at the prose");
-        constraint.commit("call>");
-        check(!constraint.active(), "r8 01b: the replayed prose keeps CALL2 from triggering");
+        check(constraint.check(std::string(call1) + "\nvisible prose\n<tool_") ==
+                  ToolCallConstraintVerdict::Rejected,
+              "r9 01b: the single-chunk prose suffix rejects the chunk");
+        check(!constraint.active(), "r9 01b: the rejected chunk leaves the state inactive");
     }
 
-    // TC control: the same E text under TemplateCompatible keeps the historical entry
-    // semantics (the marker after prose still triggers; Round 8 §3.18).
+    // TC control: post-call strictness is orthogonal to the intent policy (R9-I3) — even
+    // under TemplateCompatible the visible suffix rejects; only whitespace + a marker is
+    // legal after a completed call (Round 9 §3.12).
     {
         ToolCallGrammarConstraint constraint(64, Mode::Compatibility, Intent::TemplateCompatible);
-        constraint.commit(std::string(call1) + "\nvisible prose\n" + call2);
-        constraint.commit(marker);
-        check(constraint.active(), "r8 TC: TemplateCompatible keeps the post-prose entry");
+        check(constraint.check(std::string(call1) + "\nvisible prose\n" + call2) ==
+                  ToolCallConstraintVerdict::Rejected,
+              "r9 TC: post-call prose rejects even under TemplateCompatible");
+        check(!constraint.active(), "r9 TC: the rejected chunk leaves the state inactive");
     }
 }
 
@@ -746,42 +756,42 @@ void test_r8_post_call_chunk_checkpoint_matrix() {
         check(split.active(), "r8 matrix C/D/K: the second wrapper marker stays eligible");
     }
 
-    // E/L: visible prose and form feed after the first call lock in both whole-chunk and
-    // bytewise form (form feed is visible content, not format whitespace; Round 8 §3.21).
+    // E/L: visible prose and form feed after the first call reject in both whole-chunk
+    // and bytewise form (R9-01: a rejected candidate never commits; form feed is visible
+    // content, not format whitespace; Round 8 §3.21, Round 9 §3.8).
     for (const std::string& suffix : {std::string("\nvisible prose\n"), std::string("\f")}) {
         const std::string text = std::string(call1) + suffix + call2;
         ToolCallGrammarConstraint whole(64, Mode::Compatibility, Intent::RequireToolAtContentStart);
-        whole.commit(text);
-        whole.commit(marker);
-        check(!whole.active(), "r8 matrix E/L: visible content keeps later markers content");
+        check(whole.check(text) == ToolCallConstraintVerdict::Rejected,
+              "r9 matrix E/L: visible content after the first call rejects the chunk");
         ToolCallGrammarConstraint bytewise(64, Mode::Compatibility, Intent::RequireToolAtContentStart);
-        for (std::size_t i = 0; i < text.size(); ++i) { bytewise.commit(text.substr(i, 1)); }
-        bytewise.commit(marker);
-        check(!bytewise.active() && bytewise.finished() == whole.finished(),
-              "r8 matrix E/L: the bytewise form agrees and stays locked");
+        for (std::size_t i = 0; i < std::string(call1).size(); ++i) { bytewise.commit(text.substr(i, 1)); }
+        check(bytewise.check(text.substr(std::string(call1).size())) ==
+                  ToolCallConstraintVerdict::Rejected,
+              "r9 matrix E/L: the bytewise form rejects at the visible suffix");
     }
 
-    // N (checkpoint inside a partial second marker): the failed draft locks; the restore
-    // recovers the exact partial marker state so the marker can still complete.
+    // N (checkpoint inside a partial second marker): the failed draft rejects (a rejected
+    // candidate never commits); the restore recovers the exact pending-marker state so the
+    // marker can still complete (Round 8 §3.16, Round 9 §3.14).
     {
         ToolCallGrammarConstraint constraint(64, Mode::Compatibility, Intent::RequireToolAtContentStart);
         constraint.commit(std::string(call1) + "\n<tool_");
         const ToolCallGrammarConstraint cp = constraint.checkpoint();
-        constraint.commit("x>");
-        constraint.commit(marker);
-        check(!constraint.active(), "r8 N: the failed draft locks the gate");
+        check(constraint.check("x>") == ToolCallConstraintVerdict::Rejected,
+              "r9 N: the failed continuation is rejected");
         constraint.restore(cp);
         constraint.commit("call>");
-        check(constraint.active(), "r8 N: the restore keeps the partial marker completable");
+        check(constraint.active(), "r9 N: the restore keeps the partial marker completable");
     }
 
-    // Syntax cross: the post-call gate is orthogonal to the entry syntax (Round 8 §3.19).
+    // Syntax cross: the post-call strictness is orthogonal to the entry syntax (Round 8
+    // §3.19, Round 9 §3.15).
     {
         const std::string text = std::string(call1) + "\nvisible prose\n" + call2;
         ToolCallGrammarConstraint native(64, Mode::QwenWrappedNative, Intent::RequireToolAtContentStart);
-        native.commit(text);
-        native.commit(marker);
-        check(!native.active(), "r8 xprod: (native, soc) post-call prose locks");
+        check(native.check(text) == ToolCallConstraintVerdict::Rejected,
+              "r9 xprod: (native, soc) post-call prose rejects");
         ToolCallGrammarConstraint native_ws(64, Mode::QwenWrappedNative, Intent::RequireToolAtContentStart);
         native_ws.commit(std::string(call1) + "\n");
         native_ws.commit(marker);
@@ -902,6 +912,51 @@ void test_r9_constraint_post_call_suffix() {
     }
 }
 
+// R9-01 §3.13: the explicit EOS legality predicate. EOS/EOT is an admissible candidate
+// only when no open structure needs more bytes: a clean preamble or a clean post-call
+// state, a locked pre-trigger gate — but never inside an open region or a pending
+// marker candidate. Runs native × compatibility.
+void test_r9_constraint_termination_predicate() {
+    using Mode   = ninfer::ToolCallSyntaxMode;
+    using Intent = ninfer::ToolCallIntentPolicy;
+    const char* call =
+        "<tool_call><function=weather><parameter=city>Paris</parameter></function></tool_call>";
+
+    for (const Mode syntax : {Mode::QwenWrappedNative, Mode::Compatibility}) {
+        // Fresh: a clean preamble may end.
+        {
+            ToolCallGrammarConstraint constraint(64, syntax);
+            check(constraint.can_terminate(), "r9 term: a fresh preamble may terminate");
+        }
+        // Pending marker candidate, then an open region: both forbid termination.
+        {
+            ToolCallGrammarConstraint constraint(64, syntax);
+            constraint.commit("<tool_");
+            check(!constraint.can_terminate(), "r9 term: a pending marker forbids termination");
+            constraint.commit("call><function=wea");
+            check(!constraint.can_terminate(), "r9 term: an open region forbids termination");
+        }
+        // Clean post-call: a closed sequence (with whitespace) may end; a post-call
+        // partial marker forbids termination.
+        {
+            ToolCallGrammarConstraint constraint(64, syntax);
+            constraint.commit(call);
+            check(constraint.can_terminate(), "r9 term: a closed call may terminate");
+            constraint.commit("\n");
+            check(constraint.can_terminate(), "r9 term: a whitespace-closed sequence may terminate");
+            constraint.commit("<tool_");
+            check(!constraint.can_terminate(), "r9 term: a post-call partial marker forbids termination");
+        }
+        // SOC: a locked preamble may end (the gate decision is final, the stream just
+        // carries ordinary content).
+        {
+            ToolCallGrammarConstraint constraint(64, syntax, Intent::RequireToolAtContentStart);
+            constraint.commit("preamble");
+            check(constraint.can_terminate(), "r9 term: a locked preamble may terminate");
+        }
+    }
+}
+
 } // namespace
 
 int main() {
@@ -932,6 +987,7 @@ int main() {
     test_r8_constraint_post_call_gate();
     test_r8_post_call_chunk_checkpoint_matrix();
     test_r9_constraint_post_call_suffix();
+    test_r9_constraint_termination_predicate();
     if (failures == 0) { std::puts("tool_call_grammar_state tests: all passed"); }
     return failures == 0 ? 0 : 1;
 }

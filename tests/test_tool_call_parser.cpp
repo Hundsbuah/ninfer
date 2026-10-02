@@ -4767,16 +4767,17 @@ int test_r7_intent_retry_cross_matrix() {
     return failures;
 }
 
-// R8-01 (Round 8 §3.20): the post-call eligibility corpus pinning the production parser
-// and the grammar constraint to the same outcome: a completed call keeps the next entry
-// eligible only across formatting whitespace; visible content (prose, a failed marker,
-// or form feed) makes every later marker ordinary text. The production parser corpus is
-// unchanged; the constraint second-entry outcome must agree (no contradiction may
-// remain, R8-I1).
+// R8-01 / R9-01 (Round 8 §3.20, Round 9 §2/§3.18): the post-call eligibility corpus pins
+// the production parser and the grammar constraint to the same outcome. R9-01 sharpens
+// the cross-check: the constraint now REJECTS (verdict) the visible-suffix texts that
+// the strict parser demotes to zero calls — a Rejected verdict and committed calls may
+// not co-occur, and a cut stream inside a pending second marker is NeedMore
+// (EOS-illegal), not a committed open region.
 int test_r8_parser_constraint_post_call_cross_check() {
-    using Intent = ninfer::ToolCallIntentPolicy;
-    using Finish = ninfer::FinishReason;
-    using Syntax = ninfer::ToolCallSyntaxMode;
+    using Intent  = ninfer::ToolCallIntentPolicy;
+    using Finish  = ninfer::FinishReason;
+    using Syntax  = ninfer::ToolCallSyntaxMode;
+    using Verdict = fi::ToolCallConstraintVerdict;
     const auto contract = contract_from_definitions(
         {tool_definition("read", Json{{"path", Json{{"type", "string"}}}}),
          tool_definition("bash", Json{{"command", Json{{"type", "string"}}}})});
@@ -4789,60 +4790,65 @@ int test_r8_parser_constraint_post_call_cross_check() {
                                                syntax, ninfer::ToolCallAmbiguityPolicy::FailClosed,
                                                Intent::RequireToolAtContentStart);
     };
-    // The constraint's second-entry trigger outcome: after the full corpus text, a fresh
-    // wrapper is eligible (active) only while the tool-sequence gate is open.
-    const auto constraint_eligible = [&](const std::string& text, Syntax syntax) {
+    // The constraint's verdict on the full corpus text (a const probe: no state change —
+    // a candidate the constrained sampler would reject is never committed).
+    const auto constraint_verdict = [&](const std::string& text, Syntax syntax) {
         fi::ToolCallGrammarConstraint constraint(64, syntax, Intent::RequireToolAtContentStart);
-        constraint.commit(text);
-        constraint.commit("<tool_call>");
-        return constraint.active();
+        return constraint.check(text);
     };
 
     struct Entry {
         const char* name;
         std::string text;
-        int parser_calls; // the production parser's structured outcome
-        bool eligible;    // the constraint's second-entry trigger outcome
+        int parser_calls;  // the production parser's structured outcome
+        Verdict verdict;   // the constraint's R9-01 full-text verdict
     };
     const std::vector<Entry> corpus = {
-        {"P1", "\n \t\n" + R, 1, true},                        // whitespace + CALL
-        {"P2", "Example:\n" + R, 0, false},                   // prose + CALL
-        {"P3", R + "\n\t \r\n" + B, 2, true},                 // CALL1 + whitespace + CALL2
-        {"P4", R + "\nNow the real action:\n" + B, 0, false}, // CALL1 + prose + CALL2
-        {"P5", R + "<tool_x>" + B, 0, false},                 // CALL1 + failed marker + CALL2
-        {"P7", R + "\r\n" + B, 2, true},                      // CRLF-separated
-        {"P8", R + "\t" + B, 2, true},                        // tab-separated
-        {"P9", R + "\f" + B, 0, false},                       // form-feed-separated (visible)
+        {"P1", "\n \t\n" + R, 1, Verdict::Allowed},
+        {"P2", "Example:\n" + R, 0, Verdict::Allowed},
+        {"P3", R + "\n\t \r\n" + B, 2, Verdict::Allowed},
+        {"P4", R + "\nNow the real action:\n" + B, 0, Verdict::Rejected},
+        {"P5", R + "<tool_x>" + B, 0, Verdict::Rejected},
+        {"P6", R + "\n<tool_", 0, Verdict::NeedMore},
+        {"P7", R + "\r\n" + B, 2, Verdict::Allowed},
+        {"P8", R + "\t" + B, 2, Verdict::Allowed},
+        {"P9", R + "\f" + B, 0, Verdict::Rejected},
     };
     for (const Syntax syntax : {Syntax::QwenWrappedNative, Syntax::Compatibility}) {
         for (const Entry& entry : corpus) {
-            const auto parsed = parse(entry.text, syntax);
-            const int calls   = static_cast<int>(parsed.tool_calls.size());
-            const bool eligible = constraint_eligible(entry.text, syntax);
+            const auto parsed  = parse(entry.text, syntax);
+            const int calls    = static_cast<int>(parsed.tool_calls.size());
+            const Verdict verdict = constraint_verdict(entry.text, syntax);
             failures += check(calls == entry.parser_calls,
                               std::string("R8 cross ") + entry.name +
                                   ": the parser outcome is unchanged");
-            failures += check(eligible == entry.eligible,
+            failures += check(verdict == entry.verdict,
                               std::string("R8 cross ") + entry.name +
-                                  ": the constraint second-entry outcome agrees");
-            failures += check(eligible == (calls >= 1),
+                                  ": the constraint R9 verdict agrees");
+            failures += check(!(verdict == Verdict::Rejected && calls > 0),
                               std::string("R8 cross ") + entry.name +
                                   ": no contradiction between parser and constraint");
         }
     }
 
-    // P6: CALL1 + partial immediate CALL2 (input ends inside the second wrapper): the
-    // strict parser commits nothing, and the constraint keeps the open prefix legal.
+    // P6: CALL1 + partial immediate CALL2 (the input ends inside the second wrapper):
+    // the strict parser commits nothing (the region is cut), the constraint keeps the
+    // prefix legal (NeedMore, EOS-illegal), and the good continuation completes the
+    // marker (Round 9 §3.10/§3.14).
     {
         const std::string text = R + "\n<tool_";
         const auto parsed = parse(text, Syntax::QwenWrappedNative);
-        failures += check(parsed.tool_calls.empty(),
-                          "R8 cross P6: the strict parser commits nothing");
+        failures += check(parsed.tool_calls.empty(), "R8 cross P6: the strict parser commits nothing");
         fi::ToolCallGrammarConstraint constraint(64, Syntax::QwenWrappedNative,
                                                  Intent::RequireToolAtContentStart);
+        failures += check(constraint.check(text) == Verdict::NeedMore,
+                          "R9 cross P6: the partial second entry needs more bytes");
         constraint.commit(text);
+        failures += check(!constraint.can_terminate(),
+                          "R9 cross P6: EOS is illegal inside the pending marker");
+        constraint.commit("call>");
         failures += check(constraint.active(),
-                          "R8 cross P6: the partial second entry stays a legal prefix");
+                          "R9 cross P6: the good continuation completes the marker");
     }
     return failures;
 }
