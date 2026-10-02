@@ -197,11 +197,11 @@ The endpoint supports:
   parsers;
 - llama.cpp-compatible terminal `timings`, plus opt-in `timings_per_token` and
   streaming `return_progress` observations;
-- function tools and free-form `custom` tools, the latter served to the model as a
-  single-string-input function under the caller's own tool name so callers that dispatch by name
-  keep working;
-- `tool_choice` `auto` and `none`, plus `allowed_tools` selections with mode `auto` (function-only
-  or custom, nested or direct), which narrow the effective tool set as an explicit subset filter;
+- function tools; free-form `custom` tools are rejected with `tool_type_not_supported` — NInfer
+  provides neither free-form custom input nor the custom output wire kind (Round 9 R9-03);
+- `tool_choice` `auto` and `none`, plus `allowed_tools` selections with mode `auto`
+  (function-only, nested or direct), which narrow the effective tool set as an explicit subset
+  filter;
 - `parallel_tool_calls:true`;
 - assistant tool-call history, tool-result messages, and legacy function-call history;
 - the top-level `reasoning_effort` field, where the `default` and `auto` aliases resolve to the
@@ -239,6 +239,11 @@ Round 9 (R9-02) extends the same contract to strict schema guarantees: `tools[i]
 `true` is rejected (`strict_tools_not_supported`) — the flag is a schema-adherence guarantee that
 requires constrained decoding, which the Engine does not provide. Omitted or `false` remains
 accepted, and non-boolean values keep the field-type error.
+
+Round 9 (R9-03) also removes the synthetic custom-to-function translation: `tools[i].type`
+`custom` and `allowed_tools` custom selectors are rejected (`tool_type_not_supported`), and
+assistant history `tool_calls` of type `custom` are rejected the same way. Full custom-tool
+support (custom wire kind, free-form input, grammar-constrained sampling) is a separate project.
 
 This is an intentional correctness change: clients that relied on the silent downgrade of
 `required`, named choices, `allowed_tools` mode `required`, or `parallel_tool_calls:false` to

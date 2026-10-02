@@ -141,6 +141,10 @@ materialize_tool_calls(const std::vector<ninfer::GeneratedToolCall>& generated) 
     return calls;
 }
 
+// R9-03 invariant: supported Chat tool calls are function calls only — custom tool
+// definitions are rejected at the request boundary (openai_chat_request.cpp) before any
+// generation, so this unconditional function wire kind is complete; no custom wire-kind
+// machinery is added (Round 9 §5.11).
 Json tool_calls_json(const std::vector<ToolCall>& calls, bool include_index) {
     Json output = Json::array();
     for (std::size_t index = 0; index < calls.size(); ++index) {

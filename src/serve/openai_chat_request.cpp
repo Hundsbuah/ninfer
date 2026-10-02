@@ -386,8 +386,9 @@ std::vector<ToolCall> parse_assistant_tool_calls(const Json& message, std::size_
         }
         if (!value.contains("type") || !value.at("type").is_string() ||
             value.at("type").get<std::string>() != "function") {
-            bad_request("only function tool_calls are supported", prefix + ".type",
-                        "tool_type_not_supported");
+            bad_request("assistant tool_calls must have type function; Chat custom tools "
+                        "are not supported",
+                        prefix + ".type", "tool_type_not_supported");
         }
         if (!value.contains("function") || !value.at("function").is_object()) {
             bad_request("tool_calls entries must contain a function object", prefix + ".function");
@@ -607,30 +608,6 @@ void parse_messages(const Json& body, GenerationRequest& output) {
     }
 }
 
-// Custom tools carry no declared JSON Schema: their input is free-form text. NInfer serves them as
-// a single-string-input function under the same name, so callers that dispatch by tool name (for
-// example the GitHub Copilot CLI and MCP clients) keep working. A declared `format` is carried as
-// descriptive prompt metadata only, because the engine has no constrained decoding for it.
-std::string custom_tool_input_schema(const Json& custom) {
-    std::string description = "The complete custom tool input.";
-    if (custom.contains("format") && custom.at("format").is_object()) {
-        const Json& format = custom.at("format");
-        if (format.contains("type") && format.at("type").is_string()) {
-            description += " Declared format: " + format.at("type").get<std::string>() + ".";
-            if (format.contains("grammar") && format.at("grammar").is_string()) {
-                description += " Grammar: " + format.at("grammar").get<std::string>();
-            }
-        }
-    }
-    return Json{{"type", "object"},
-                {"properties",
-                 Json{{"input",
-                       Json{{"type", "string"}, {"description", std::move(description)}}}}},
-                {"required", Json::array({"input"})},
-                {"additionalProperties", false}}
-        .dump();
-}
-
 void parse_tools(const Json& body, GenerationRequest& output) {
     if (!body.contains("tools") || body.at("tools").is_null()) { return; }
     const Json& tools = body.at("tools");
@@ -644,22 +621,13 @@ void parse_tools(const Json& body, GenerationRequest& output) {
         }
         const std::string type = item.at("type").get<std::string>();
         if (type == "custom") {
-            if (!item.contains("custom") || !item.at("custom").is_object()) {
-                bad_request("custom tools must contain a custom object", prefix + ".custom");
-            }
-            const Json& custom = item.at("custom");
-            ToolDefinition tool;
-            tool.name = require_function_name(custom, prefix + ".custom.name");
-            if (custom.contains("description") && !custom.at("description").is_null()) {
-                if (!custom.at("description").is_string()) {
-                    bad_request("custom tool description must be a string",
-                                prefix + ".custom.description");
-                }
-                tool.description = custom.at("description").get<std::string>();
-            }
-            tool.input_schema_json = custom_tool_input_schema(custom);
-            output.tools.push_back(std::move(tool));
-            continue;
+            // R9-03: OpenAI custom tools require free-form custom-tool input/output
+            // semantics (free-form input, a custom output wire type, an optional
+            // constrained grammar); the Engine provides none of these, so the definition
+            // is rejected at the type field (full custom support is a separate project).
+            bad_request("OpenAI custom tools require free-form custom-tool input/output "
+                        "semantics that NInfer does not provide",
+                        prefix + ".type", "tool_type_not_supported");
         }
         if (type != "function") {
             bad_request(
@@ -729,12 +697,12 @@ void apply_allowed_tools(const Json& config, GenerationRequest& output) {
         if (!item.is_object() || !item.contains("type") || !item.at("type").is_string()) {
             bad_request("allowed tool entries must contain a string type", prefix + ".type");
         }
-        if (item.at("type").get<std::string>() != "function" &&
-            item.at("type").get<std::string>() != "custom") {
-            bad_request(
-                "allowed_tools entries must select a function or custom tool, because NInfer "
-                "provides no other output contract",
-                prefix + ".type", "tool_type_not_supported");
+        if (item.at("type").get<std::string>() != "function") {
+            // R9-03: allowed_tools is function-only — custom tools are rejected at the
+            // definition (parse_tools), so a custom selector can never select anything.
+            bad_request("allowed_tools entries must select a function tool; NInfer does "
+                        "not support custom tools",
+                        prefix + ".type", "tool_type_not_supported");
         }
         const std::string name = require_function_name(item, prefix + ".name");
         const bool declared =

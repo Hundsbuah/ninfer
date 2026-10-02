@@ -392,19 +392,57 @@ int test_tools() {
     const OpenAIChatRequest strict_omitted_tools = parse(body);
     failures += check(strict_omitted_tools.generation.tools.size() == 1,
                       "R9-02: omitted strict remains accepted");
+    // R9-03: OpenAI custom tools require free-form custom-tool input/output semantics
+    // (free-form input, a custom output wire type, an optional constrained grammar);
+    // the Engine provides none of these, so custom definitions are rejected at the type
+    // field — the previous synthetic single-string-input function overstated support.
+    body          = base_request();
     body["tools"] = Json::array({Json{{"type", "custom"},
                                       {"custom",
                                        Json{{"name", "shell"},
                                             {"description", "Run a shell command"},
                                             {"format", Json{{"type", "grammar"},
                                                              {"grammar", "start: /.+/"}}}}}}});
-    const GenerationRequest custom_tools = parse(body).generation;
-    failures += check(custom_tools.tools.size() == 1 && custom_tools.tools[0].name == "shell" &&
-                          custom_tools.tools[0].input_schema_json.find("\"input\"") !=
-                              std::string::npos &&
-                          custom_tools.tools[0].input_schema_json.find("start: /.+/") !=
-                              std::string::npos,
-                      "custom tools are served as a single-string-input function");
+    const ApiError custom_grammar_error = api_error([&] { (void)parse(body); });
+    failures += check(custom_grammar_error.param == "tools[0].type" &&
+                          custom_grammar_error.code == "tool_type_not_supported",
+                      "R9-03: a grammar-bearing custom tool definition is rejected");
+    body["tools"] = Json::array({Json{{"type", "custom"},
+                                      {"custom",
+                                       Json{{"name", "shell"}, {"description", "Run a shell command"}}}}});
+    const ApiError custom_bare_error = api_error([&] { (void)parse(body); });
+    failures += check(custom_bare_error.param == "tools[0].type" &&
+                          custom_bare_error.code == "tool_type_not_supported",
+                      "R9-03: a custom tool definition without a format is rejected");
+
+    // R9-03: allowed_tools is function-only — a custom selector cannot select anything.
+    body          = base_request();
+    body["tools"] = Json::array({function_tool("weather")});
+    body["tool_choice"] = Json{{"type", "allowed_tools"},
+                                {"allowed_tools",
+                                 Json{{"mode", "auto"},
+                                      {"tools",
+                                       Json::array({Json{{"type", "custom"},
+                                                         {"custom", Json{{"name", "shell"}}}}})}}}};
+    const ApiError custom_allowed_error = api_error([&] { (void)parse(body); });
+    failures += check(custom_allowed_error.param == "tool_choice.allowed_tools.tools[0].type" &&
+                          custom_allowed_error.code == "tool_type_not_supported",
+                      "R9-03: a custom allowed_tools selector is rejected");
+
+    // R9-03: a standards-conformant custom tool call cannot be replayed as Chat history.
+    body          = base_request();
+    body["messages"] = Json::array({Json{{"role", "user"}, {"content", "hi"}},
+                                    Json{{"role", "assistant"},
+                                         {"content", ""},
+                                         {"tool_calls",
+                                          Json::array({Json{{"id", "call_1"},
+                                                            {"type", "custom"},
+                                                            {"custom", Json{{"name", "shell"},
+                                                                              {"input", "ls"}}}}})}}});
+    const ApiError custom_history_error = api_error([&] { (void)parse(body); });
+    failures += check(custom_history_error.param == "messages[1].tool_calls[0].type" &&
+                          custom_history_error.code == "tool_type_not_supported",
+                      "R9-03: custom tool_calls in history are explicitly unsupported");
 
     body                        = base_request();
     body["tools"]               = Json::array({function_tool()});
