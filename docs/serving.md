@@ -929,8 +929,8 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--max-concurrency N` | maximum admitted requests; valid range `1..8` | `1` |
 | `--max-pending-requests N` | additional requests allowed to wait for admission | `16` |
 | `--pending-timeout-ms N` | maximum preparation-plus-admission wait | `30000` |
-| `--prefill-chunk N` | text-prefill chunk | `1024` |
-| `--prefill-round-robin` | rotate prefill units over the requests with staged prefill, starting after the lane the previous unit served, and while another request is active advance at most 1024 prompt tokens per unit (896 with the fast INT8 prompt kernel) ([execution behavior](#execution-behavior)); effective only with `--max-concurrency` above 1 | lowest lane first, whole chunks |
+| `--prefill-chunk N` | text-prefill chunk; with INT8, NVFP4, FP8 or K8V4 KV (unless an original INT8 or NVFP4 prompt kernel is selected) it is rounded down to whole prompt-attention waves, 896 tokens for the 24-head model on RTX 5090 (`4096` runs as `3584`) | `1024` |
+| `--prefill-round-robin` | rotate prefill units over the requests with staged prefill, starting after the lane the previous unit served, and while another request is active advance at most 1024 prompt tokens per unit (896, one attention wave, where `--prefill-chunk` is rounded to waves) ([execution behavior](#execution-behavior)); effective only with `--max-concurrency` above 1 | lowest lane first, whole chunks |
 | `--use-original-int8-prefill-kernel` | prefill INT8-KV prompt attention with the original kernel at the requested `--prefill-chunk`. Without it INT8 KV uses the fast kernel (FP16 per-tile PV accumulation; a chunk whose row blocks alone would leave SMs idle splits its keys across CTAs, at most 64 MiB of workspace) and rounds `--prefill-chunk` down to whole prompt-attention waves (896 tokens for the 24-head model on RTX 5090: `4096` runs as `3584`); requires `--kv-dtype int8` (startup rejects it with any other KV format) | off |
 | `--int8-prefill-8bit-pv` | run the fast INT8 prompt kernel's P×V on INT8 Tensor Cores: each row's probabilities, scaled by the V group scale, become 8-bit codes per 64-key tile against the exact stored V codes. Prompt attention takes 8-11 % less time from 16K context up; probabilities below half a code step of their tile's largest round to zero, which moved 64K-window perplexity by 1.1 % on the bundled corpus. Requires `--kv-dtype int8` and the fast kernel (startup rejects it with `--use-original-int8-prefill-kernel`) | off |
 | `--use-original-nvfp4-prefill-kernel` | prefill NVFP4-KV prompt attention with the tiled kernel. Without it a chunk that sees more than 2048 keys uses the fast kernel, which runs QK on block-scaled FP4 Tensor Cores directly over the stored K codes (Q as two NVFP4 terms), decodes V in registers with FP16 per-tile PV accumulation, and splits the chunk's keys across CTAs when its row blocks alone would leave SMs idle (at most 64 MiB of workspace); shorter chunks keep the tiled kernel. Requires `--kv-dtype nvfp4` (startup rejects it with any other KV format) | off |
@@ -1249,7 +1249,8 @@ per worker boundary). The lowest-numbered lane with staged prefill is served fir
 prompt staged beside a long one may wait for the whole long prefill, and every unit is a whole
 `--prefill-chunk`, which a waiting decode round also waits for. `--prefill-round-robin` serves the
 prefilling lanes in turn, and while any other request is active (prefilling or decoding) each unit
-advances at most 1024 prompt tokens (896 with the fast INT8 prompt kernel, one attention wave), so
+advances at most 1024 prompt tokens (896, one attention wave, where `--prefill-chunk` is rounded to
+waves), so
 another request waits at most one such unit. A prompt alone still prefills in whole chunks. The
 narrower units use the workspace already reserved for `--prefill-chunk`, so they leave KV capacity
 unchanged, but they make a long prompt's own prefill slower while it shares the GPU, and outputs
