@@ -70,12 +70,16 @@ CUDA_VISIBLE_DEVICES=99.
 | R8-01 constraint `CALL1 -> prose -> CALL2` divergence | MEDIUM | FIXED | `006bc52` (red) + `391bccf` + `73d4e2c` + `c095fc5` + `4c5b5d1` | 6 red assertions red->green; corpus A-N green; P1-P9 cross-check green (both syntaxes) |
 | R8-01a `latched_once_` permanent exemption | MEDIUM root cause | FIXED | `391bccf` | field removed; lock independent of latch history; checkpoint green |
 | R8-01b `marker_suffix()` / `rfind('<')` skip | MEDIUM root cause | FIXED | `73d4e2c` | helper deleted; replay from `progress.break_offset`; single-chunk partial case green |
-| R8-02 Chat `required` -> Auto | MEDIUM | FIXED | `88c196e` (red) + `863072a` | 400 `tool_choice_not_supported` |
+| R8-02 Chat `required` -> Auto | MEDIUM | FIXED | `88c196e` (red) + `863072a` + `f79946f` (test addendum) | 400 `tool_choice_not_supported` |
 | R8-02b named function/custom -> Auto | MEDIUM | FIXED | `88c196e` (red) + `863072a` | 400 `tool_choice_not_supported` after name-syntax validation |
-| R8-02c `allowed_tools.mode=required` -> Auto | MEDIUM | FIXED | `88c196e` (red) + `2cded6e` | 400 `tool_choice_not_supported` before mutating `output.tools` |
+| R8-02c `allowed_tools.mode=required` -> Auto | MEDIUM | FIXED | `88c196e` (red) + `2cded6e` + `f79946f` (test addendum) | 400 `tool_choice_not_supported` before mutating `output.tools` |
 | R8-02d `parallel_tool_calls=false` advisory | MEDIUM | FIXED | `88c196e` (red) + `2cded6e` | 400 `parallel_tool_calls_not_supported` when `uses_tools()`; neutral otherwise |
 | R6-04 byte-identical call-only residual | residual | DOCUMENTED | n/a | unchanged (`docs/tool_call_parser.md`) |
 | constrained runtime decoding | non-goal | KEPT FAIL-FAST | n/a | unchanged startup error |
+Addendum commits outside the planned order: `f79946f` (test fix: the
+allowed_tools-required case needed its `mode` restored after the red edit) and
+`d703d1e` (round-8 implementation spec added to version control, mirroring the
+round-7 documentation record).
 
 ---
 
