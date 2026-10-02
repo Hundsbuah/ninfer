@@ -505,6 +505,7 @@ std::string format_server_start_json(
              {"max_pending_requests", engine_options.max_pending_requests},
              {"pending_timeout_ms", engine_options.pending_timeout_ms},
              {"prefill_chunk", engine_options.prefill_chunk},
+             {"prefill_round_robin", engine_options.prefill_round_robin},
              {"original_int8_prefill_kernel", engine_options.original_int8_prefill_kernel},
              {"int8_prefill_8bit_pv", engine_options.int8_prefill_8bit_pv},
              {"original_nvfp4_prefill_kernel", engine_options.original_nvfp4_prefill_kernel},

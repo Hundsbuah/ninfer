@@ -89,6 +89,7 @@ int main() {
     engine_options.max_pending_requests                            = options.max_pending_requests;
     engine_options.pending_timeout_ms                              = options.pending_timeout_ms;
     engine_options.prefill_chunk                                   = options.prefill_chunk;
+    engine_options.prefill_round_robin                             = true;
     engine_options.kv_cache                                        = options.kv_cache;
     engine_options.speculative                                     = options.speculative;
     engine_options.enable_vision                                   = options.enable_vision;
@@ -190,6 +191,8 @@ int main() {
     failures += check(server.at("artifact").at("size_bytes") == 123456, "artifact size missing");
     failures += check(server.at("engine").at("max_context") == 262144, "max context missing");
     failures += check(server.at("engine").at("kv_capacity") == 524288, "KV capacity missing");
+    failures +=
+        check(server.at("engine").at("prefill_round_robin") == true, "prefill round-robin missing");
     failures += check(server.at("engine").at("kv_capacity_mode") == "explicit" &&
                           server.at("engine").at("kv_capacity_page_groups") == 8192 &&
                           server.at("engine").at("kv_capacity_max_page_groups") == 16384,

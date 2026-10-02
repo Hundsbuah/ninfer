@@ -464,6 +464,61 @@ int exercise_interleaved(const char* artifact) {
     return failures;
 }
 
+// Round-robin prefill: a short prompt submitted just after a long one is served between the long
+// prompt's units, so its first token comes first, and while it decodes the long prompt advances in
+// narrower units than its whole chunks. The default lowest-lane order is the control: the short
+// prompt waits for the whole long prefill and the long prompt takes whole chunks.
+int exercise_round_robin(const char* artifact) {
+    const std::vector<ninfer::TokenId> long_prompt  = synthetic_tokens(3700, 11);
+    const std::vector<ninfer::TokenId> short_prompt = synthetic_tokens(200, 12);
+    std::uint64_t lowest_lane_units                 = 0;
+    int failures                                    = 0;
+    for (const bool round_robin : {false, true}) {
+        ninfer::EngineOptions options =
+            hybrid_options(artifact, ninfer::SpeculativeBackend::None, 16384, 1ULL << 30, 8);
+        options.max_concurrency     = 2;
+        options.prefill_chunk       = 2048;
+        options.prefill_round_robin = round_robin;
+        ninfer::Engine engine(options);
+        ninfer::GenerationHandle first =
+            engine.submit(engine.prepare_tokens(long_prompt), greedy(8));
+        ninfer::GenerationHandle second =
+            engine.submit(engine.prepare_tokens(short_prompt), greedy(64));
+        const ninfer::GenerationResult long_result  = first.wait();
+        const ninfer::GenerationResult short_result = second.wait();
+        const char* mode                            = round_robin ? "round-robin" : "lowest lane";
+        if (long_result.generated_token_ids.size() != 8 ||
+            short_result.generated_token_ids.size() != 64) {
+            std::cerr << "round-robin (" << mode << "): generated "
+                      << long_result.generated_token_ids.size() << " and "
+                      << short_result.generated_token_ids.size() << " tokens, expected 8 and 64\n";
+            ++failures;
+        }
+        const bool short_first =
+            short_result.timings.first_token_seconds < long_result.timings.first_token_seconds;
+        const std::uint64_t units = long_result.engine_timing.prefill_units;
+        std::cout << "round-robin (" << mode << "): short first token "
+                  << short_result.timings.first_token_seconds << " s, long "
+                  << long_result.timings.first_token_seconds << " s, long prefill units " << units
+                  << '\n';
+        if (!round_robin) {
+            lowest_lane_units = units;
+            if (short_first) {
+                std::cerr << "round-robin (lowest lane): the short prompt was served before the "
+                             "long prefill finished\n";
+                ++failures;
+            }
+        } else if (!short_first || units <= lowest_lane_units) {
+            std::cerr << "round-robin: short first token "
+                      << short_result.timings.first_token_seconds << " s, long "
+                      << long_result.timings.first_token_seconds << " s; long prefill units "
+                      << units << " against " << lowest_lane_units << " in whole chunks\n";
+            ++failures;
+        }
+    }
+    return failures;
+}
+
 // Requests cancellation once the first prefill chunk is reported. Non-final prefill steps return
 // without waiting for the Device, so the cancellation usually reaches the Program with a later
 // chunk still queued.
@@ -727,7 +782,7 @@ int main() {
     }
     const char* selected            = std::getenv("NINFER_HYBRID_REAL_SCENARIO");
     const std::string_view scenario = selected != nullptr && *selected != '\0' ? selected : "all";
-    constexpr std::array<std::string_view, 13> kScenarios{"all",
+    constexpr std::array<std::string_view, 14> kScenarios{"all",
                                                           "restore-exact",
                                                           "restore-exact-mtp",
                                                           "restore-exact-dflash2",
@@ -738,6 +793,7 @@ int main() {
                                                           "turns-protocol",
                                                           "coalesce",
                                                           "interleaved",
+                                                          "round-robin",
                                                           "cancel-prefill",
                                                           "cancel-prefill-dflash2"};
     if (std::find(kScenarios.begin(), kScenarios.end(), scenario) == kScenarios.end()) {
@@ -761,6 +817,7 @@ int main() {
         if (all || scenario == "vision") { failures += exercise_vision(artifact); }
         if (all || scenario == "persist") { failures += exercise_persist(artifact); }
         if (all || scenario == "interleaved") { failures += exercise_interleaved(artifact); }
+        if (all || scenario == "round-robin") { failures += exercise_round_robin(artifact); }
         if (all || scenario == "cancel-prefill") {
             failures += exercise_cancel_prefill(artifact, ninfer::SpeculativeBackend::None);
         }

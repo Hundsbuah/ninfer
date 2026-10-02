@@ -78,6 +78,10 @@ std::string serve_usage_text(const char* argv0) {
            "  --max-concurrency N        max concurrent sequences, 1-8 (default 1)\n"
            "  --prefill-chunk N          prefill chunk size in tokens, multiple of 128\n"
            "                             (default 1024)\n"
+           "  --prefill-round-robin      rotate prefill over the requests that are\n"
+           "                             prefilling, in steps of at most 1024 tokens while\n"
+           "                             another request is active, so it waits less\n"
+           "                             (default: lowest lane first, whole chunks)\n"
            "  --use-original-int8-prefill-kernel\n"
            "                             prefill INT8 KV with the original prompt kernel at\n"
            "                             the requested chunk (default: the fast kernel, chunk\n"
@@ -369,6 +373,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--pending-timeout-ms") {
             options.pending_timeout_ms = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--pending-timeout-ms"), "pending-timeout-ms"));
+        } else if (arg == "--prefill-round-robin") {
+            options.prefill_round_robin = true;
         } else if (arg == "--prefill-chunk") {
             options.prefill_chunk = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--prefill-chunk"), "prefill-chunk"));

@@ -44,6 +44,7 @@ struct ServeOptions {
     std::uint32_t max_pending_requests = 16;
     std::uint32_t pending_timeout_ms   = 30000;
     std::uint32_t prefill_chunk        = 1024;
+    bool prefill_round_robin           = false;
     bool original_int8_prefill_kernel  = false;
     bool int8_prefill_8bit_pv          = false;
     bool original_nvfp4_prefill_kernel = false;

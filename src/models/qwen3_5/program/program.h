@@ -828,6 +828,7 @@ struct PrefillProgress {
     runtime::BeginSummary summary;
     std::uint32_t processed_prompt_tokens = 0;
     bool complete                         = false;
+    bool completes_service_unit           = true;
     runtime::ExecutionTiming timing;
     std::optional<PendingBatch> pending;
     std::optional<CaptureOffer> capture;
@@ -1017,7 +1018,8 @@ public:
     // waiting, when no transfer is in flight. A failed transfer surfaces at the next progress.
     [[nodiscard]] bool wait_context_transfer() noexcept;
     [[nodiscard]] PrefillProgress
-    advance_prefill(SequenceHandle sequence, runtime::ExecutionTiming* failed_timing = nullptr);
+    advance_prefill(SequenceHandle sequence, runtime::ExecutionTiming* failed_timing = nullptr,
+                    runtime::PrefillStepWidth width = runtime::PrefillStepWidth::Nominal);
     [[nodiscard]] CaptureAssessment
     inspect_capture(const CaptureOffer& offer, const SharedPrefixHandle* exact_shared,
                     const SharedPrefixHandle* replacement,

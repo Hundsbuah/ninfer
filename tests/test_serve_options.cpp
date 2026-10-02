@@ -770,6 +770,11 @@ int main() {
     failures +=
         check(serve_usage_text("ninfer-serve").find("--request-log-jsonl") != std::string::npos,
               "serve help omits --request-log-jsonl");
+    failures += check(
+        !logged.prefill_round_robin &&
+            parse({"ninfer-serve", "model.ninfer", "--prefill-round-robin"}).prefill_round_robin &&
+            serve_usage_text("ninfer-serve").find("--prefill-round-robin") != std::string::npos,
+        "--prefill-round-robin must be an opt-in serve option");
     failures += check(logged.request_log_rotation.max_bytes == 0 &&
                           logged.request_log_rotation.keep == kDefaultRequestLogKeep,
                       "the request log must not rotate unless --request-log-max-mib is given");

@@ -308,6 +308,12 @@ struct EngineOptions {
     std::uint32_t max_pending_requests = 16;
     std::uint32_t pending_timeout_ms   = 30000;
     std::uint32_t prefill_chunk        = 1024;
+    // Opt-in: prefill units rotate round-robin over the lanes with staged prefill, starting after
+    // the lane the previous unit served, and while another request is active each unit advances
+    // at most 1024 prompt tokens (rounded like prefill_chunk). False serves the lowest such lane
+    // first in whole chunks, so a prompt staged beside a long one may wait for the whole long
+    // prefill.
+    bool prefill_round_robin           = false;
     // INT8 KV prefills with the fast prompt-attention kernel and rounds prefill_chunk down to whole
     // prompt-attention waves. True selects the original INT8 prompt kernel at the requested chunk;
     // it requires the INT8 KV cache.

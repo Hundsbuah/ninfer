@@ -1002,6 +1002,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
         "resolved Paged KV capacity exceeds int32"));
     impl->max_concurrency     = inputs.max_concurrency;
     impl->prefill_chunk       = inputs.prefill_chunk;
+    impl->concurrent_prefill_chunk = inputs.concurrent_prefill_chunk;
     impl->fast_prefill_kernel = inputs.fast_prefill_kernel;
     impl->draft_window        = inputs.draft_window;
     impl->neural_draft_window = inputs.neural_draft_window;
@@ -1183,9 +1184,9 @@ PromptAttentionKernel prompt_attention_kernel(const EngineOptions& options) {
 // Every chunk but a prompt's last one has the effective width, so with the fast prefill kernel it
 // is rounded down to whole prompt-attention waves, keeping each full chunk's attention free of a
 // partial last wave.
-std::uint32_t effective_prefill_chunk(const execution::Parameters& parameters,
-                                      const EngineOptions& options) {
-    const std::uint32_t requested = std::min(options.prefill_chunk, options.max_context);
+std::uint32_t prefill_step_width(const execution::Parameters& parameters,
+                                 const EngineOptions& options, std::uint32_t requested) {
+    requested = std::min(requested, options.max_context);
     if (!uses_fast_int8_prefill(options)) { return requested; }
     const auto& attention = *parameters.model.config().text.attention;
     const auto wave = static_cast<std::uint32_t>(ops::causal_softmax_attention_prompt_wave_tokens(
@@ -1193,6 +1194,21 @@ std::uint32_t effective_prefill_chunk(const execution::Parameters& parameters,
          static_cast<std::int32_t>(attention.num_attention_heads),
          static_cast<std::int32_t>(attention.num_key_value_heads)}));
     return requested < wave ? requested : requested / wave * wave;
+}
+
+std::uint32_t effective_prefill_chunk(const execution::Parameters& parameters,
+                                      const EngineOptions& options) {
+    return prefill_step_width(parameters, options, options.prefill_chunk);
+}
+
+// A Concurrent prefill step (beside other active requests with --prefill-round-robin) advances at
+// most this many prompt tokens, within the same workspace as the full chunk.
+constexpr std::uint32_t kConcurrentPrefillTokens = 1024;
+
+std::uint32_t effective_concurrent_prefill_chunk(const execution::Parameters& parameters,
+                                                 const EngineOptions& options) {
+    return prefill_step_width(parameters, options,
+                              std::min(options.prefill_chunk, kConcurrentPrefillTokens));
 }
 
 std::unique_ptr<qwen3_5::detail::SequencePlannerImpl>
@@ -1207,26 +1223,27 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         draft_window = std::max(draft_window, shape.verify_drafts);
     }
     SequencePlanningInputs inputs{
-        .parameters          = &parameters,
-        .neural_draft_window = options.speculative.draft_tokens,
-        .round_shapes        = round_shapes,
-        .tree_widths         = std::move(tree_widths),
-        .draft_tree_paths    = options.speculative.draft_tree_paths,
-        .ngram_draft_window  = options.speculative.ngram_draft_tokens,
-        .ngram_min_match     = options.speculative.ngram_min_match,
-        .capacity            = options.max_context,
-        .max_concurrency     = options.max_concurrency,
-        .prefill_chunk       = effective_prefill_chunk(parameters, options),
-        .fast_prefill_kernel = prompt_attention_kernel(options),
-        .draft_window        = draft_window,
-        .speculative_backend = options.speculative.backend,
-        .kv_storage          = options.kv_cache,
-        .proposal_head       = options.speculative.proposal_head,
-        .features            = models::load_options(options),
-        .use_cuda_graph      = options.use_cuda_graph,
-        .causal_scoring      = options.purpose == EnginePurpose::CausalScoring,
-        .device              = options.device,
-        .context_cache       = options.context_cache,
+        .parameters               = &parameters,
+        .neural_draft_window      = options.speculative.draft_tokens,
+        .round_shapes             = round_shapes,
+        .tree_widths              = std::move(tree_widths),
+        .draft_tree_paths         = options.speculative.draft_tree_paths,
+        .ngram_draft_window       = options.speculative.ngram_draft_tokens,
+        .ngram_min_match          = options.speculative.ngram_min_match,
+        .capacity                 = options.max_context,
+        .max_concurrency          = options.max_concurrency,
+        .prefill_chunk            = effective_prefill_chunk(parameters, options),
+        .concurrent_prefill_chunk = effective_concurrent_prefill_chunk(parameters, options),
+        .fast_prefill_kernel      = prompt_attention_kernel(options),
+        .draft_window             = draft_window,
+        .speculative_backend      = options.speculative.backend,
+        .kv_storage               = options.kv_cache,
+        .proposal_head            = options.speculative.proposal_head,
+        .features                 = models::load_options(options),
+        .use_cuda_graph           = options.use_cuda_graph,
+        .causal_scoring           = options.purpose == EnginePurpose::CausalScoring,
+        .device                   = options.device,
+        .context_cache            = options.context_cache,
     };
     const std::uint32_t logical_pages = page_count(inputs.capacity);
     const std::uint32_t minimum_pages = std::max(logical_pages, inputs.max_concurrency);

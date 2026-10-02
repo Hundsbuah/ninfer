@@ -689,10 +689,11 @@ void ProgramImpl::start_sequence(std::uint32_t lane, SequenceState& sequence,
     }
 }
 
-runtime::PrefillStepResult
-ProgramImpl::advance_prefill_raw(std::uint32_t lane, runtime::ExecutionTiming* failed_timing) {
+runtime::PrefillStepResult ProgramImpl::advance_prefill_raw(std::uint32_t lane,
+                                                            runtime::ExecutionTiming* failed_timing,
+                                                            runtime::PrefillStepWidth width) {
     if (lane >= max_concurrency) { throw std::out_of_range("request lane is out of range"); }
-    return advance_prefill(active_sequence(lane), requests[lane], failed_timing);
+    return advance_prefill(active_sequence(lane), requests[lane], failed_timing, width);
 }
 
 runtime::ExecutionTiming ProgramImpl::resolve_prefill_raw(std::uint32_t lane, bool terminal,
@@ -983,7 +984,8 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
 
 runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                                                         RequestControl& request,
-                                                        runtime::ExecutionTiming* failed_timing) {
+                                                        runtime::ExecutionTiming* failed_timing,
+                                                        runtime::PrefillStepWidth width) {
     runtime::ExecutionTimingRecorder timing(runtime::ExecutionTimingPhase::Submit, failed_timing);
     if (request.lifecycle != Lifecycle::Prefilling || !request.prefill) {
         throw std::logic_error("staged prefill step requires an active concurrent request");
@@ -1100,8 +1102,17 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
         }
 
         if (staged.cursor < staged.prompt_tokens) {
+            // One prefill chunk is one planned service unit. A Concurrent step advances at most
+            // the concurrent width of it and leaves the rest of the chunk to later steps; Vision
+            // prompts keep whole chunks.
+            if (staged.chunk_remaining == 0) {
+                staged.chunk_remaining =
+                    std::min(prefill_chunk, staged.prompt_tokens - staged.cursor);
+            }
             const std::uint32_t nominal =
-                std::min(prefill_chunk, staged.prompt_tokens - staged.cursor);
+                width == runtime::PrefillStepWidth::Concurrent && !staged.vision
+                    ? std::min(staged.chunk_remaining, concurrent_prefill_chunk)
+                    : staged.chunk_remaining;
             mark_workspace_usage(staged.prepare_mtp ? workspace_plan.mtp_prefill
                                                     : workspace_plan.text_prefill);
             if (is_masked_draft_backend(speculative_backend)) {
@@ -1175,6 +1186,7 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                 staged.cursor += result.processed_tokens;
                 processed_prompt_tokens += result.processed_tokens;
                 remaining -= result.processed_tokens;
+                staged.chunk_remaining -= result.processed_tokens;
                 final_chunk_tokens     = result.processed_tokens;
                 sequence.text_kv_valid = staged.cursor;
                 if (staged.prepare_mtp) { sequence.mtp_kv_valid = staged.cursor; }
@@ -1199,6 +1211,8 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                             std::chrono::duration<double>(Clock::now() - started).count();
                         if (++next_capture_offer_id_ == 0) { ++next_capture_offer_id_; }
                         staged.pending_capture_offer = next_capture_offer_id_;
+                        // A capture offer ends the chunk, as the plan's service units count.
+                        staged.chunk_remaining = 0;
                         return runtime::PrefillStepResult{
                             .summary                 = summary,
                             .processed_prompt_tokens = processed_prompt_tokens,
@@ -1220,6 +1234,7 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                 return runtime::PrefillStepResult{
                     .summary                 = summary,
                     .processed_prompt_tokens = processed_prompt_tokens,
+                    .completes_service_unit  = staged.chunk_remaining == 0,
                     .timing                  = timing.finish(),
                 };
             }

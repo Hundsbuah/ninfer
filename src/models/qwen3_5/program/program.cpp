@@ -397,8 +397,9 @@ bool Program::has_context_transaction() const noexcept { return impl_->has_conte
 bool Program::wait_context_transfer() noexcept { return impl_->wait_context_transfer(); }
 
 PrefillProgress Program::advance_prefill(SequenceHandle sequence,
-                                         runtime::ExecutionTiming* failed_timing) {
-    return impl_->advance_prefill(sequence, failed_timing);
+                                         runtime::ExecutionTiming* failed_timing,
+                                         runtime::PrefillStepWidth width) {
+    return impl_->advance_prefill(sequence, failed_timing, width);
 }
 
 CaptureAssessment
