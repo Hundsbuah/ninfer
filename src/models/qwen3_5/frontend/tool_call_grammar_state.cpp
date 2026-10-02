@@ -5,19 +5,6 @@
 #include <utility>
 
 namespace ninfer::models::qwen3_5::frontend {
-namespace {
-
-// The marker-trigger candidate held by the inactive state: the suffix of the observed
-// bytes starting at the last '<' (empty while no marker candidate is accumulating). The
-// candidate can only still grow into a later wrapper trigger: the parser's retry re-reads
-// a failed region at a later <tool_call> wrapper, and the suffix from the last '<' is the
-// longest still-open marker candidate.
-std::string marker_suffix(const std::string& text) {
-    const std::size_t pos = text.rfind('<');
-    return pos == std::string::npos ? std::string{} : std::string(text.substr(pos));
-}
-
-} // namespace
 
 ToolCallGrammarConstraint::ToolCallGrammarConstraint(std::size_t max_tool_name_length,
                                                      ToolCallSyntaxMode syntax,
@@ -43,6 +30,63 @@ ToolCallParsePolicy ToolCallGrammarConstraint::parse_policy() const {
     return policy;
 }
 
+// R8-01 (Round 8 §3.8): the single authority for the inactive intent-state transitions,
+// shared by ordinary inactive bytes and the post-call trailing replay. It owns the
+// formatting whitespace handling, the marker start and continuation, the candidate
+// classification, the failed-candidate breaking-'< rescan (F8), the hardened text lock
+// (visible content locks the gate at any point, R8-I2/R8-I6), and the complete-marker
+// trigger (which seeds the region buffer with the marker plus the remaining bytes).
+// Returns true once a complete trigger fired (state.triggered_ set).
+bool ToolCallGrammarConstraint::advance_inactive(ToolCallGrammarConstraint& state,
+                                                 std::string_view text) {
+    std::size_t i = 0;
+    while (i < text.size()) {
+        const char byte = text[i];
+        if (state.marker_prefix_.empty()) {
+            if (byte == '<') { state.marker_prefix_.push_back(byte); }
+            else if (state.intent_ == ToolCallIntentPolicy::RequireToolAtContentStart &&
+                     !is_tool_format_whitespace(byte)) {
+                // R8-01: visible content locks the gate at any point (R8-I2: the first
+                // latch is not permanent permission).
+                state.entry_locked_ = true;
+            }
+            ++i;
+            continue;
+        }
+        state.marker_prefix_.push_back(byte);
+        ToolOpenTag marker = {};
+        const ToolMarkerStatus status =
+            classify_tool_marker_prefix(state.marker_prefix_, marker, state.syntax_);
+        if (status == ToolMarkerStatus::Complete) {
+            if (state.intent_ == ToolCallIntentPolicy::RequireToolAtContentStart &&
+                state.entry_locked_) {
+                // The gate is locked: the complete marker is ordinary content (the parser
+                // publishes it as content instead of latching).
+                state.marker_prefix_.clear();
+                ++i;
+                continue;
+            }
+            state.triggered_ = true;
+            state.buffer_ = state.marker_prefix_ + std::string(text.substr(i + 1));
+            state.marker_prefix_.clear();
+            return true;
+        }
+        if (status == ToolMarkerStatus::NotMarker) {
+            if (state.intent_ == ToolCallIntentPolicy::RequireToolAtContentStart) {
+                // R8-01: a failed marker candidate is visible content at any point.
+                state.entry_locked_ = true;
+            }
+            // F8: a breaking '<' starts a fresh candidate (shared split rule).
+            const std::size_t rescan_start = failed_marker_candidate_rescan_start(state.marker_prefix_);
+            state.marker_prefix_ = rescan_start == std::string_view::npos
+                                       ? std::string{}
+                                       : std::string(state.marker_prefix_.substr(rescan_start));
+        }
+        ++i;
+    }
+    return false;
+}
+
 ToolCallConstraintVerdict
 ToolCallGrammarConstraint::advance(std::string_view decoded_bytes, ToolCallGrammarConstraint* target) const {
     ToolCallGrammarConstraint state = *this;
@@ -62,9 +106,14 @@ ToolCallGrammarConstraint::advance(std::string_view decoded_bytes, ToolCallGramm
                 // closed earlier in the buffer and the remaining bytes are unconstrained.
                 // A structural break inside an open region is a wire violation.
                 if (progress.failure == ToolCallParseFailure::TrailingContent) {
+                    // R8-01: the region closed earlier in the buffer; the bytes from the
+                    // parser's break offset are ordinary trailing content and replay
+                    // through the inactive gate: visible content locks the hardened intent,
+                    // and a directly consecutive wrapper may retrigger (Round 8 §3.7).
                     state.triggered_ = false;
-                    state.marker_prefix_ = marker_suffix(combined);
                     state.buffer_.clear();
+                    state.marker_prefix_.clear();
+                    (void)advance_inactive(state, combined.substr(progress.break_offset));
                     continue;
                 }
                 if (target != nullptr) { *target = state; }
@@ -83,61 +132,12 @@ ToolCallGrammarConstraint::advance(std::string_view decoded_bytes, ToolCallGramm
             // EndOfInput: the candidate ends inside an open structure — a legal prefix.
             break;
         }
-        // Inactive: ordinary prose is always legal; only a complete marker trigger
-        // constrains. The marker candidate follows the machine's own feed rule
-        // (ToolCallStreamParser::feed) via the shared transition (F8): a '<' starts a
-        // candidate only when none is held; every further byte is appended and classified
-        // by the grammar; a NotMarker classification flushes the failed bytes as prose and
-        // a breaking '<' is retained as a fresh candidate start. The first trigger is
-        // therefore exactly the parser's latch.
-        std::size_t i = offset;
-        while (i < decoded_bytes.size()) {
-            const char byte = decoded_bytes[i];
-            if (state.marker_prefix_.empty()) {
-                if (byte == '<') { state.marker_prefix_.push_back(byte); }
-                else if (state.intent_ == ToolCallIntentPolicy::RequireToolAtContentStart &&
-                         !is_tool_format_whitespace(byte)) {
-                    // R8-01: visible content locks the gate at any point (R8-I2: the first
-                    // latch is not permanent permission).
-                    state.entry_locked_ = true;
-                }
-                ++i;
-                continue;
-            }
-            state.marker_prefix_.push_back(byte);
-            ToolOpenTag marker = {};
-            const ToolMarkerStatus status =
-                classify_tool_marker_prefix(state.marker_prefix_, marker, state.syntax_);
-            if (status == ToolMarkerStatus::Complete) {
-                if (state.intent_ == ToolCallIntentPolicy::RequireToolAtContentStart &&
-                    state.entry_locked_) {
-                    // R7-02: visible content before this marker has already locked the
-                    // gate: the complete marker is ordinary content (the parser publishes
-                    // it as content instead of latching).
-                    state.marker_prefix_.clear();
-                    ++i;
-                    continue;
-                }
-                state.triggered_ = true;
-                state.buffer_ = state.marker_prefix_ + std::string(decoded_bytes.substr(i + 1));
-                state.marker_prefix_.clear();
-                offset = decoded_bytes.size();
-                break;  // re-enter: the full candidate is now region text
-            }
-            if (status == ToolMarkerStatus::NotMarker) {
-                if (state.intent_ == ToolCallIntentPolicy::RequireToolAtContentStart) {
-                    // R8-01: a failed marker candidate is visible content at any point.
-                    state.entry_locked_ = true;
-                }
-                // F8: a breaking '<' starts a fresh candidate (shared split rule).
-                const std::size_t rescan_start = failed_marker_candidate_rescan_start(state.marker_prefix_);
-                state.marker_prefix_ = rescan_start == std::string_view::npos
-                                          ? std::string{}
-                                          : std::string(state.marker_prefix_.substr(rescan_start));
-            }
-            ++i;
-        }
-        if (!state.triggered_) { break; }
+        // Inactive bytes: the shared intent-state scanner. Ordinary content and the
+        // post-call trailing replay use the same authority (Round 8 §3.8); a complete
+        // trigger re-enters the region parse with the seeded buffer.
+        const bool marker_complete = advance_inactive(state, decoded_bytes.substr(offset));
+        offset = decoded_bytes.size();
+        if (!marker_complete) { break; }
     }
     if (target != nullptr) { *target = state; }
 

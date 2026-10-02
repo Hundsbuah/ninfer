@@ -91,6 +91,14 @@ private:
     // the byte rules on a copy of the state words.
     [[nodiscard]] ToolCallConstraintVerdict
     advance(std::string_view decoded_bytes, ToolCallGrammarConstraint* target) const;
+    // R8-01 (Round 8 §3.8): the single authority for the inactive intent-state transitions
+    // (formatting whitespace, marker start/continuation, candidate classification,
+    // failed-candidate rescan, hardened text lock, complete-marker trigger). Shared by
+    // ordinary inactive bytes and the post-call trailing replay. Returns true once a
+    // complete trigger fired (the region buffer is seeded with the marker plus the
+    // remaining bytes).
+    [[nodiscard]] static bool advance_inactive(ToolCallGrammarConstraint& state,
+                                               std::string_view text);
     std::size_t max_tool_name_length_;
     // R6-01: the selected top-level entry syntax (shared by the marker trigger, the
     // pending-prefix classification, and the region re-parse policy). Value-semantic:
