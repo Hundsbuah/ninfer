@@ -360,6 +360,7 @@ int test_tools() {
     const GenerationRequest direct_allowed = parse(body).generation;
     failures += check(direct_allowed.tools.size() == 1 && direct_allowed.tools[0].name == "weather",
                       "direct allowed_tools compatibility shape is accepted");
+    body["tool_choice"]["mode"] = "required";
     // R8-02: required invocation from an allowed subset cannot be guaranteed (the
     // filtered set still permits no tool call): reject before mutating the effective set.
     const ApiError required_allowed_error = api_error([&] { (void)parse(body); });
