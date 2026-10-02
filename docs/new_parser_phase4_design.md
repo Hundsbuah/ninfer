@@ -114,15 +114,20 @@ can trigger where the parser does not latch (e.g. a `<tool_call>` inside a ```` 
 fence).
 The first trigger is the parser's latch **modulo the fence**: `<tool_call>`,
 `<function_calls>`, or a complete function/invoke opener
-(`classify_tool_marker_prefix == Complete`). After a region closes, a later complete marker
-retriggers (the parser's region parse accepts a flat call sequence; its retry re-reads a
-failed slice at a later `<tool_call>` wrapper). The rescan after a close is a deliberate
-superset of that wrapper-only retry on the narrow degenerate case of prose between complete
-calls followed by a bare function/invoke opener; the parser remains the final authority, so
-the difference affects masking guidance only, never the accepted output. A candidate ending
-inside a marker trigger reports `NeedMore` (legal so far; the state stays pending) — this
-mirrors the grammar's own `NeedMore` for partial markers and is what keeps a partial
-`<tool` in prose from being rejected.
+(`classify_tool_marker_prefix == Complete`).
+
+**After a region closes** (Round 9 R9-01) the state enters the explicit
+`BetweenCalls` phase: only formatting whitespace, a legal next wrapper
+(`NeedMore`/`Allowed` on a partial/complete marker), and termination stay
+admissible; any visible content byte (prose, form feed, a failed marker) is
+`Rejected`, and a rejected candidate never commits. The Round-8 rescan — which
+admitted prose between complete calls — is removed: the strict between-calls
+scan now agrees with the strict parser's `TrailingContent` demotion
+(constraint `Rejected` only when the parser commits no calls), so the
+asymmetry documented under R3-11 no longer exists. A candidate ending inside a
+marker trigger reports `NeedMore` (legal so far; the state stays pending) —
+this mirrors the grammar's own `NeedMore` for partial markers and is what
+keeps a partial `<tool` in prose from being rejected.
 
 ### D3 — token/byte semantics
 
@@ -140,13 +145,15 @@ tokens (tokenizer detokenization) before calling the state.
   or close).
 - `Rejected`: the bytes cause a **definitive** structural break (`MalformedStructure` /
   `InvalidToolName`) at a position where a legal continuation existed before the candidate.
-  `TrailingContent` (a non-marker byte after a complete call inside the latched region) is
-  *not* a break for the constraint: the region closed earlier and the remaining bytes are
-  unconstrained prose (the state deactivates and re-enters marker tracking). Note the
-  asymmetry (R3-11): in **strict** mode the parser rejects the whole region as
-  `TrailingContent` — the constraint's `Allowed` verdict does not prevent that failure
-  (tolerant mode commits the complete calls). The parser remains the final authority;
-  `Allowed` only guides masking.
+- `TrailingContent` (a non-marker byte after a complete call inside the latched region)
+  is no longer unconstrained prose (Round 9 R9-01): the tail replays through the
+  strict between-calls scanner — visible content (prose, form feed, a failed
+  marker) is `Rejected`, while formatting whitespace and a legal next wrapper stay
+  admissible. The strict-mode asymmetry of R3-11 is eliminated: the constraint now
+  rejects exactly the suffix texts the strict parser demotes to zero calls, so
+  `Rejected` and committed calls may not co-occur (the cross-check rule pinned in
+  `test_tool_call_parser.cpp`). The parser remains the final authority; the verdicts
+  only guide masking.
 - `NeedMore`: the candidate ends inside a marker trigger; the grammar cannot decide yet (the
   bytes are legal so far; masking treats the candidate as allowed, the state stays pending).
 
