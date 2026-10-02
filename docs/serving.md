@@ -200,11 +200,11 @@ The endpoint supports:
 - function tools and free-form `custom` tools, the latter served to the model as a
   single-string-input function under the caller's own tool name so callers that dispatch by name
   keep working;
-- `tool_choice` `auto`/`none`, and `required`, named-function, `custom`, or function-only
-  `allowed_tools` selections, which are accepted and treated as advisory narrowing because the
-  Engine cannot force a call;
-- `strict:true` and `parallel_tool_calls:false` as advisory flags: the Engine does not enforce JSON
-  Schema through constrained decoding and cannot limit the model to one call;
+- `tool_choice` `auto` and `none`, plus `allowed_tools` selections with mode `auto` (function-only
+  or custom, nested or direct), which narrow the effective tool set as an explicit subset filter;
+- `parallel_tool_calls:true`;
+- `strict:true` as an advisory flag: the Engine does not enforce JSON Schema through
+  constrained decoding;
 - assistant tool-call history, tool-result messages, and legacy function-call history;
 - the top-level `reasoning_effort` field, where the `default` and `auto` aliases resolve to the
   server-configured level;
@@ -220,6 +220,27 @@ Each capability rejection identifies the affected field and the guarantee NInfer
 Known constrained-decoding aliases (`grammar`, `structured_outputs`, `guided_json`, `guided_regex`,
 `guided_choice`, and `guided_grammar`) receive the same explicit rejection instead of being treated
 as unknown hints.
+
+Round 8 (R8-02) tightened the Chat tool-control contract: requests that ask the Engine to
+guarantee a behavior it cannot enforce are rejected with HTTP 400 instead of being silently
+weakened to automatic selection, consistent with the Responses adapter:
+
+| Chat field | Round-8 behavior |
+|---|---|
+| `tool_choice:auto` | supported |
+| `tool_choice:none` | supported |
+| `tool_choice:required` | rejected (`tool_choice_not_supported`) |
+| named `function` / `custom` choice | rejected (`tool_choice_not_supported`) |
+| `allowed_tools` mode `auto` | supported subset filter |
+| `allowed_tools` mode `required` | rejected (`tool_choice_not_supported`) |
+| `parallel_tool_calls:true` | supported |
+| `parallel_tool_calls:false` + callable tools | rejected (`parallel_tool_calls_not_supported`) |
+| `parallel_tool_calls:false` + no effective tools | accepted neutral |
+
+This is an intentional correctness change: clients that relied on the silent downgrade of
+`required`, named choices, `allowed_tools` mode `required`, or `parallel_tool_calls:false` to
+automatic selection now receive HTTP 400. If backward compatibility is later required, use an
+explicit NInfer-specific compatibility switch rather than weakening the standard field.
 
 Semantically neutral fields do not make an otherwise executable request fail. All-zero
 `logit_bias`, `logprobs:false`, `top_logprobs:0`, `verbosity:"medium"`, empty legacy tool controls,
@@ -285,7 +306,7 @@ missing closing bracket after the function name. `StopString`, `OutputLimit`, `C
 broken tail leaves the region as text. A natural stop (`StopToken`, or no reported reason) may commit
 a function-closed final call cut before its wrapper close, reported with a `truncated_tail`
 diagnostic (logged at Info severity) rather than demoted to text.
-A server can additionally select `--tool-call-intent start-of-content`: a top-level tool region may latch only while every emitted Content byte is formatting whitespace (reasoning-channel text does not count — it never reaches the tool-call scanner). Once any visible content byte commits, the turn locks to text and later tool markup is content. The mode is an NInfer agent-hardening extension, stricter than the upstream Qwen template contract (which permits natural-language text before a function call), and it is a separate dimension from `--tool-call-syntax`, `--tolerant-tool-calls`, and `--tool-call-ambiguity`. It reduces the prose-prefixed unfenced quotation class; a complete declared unfenced call with no preceding content is still indistinguishable from a genuine action on the wire bytes (`docs/tool_call_parser.md`, semantic quotation residual).
+A server can additionally select `--tool-call-intent start-of-content`: a top-level tool region stays eligible only while the output remains a structured tool sequence — the first entry must start at content start (after formatting whitespace), directly consecutive wrappers (separated by formatting whitespace only) stay eligible, and any visible content byte committed at any point — before the first entry or after a completed call — locks the turn to text and makes later tool markup content (Round 8 R8-01: the first latch is not permanent permission, and the grammar constraint agrees with this gate; reasoning-channel text does not count — it never reaches the tool-call scanner). The mode is an NInfer agent-hardening extension, stricter than the upstream Qwen template contract (which permits natural-language text before a function call), and it is a separate dimension from `--tool-call-syntax`, `--tolerant-tool-calls`, and `--tool-call-ambiguity`. It reduces the prose-prefixed unfenced quotation class; a complete declared unfenced call with no preceding content is still indistinguishable from a genuine action on the wire bytes (`docs/tool_call_parser.md`, semantic quotation residual).
 The intent policy and the prompt template are separate dimensions. `--tool-call-intent`
 controls parser execution semantics; the chat template controls what the model is prompted
 to emit. The maintained local template `tools/chat_templates/qwen3_8.jinja` carries the
@@ -306,7 +327,6 @@ explicitly disabled (top-level or `chat_template_kwargs` `enable_thinking`, or
 
 Prompt-bearing JSON objects retain their received member order through request parsing and prompt
 rendering, including tool schemas and historical tool inputs. Canonical model-origin tool arguments
-retain that member order in aggregate and streaming responses, so an unmodified replay reconstructs
 the same ordered tool call. NInfer does not canonicalize semantically equivalent JSON: if a client
 reorders members, inserts defaults, or otherwise rewrites a tool object, the changed rendered input
 does not match the model-held endpoint and can reuse only an earlier exact checkpoint.

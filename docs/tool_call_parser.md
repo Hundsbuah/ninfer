@@ -165,6 +165,15 @@ constraint core (Round-6 R6-01: the constraint constructor takes the same `ToolC
 so the CPU constraint state can never latch an entry the parser would treat as prose). It is
 an explicit configuration choice, never inferred from template filenames or other metadata
 substrings, and a canonical wrapped Qwen3.8 call parses identically in both modes.
+Under `RequireToolAtContentStart` (Phase-4, R6-05; intent parity R7-02, R8-01) the constraint
+trigger is a tool-sequence gate mirroring the parser's intent state: visible
+non-formatting-whitespace content locks the gate at any point — before the first entry or
+after a completed call (Round 8 R8-01: the first latch is not permanent permission) — a
+complete marker under a locked gate is ordinary content and never triggers, directly
+consecutive wrappers across formatting whitespace stay eligible, and the trailing content
+after a closed region replays through the gate from the parser's `break_offset` instead of
+jumping to the last `<` (Round 8 §3.5/§3.7). The gate's state words remain value-semantic
+across checkpoint/restore, so speculative rollback recovers the exact tool-entry eligibility.
 
 ## Ambiguous byte protocol
 
