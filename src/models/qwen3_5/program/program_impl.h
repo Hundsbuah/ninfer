@@ -607,8 +607,8 @@ public:
 
     [[nodiscard]] RequestBasePlan plan_request(const PreparedPromptData& prompt,
                                                const runtime::ResolvedExecutionOptions& options);
-    [[nodiscard]] std::vector<float> causal_score(PreparedPromptData&& prompt,
-                                                  std::uint32_t first_target);
+    [[nodiscard]] ScoreResult causal_score(PreparedPromptData&& prompt, std::uint32_t first_target,
+                                           const ScoreOptions& options);
     [[nodiscard]] std::optional<AdmissionCandidate> inspect_admission(
         const PreparedPromptData& prompt, const RequestBasePlan& base, runtime::LaneId destination,
         const ContinuationHandle* source, const SharedPrefixHandle* shared_source,
@@ -769,7 +769,7 @@ public:
     const std::uint32_t prefill_chunk;
     // Widest Concurrent prefill step (at most prefill_chunk).
     const std::uint32_t concurrent_prefill_chunk;
-    const PromptAttentionKernel fast_prefill_kernel;
+    const PromptAttention prompt_attention;
     const std::uint32_t draft_window;
     const std::uint32_t neural_draft_window;
     // DFlash2 tree verification: the tree widths each batch size may verify and the most

@@ -126,7 +126,7 @@ void k8v4_kv_append_attention(const Tensor& q, const Tensor& k, const Tensor& v,
                               const Tensor& tree_masks, float scale, PagedKVBatchLayerView cache,
                               CausalAttentionExecutionEnvelope envelope, WorkspaceArena& workspace,
                               Tensor& out, cudaStream_t stream) {
-    const auto plan = make_k8v4_kv_causal_plan(q.ne[1], q.ne[2], q.ne[3], envelope);
+    const auto plan  = make_k8v4_kv_causal_plan(q.ne[1], q.ne[2], q.ne[3], envelope);
     const auto* tree = static_cast<const std::uint32_t*>(tree_masks.data);
     if (tree != nullptr && plan.family == K8V4KvFamily::Tiled)
         throw std::invalid_argument("K8V4 attention: a verification tree needs the "
@@ -137,7 +137,8 @@ void k8v4_kv_append_attention(const Tensor& q, const Tensor& k, const Tensor& v,
         auto view = make_quantized_causal_cache_view<K8V4KvCacheView<false>>(cache, &valid, &rows);
         view.tree_masks = tree;
         if (plan.family == K8V4KvFamily::Tiled)
-            k8v4_kv_tiled_attention(p, view, plan.partition, workspace, stream);
+            k8v4_kv_tiled_attention(p, view, plan.partition, envelope.fast_prompt_pv8, workspace,
+                                    stream);
         else
             execute_parallel(p, view, plan, workspace, stream);
     } else {
@@ -158,7 +159,7 @@ void k8v4_kv_cached_attention(const Tensor& q, const Tensor& positions, float sc
         k8v4_kv_tiled_attention(
             make_causal_operands(q, positions, out, scale, envelope.max_visible_keys),
             make_quantized_causal_cache_view<K8V4KvCacheView<false>>(view), plan.partition,
-            workspace, stream);
+            envelope.fast_prompt_pv8, workspace, stream);
     else if (plan.family == K8V4KvFamily::ParallelGrouped)
         execute_parallel(make_causal_operands(q, positions, out, scale, envelope.max_visible_keys),
                          make_quantized_causal_cache_view<K8V4KvCacheView<false>>(view), plan,

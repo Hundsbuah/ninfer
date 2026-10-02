@@ -77,6 +77,17 @@ constexpr ReductionCriterion kAttentionK8V4Criterion{
     /*gross_relative_to_max_reference*/ 1.1e-1,
 };
 
+// The 8-bit PV form of NVFP4 and K8V4 rounds every probability and every decoded V value once to
+// E4M3 (three fraction bits: relative error at most 2^-4 each). Independent uniform rounding of
+// both factors gives each product a relative RMS error of sqrt(2) * 2^-4 / sqrt(3), about 0.051,
+// and at most (1 + 2^-4)^2 - 1, about 0.129; the storage's own criterion applies where it is
+// looser.
+constexpr ReductionCriterion kAttentionE4m3PvCriterion{
+    /*relative_l2*/ 5.0e-2,
+    /*gross_absolute*/ 5.0e-3,
+    /*gross_relative_to_max_reference*/ 1.3e-1,
+};
+
 struct TestVectorLayout {
     DType code_dtype;
     std::int32_t code_extent;
@@ -140,6 +151,8 @@ struct AttentionCase {
     float value_amplitude   = 1.0f;
     // With fast_prompt_kernel over INT8 KV: run the kernel's 8-bit PV form.
     bool fast_prompt_pv8 = false;
+    // Envelope bound on the FP32 partials of a prompt launch's key splits.
+    std::size_t split_workspace_bytes = ops::kCausalPromptSplitWorkspaceDefaultBytes;
 };
 
 enum class MappingPattern { Identity, Offset, Fragmented };
@@ -1690,13 +1703,29 @@ const char* cache_name(KvCacheStorage storage) {
     return "unknown";
 }
 
-ReductionCriterion attention_criterion(KvCacheStorage storage) {
+ReductionCriterion storage_attention_criterion(KvCacheStorage storage) {
     if (storage == KvCacheStorage::BFloat16) return kAttentionBf16Criterion;
     if (storage == KvCacheStorage::Int8Group64) return kAttentionInt8Criterion;
     if (storage == KvCacheStorage::Fp8E4M3Row256) return kAttentionFp8Criterion;
     if (storage == KvCacheStorage::Nvfp4Group16) return kAttentionNvfp4Criterion;
     if (storage == KvCacheStorage::Fp8KeyNvfp4Value) return kAttentionK8V4Criterion;
     throw std::logic_error("unregistered causal-attention test storage");
+}
+
+// pv8 selects the 8-bit PV form; INT8's keeps V exact and meets the INT8 criterion.
+ReductionCriterion attention_criterion(KvCacheStorage storage, bool pv8 = false) {
+    ReductionCriterion criterion = storage_attention_criterion(storage);
+    if (pv8 && (storage == KvCacheStorage::Nvfp4Group16 ||
+                storage == KvCacheStorage::Fp8KeyNvfp4Value)) {
+        criterion.relative_l2 =
+            std::max(criterion.relative_l2, kAttentionE4m3PvCriterion.relative_l2);
+        criterion.gross_absolute =
+            std::max(criterion.gross_absolute, kAttentionE4m3PvCriterion.gross_absolute);
+        criterion.gross_relative_to_max_reference =
+            std::max(criterion.gross_relative_to_max_reference,
+                     kAttentionE4m3PvCriterion.gross_relative_to_max_reference);
+    }
+    return criterion;
 }
 
 int verify_attention(const std::string& label, const std::vector<double>& actual,
@@ -1801,8 +1830,9 @@ int run_a1_case(const Geometry& geometry, KvCacheStorage storage, const Attentio
     }
     ops::CausalAttentionExecutionEnvelope envelope{static_cast<std::uint32_t>(total),
                                                    test_case.envelope_max};
-    envelope.fast_prompt_kernel = test_case.fast_prompt_kernel;
-    envelope.fast_prompt_pv8    = test_case.fast_prompt_pv8;
+    envelope.fast_prompt_kernel           = test_case.fast_prompt_kernel;
+    envelope.fast_prompt_pv8              = test_case.fast_prompt_pv8;
+    envelope.prompt_split_workspace_bytes = test_case.split_workspace_bytes;
 
     const HostCache initial = make_cache(geometry, storage, max_context, test_case.seed + 10u,
                                          amplitude, test_case.value_amplitude);
@@ -1872,7 +1902,8 @@ int run_a1_case(const Geometry& geometry, KvCacheStorage storage, const Attentio
                 verify_attention(std::string(cache_name(storage)) + " attention envelope update",
                                  bf16_bits_to_double(select_query_columns(
                                      actual, kHeadDim * geometry.q_heads, oracle_queries)),
-                                 reference, attention_criterion(storage));
+                                 reference,
+                                 attention_criterion(storage, test_case.fast_prompt_pv8));
         }
     }
 
@@ -1884,7 +1915,8 @@ int run_a1_case(const Geometry& geometry, KvCacheStorage storage, const Attentio
                    verify_attention(label,
                                     bf16_bits_to_double(select_query_columns(
                                         output_bits, kHeadDim * geometry.q_heads, oracle_queries)),
-                                    reference, attention_criterion(storage));
+                                    reference,
+                                    attention_criterion(storage, test_case.fast_prompt_pv8));
     failures += verify_cache(label, cache.snapshot(), expected);
     if (storage == KvCacheStorage::Nvfp4Group16 || storage == KvCacheStorage::Fp8KeyNvfp4Value) {
         DeviceCache standalone(initial, mapping);
@@ -1926,8 +1958,9 @@ int run_a3_case(const Geometry& geometry, KvCacheStorage storage, const Attentio
     }
     ops::CausalAttentionExecutionEnvelope envelope{static_cast<std::uint32_t>(total),
                                                    test_case.envelope_max};
-    envelope.fast_prompt_kernel = test_case.fast_prompt_kernel;
-    envelope.fast_prompt_pv8    = test_case.fast_prompt_pv8;
+    envelope.fast_prompt_kernel           = test_case.fast_prompt_kernel;
+    envelope.fast_prompt_pv8              = test_case.fast_prompt_pv8;
+    envelope.prompt_split_workspace_bytes = test_case.split_workspace_bytes;
 
     const HostCache cache_host = make_cache(geometry, storage, max_context, test_case.seed + 10u,
                                             amplitude, test_case.value_amplitude);
@@ -1967,7 +2000,8 @@ int run_a3_case(const Geometry& geometry, KvCacheStorage storage, const Attentio
     int failures = verify_attention(label,
                                     bf16_bits_to_double(select_query_columns(
                                         output_bits, kHeadDim * geometry.q_heads, oracle_queries)),
-                                    reference, attention_criterion(storage));
+                                    reference,
+                                    attention_criterion(storage, test_case.fast_prompt_pv8));
     failures += verify_cache(label + " cache unchanged", cache.snapshot(), cache_host);
     failures += verify_input(label + " q unchanged", dq, q_bits);
     failures += verify_positions(label + " positions unchanged", dp, positions);
@@ -2172,7 +2206,7 @@ int run_batch_case(const Geometry& geometry, KvCacheStorage storage,
                                   " phase=" + std::to_string(phase);
         const auto output = copy_from_guarded<std::uint16_t>(dout, q.size());
         failures += verify_attention(label, bf16_bits_to_double(output), reference,
-                                     attention_criterion(storage));
+                                     attention_criterion(storage, test_case.fast_prompt_pv8));
         failures += verify_invalid_columns_zero(label, output, geometry, width, valid);
         BatchDeviceCache::Bytes after = cache.snapshot_bytes();
         failures += cache.verify(label, expected, after);
@@ -2907,15 +2941,17 @@ int run_int8_fast_prompt_cases(bool pv8) {
     return failures;
 }
 
-// The fast NVFP4 prompt kernel over prompt-route widths above 2048 visible keys: partial and full
+// The fast NVFP4 prompt kernel over prompt-route widths above 768 visible keys: partial and full
 // row blocks, launches over enough key pages to split them across CTAs (including an envelope far
 // past the populated keys, so late splits own no visible key), V magnitudes whose group scales need
 // its FP16-partial rescale, a masked row, and the production prefill chunk after a long history.
-int run_nvfp4_fast_prompt_cases() {
+// pv8 runs the kernel's 8-bit (E4M3) PV form.
+int run_nvfp4_fast_prompt_cases(bool pv8) {
     constexpr KvCacheStorage storage = KvCacheStorage::Nvfp4Group16;
     int failures                     = 0;
-    const auto fast                  = [](AttentionCase test_case) {
+    const auto fast                  = [pv8](AttentionCase test_case) {
         test_case.fast_prompt_kernel = true;
+        test_case.fast_prompt_pv8    = pv8;
         return test_case;
     };
     const auto values = [&](AttentionCase test_case, float amplitude) {
@@ -2942,7 +2978,65 @@ int run_nvfp4_fast_prompt_cases() {
                             MappingPattern::Fragmented, chunk_queries);
     BatchAttentionCase masked{300, {3000}, {211}, {0}, MappingPattern::Fragmented, 926u, true};
     masked.fast_prompt_kernel = true;
+    masked.fast_prompt_pv8    = pv8;
     failures += run_batch_case(h24, storage, masked);
+    return failures;
+}
+
+// The MXFP8 tiled prompt kernel of FP8 and K8V4 KV (widths above 80) accumulates each 64-key PV
+// tile in FP16 under a per-tile power-of-two V shift. V magnitudes sit on either side of that
+// limit: FP8 row scales (|V| / 448) just under 2 at 800 and past it at 900 and 2048; K8V4 group
+// scales past 128 at 900 and up to the largest UE4M3 values at 2048. The production prefill chunk
+// runs after a history, unscaled and scaled. pv8 runs K8V4's 8-bit (E4M3) PV form, whose V shift
+// brings each tile's largest scale into [32, 64) from either side.
+int run_mxfp8_tiled_prompt_cases(KvCacheStorage storage, bool pv8) {
+    int failures          = 0;
+    const std::uint32_t s = storage == KvCacheStorage::Fp8E4M3Row256 ? 1200u : 1220u;
+    const auto values     = [pv8](AttentionCase test_case, float amplitude) {
+        test_case.value_amplitude = amplitude;
+        test_case.fast_prompt_pv8 = pv8;
+        return test_case;
+    };
+    const Geometry& h24 = kGeometries[0];
+    const Geometry& h16 = kGeometries[1];
+    failures += run_a1_case(h24, storage, values({300, 1000, 1300, s + 1}, 800.0f),
+                            MappingPattern::Identity);
+    failures += run_a3_case(h24, storage, values({640, 400, 1040, s + 2}, 900.0f),
+                            MappingPattern::Identity);
+    failures += run_a3_case(h24, storage, values({1100, 64, 1164, s + 3}, 2048.0f),
+                            MappingPattern::Fragmented);
+    failures += run_a1_case(h16, storage, values({300, 1900, 8192, s + 4}, 2048.0f),
+                            MappingPattern::Offset);
+    const std::array<int, 6> chunk_queries{0, 127, 128, 1791, 3456, 3583};
+    const auto chunk = [&](std::int32_t base, std::uint32_t seed) {
+        return values(AttentionCase{3584, base, static_cast<std::uint32_t>(base + 3584), seed},
+                      1.0f);
+    };
+    failures +=
+        run_a1_case(h24, storage, chunk(8192, s + 5), MappingPattern::Fragmented, chunk_queries);
+    failures += run_a1_case(h24, storage, values(chunk(1000, s + 6), 2048.0f),
+                            MappingPattern::Identity, chunk_queries);
+    // Small V: scales far below 32 are shifted up into the E4M3 range.
+    failures += run_a3_case(h24, storage, values({300, 700, 1000, s + 8}, 0.05f),
+                            MappingPattern::Fragmented);
+    failures +=
+        run_a3_case(h16, storage, chunk(2000, s + 7), MappingPattern::Offset, chunk_queries);
+    return failures;
+}
+
+// A 1024-column follow-up over a long history splits its keys across CTAs by default; a 64 MiB
+// split workspace bounds it to fewer splits and none leaves one split. Every count meets the
+// storage's criterion.
+int run_prompt_split_budget_cases(KvCacheStorage storage) {
+    int failures = 0;
+    const std::array<int, 4> queries{0, 511, 512, 1023};
+    for (const std::size_t mib : {std::size_t{0}, std::size_t{64}}) {
+        AttentionCase test_case{1024, 20000, 21024, 1300u + static_cast<std::uint32_t>(mib)};
+        test_case.fast_prompt_kernel    = true;
+        test_case.split_workspace_bytes = mib << 20;
+        failures += run_a1_case(kGeometries[0], storage, test_case, MappingPattern::Fragmented,
+                                queries);
+    }
     return failures;
 }
 
@@ -3071,7 +3165,17 @@ int run_storage_cases(KvCacheStorage storage) {
         failures += run_int8_fast_prompt_cases(true);
     }
     failures += run_tree_mask_cases(storage);
-    if (storage == KvCacheStorage::Nvfp4Group16) failures += run_nvfp4_fast_prompt_cases();
+    if (storage == KvCacheStorage::Nvfp4Group16) {
+        failures += run_nvfp4_fast_prompt_cases(false);
+        failures += run_nvfp4_fast_prompt_cases(true);
+    }
+    if (storage == KvCacheStorage::Fp8E4M3Row256)
+        failures += run_mxfp8_tiled_prompt_cases(storage, false);
+    if (storage == KvCacheStorage::Fp8KeyNvfp4Value) {
+        failures += run_mxfp8_tiled_prompt_cases(storage, false);
+        failures += run_mxfp8_tiled_prompt_cases(storage, true);
+    }
+    if (storage != KvCacheStorage::BFloat16) failures += run_prompt_split_budget_cases(storage);
     if (storage != KvCacheStorage::BFloat16) {
         failures += run_quantized_causal_cases(storage);
     } else {

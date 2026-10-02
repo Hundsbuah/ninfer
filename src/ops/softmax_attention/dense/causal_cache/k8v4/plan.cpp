@@ -26,7 +26,8 @@ K8V4KvCausalPlan make_k8v4_kv_causal_plan(int heads, int width, int batch,
                 batch,
                 0,
                 envelope,
-                mxfp8_tiled_partition(heads, width, envelope.max_visible_keys)};
+                mxfp8_tiled_partition(heads, width, envelope.max_visible_keys,
+                                      envelope.prompt_split_workspace_bytes)};
     const int tiles =
         family == K8V4KvFamily::ParallelGrouped ? (width + grouped_limit - 1) / grouped_limit : 1;
     const int query_tile        = family == K8V4KvFamily::ParallelGrouped && width <= 16
@@ -68,7 +69,7 @@ std::size_t k8v4_kv_workspace_bytes(int heads, int batch, int min_width, int max
     }
     return std::max(maximum, mxfp8_tiled_workspace_bytes(
                                  heads, std::max(min_width, kGroupedPrefillMaxWidth + 1), max_width,
-                                 envelope.max_visible_keys));
+                                 envelope.max_visible_keys, envelope.prompt_split_workspace_bytes));
 }
 
 } // namespace ninfer::ops::detail
