@@ -744,8 +744,12 @@ void apply_allowed_tools(const Json& config, GenerationRequest& output) {
     }
 
     if (mode == "required") {
-        // mode='required' is accepted as advisory: the engine cannot force a call, so the request
-        // proceeds with the narrowed tool set and automatic selection (docs/serving.md).
+        // R8-02: required invocation from an allowed subset cannot be guaranteed (the
+        // filtered set still permits no tool call): reject before mutating the effective
+        // tool set (exception paths must not partially mutate the request).
+        bad_request("tool_choice.allowed_tools.mode='required' forces a tool call, which NInfer "
+                    "cannot guarantee",
+                    "tool_choice", "tool_choice_not_supported");
     }
 
     std::erase_if(output.tools, [&](const ToolDefinition& tool) {
@@ -813,15 +817,21 @@ void parse_tool_choice(const Json& body, GenerationRequest& output) {
 }
 
 void parse_parallel_tool_calls(const Json& body, const GenerationRequest& output) {
-    (void)output;
     if (!body.contains("parallel_tool_calls") || body.at("parallel_tool_calls").is_null()) {
         return;
     }
     if (!body.at("parallel_tool_calls").is_boolean()) {
         bad_request("parallel_tool_calls must be a boolean", "parallel_tool_calls");
     }
-    // parallel_tool_calls=false is accepted as advisory. The engine cannot limit the model to one
-    // call while tools are enabled, so a request may still yield multiple calls (docs/serving.md).
+    const bool parallel = body.at("parallel_tool_calls").get<bool>();
+    if (!parallel && output.uses_tools()) {
+        // R8-02: OpenAI semantics limit the response to zero or one tool call, which NInfer
+        // cannot guarantee while callable tools are enabled: reject (mirroring the
+        // Responses adapter). Neutral without effective tools.
+        bad_request("parallel_tool_calls=false cannot be guaranteed when callable tools are "
+                    "present",
+                    "parallel_tool_calls", "parallel_tool_calls_not_supported");
+    }
 }
 
 void parse_stop(const Json& body, GenerationRequest& output) {
