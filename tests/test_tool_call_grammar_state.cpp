@@ -553,16 +553,15 @@ void test_r7_intent_content_start_gate() {
         check(constraint.active(), "r7 soc: consecutive wrapper re-triggers after whitespace");
     }
 
-    // 6. SOC: visible prose after an already latched region does not re-lock the gate
-    //    (the first latch satisfied the content-start requirement): a later marker still
-    //    triggers, mirroring the parser's latched_ lifecycle.
+    // 6. SOC: visible prose after a completed call locks the gate again (R8-01: the first
+    //    latch is not permanent permission): a later marker is ordinary content.
     {
         ToolCallGrammarConstraint constraint(64, Mode::Compatibility, Intent::RequireToolAtContentStart);
         constraint.commit(full_call);
-        check(!constraint.active(), "r7 soc 6: first wrapper closed");
+        check(!constraint.active(), "r8 soc 6: first wrapper closed");
         constraint.commit("\nor so.\n");
         constraint.commit(marker);
-        check(constraint.active(), "r7 soc 6: prose after a latched region does not re-lock");
+        check(!constraint.active(), "r8 soc 6: prose after a completed call locks the gate");
     }
 
     // 7. Checkpoint: a speculative draft that emitted prose must not permanently lock
@@ -603,6 +602,107 @@ void test_r7_intent_content_start_gate() {
         check(!compat_soc.active(), "r7 xprod: (compat, soc) wrapper after prose is content");
     }
 }
+
+// R8-01 (Round 8 §3): post-call hardened intent parity. The first latch is not permanent
+// permission (R8-I2): visible content after a completed call locks the gate, formatting
+// whitespace and a directly consecutive wrapper keep eligibility (R8-I4), and the state
+// stays value-semantic (R8-I5). TemplateCompatible keeps the historical semantics.
+void test_r8_constraint_post_call_gate() {
+    using Mode = ninfer::ToolCallSyntaxMode;
+    using Intent = ninfer::ToolCallIntentPolicy;
+    const char* marker = "<tool_call>";
+    const char* call1 =
+        "<tool_call><function=bash><parameter=command>echo hi</parameter></function></tool_call>";
+    const char* call2 =
+        "<tool_call><function=bash><parameter=command>echo again</parameter></function></tool_call>";
+
+    // A: prose + CALL — the pre-latch lock (the R7-02 baseline control).
+    {
+        ToolCallGrammarConstraint constraint(64, Mode::Compatibility, Intent::RequireToolAtContentStart);
+        constraint.commit("prose ");
+        constraint.commit(marker);
+        check(!constraint.active(), "r8 A: prose before the first call is content");
+    }
+
+    // B: CALL1 alone — the region closes and the gate stays open for the next entry.
+    {
+        ToolCallGrammarConstraint constraint(64, Mode::Compatibility, Intent::RequireToolAtContentStart);
+        constraint.commit(call1);
+        check(!constraint.active(), "r8 B: the first region closes");
+        constraint.commit(marker);
+        check(constraint.active(), "r8 B: the gate is open after a closed region");
+    }
+
+    // E (split): CALL1 + prose + partial CALL2 — the prose locks the gate before the
+    // second marker completes; CALL2 must never trigger (same-token evidence replayed
+    // through the ordinary inactive transitions, Round 8 §3.11).
+    {
+        ToolCallGrammarConstraint constraint(64, Mode::Compatibility, Intent::RequireToolAtContentStart);
+        constraint.commit(call1);
+        check(!constraint.active(), "r8 E: first region closed");
+        constraint.commit("\nvisible prose\n<tool_");
+        constraint.commit("call>");
+        check(!constraint.active(), "r8 E: prose after CALL1 keeps CALL2 from triggering");
+        constraint.commit(marker);
+        check(!constraint.active(), "r8 E: the locked gate keeps a later marker content");
+    }
+
+    // J (same commit): CALL1 + prose + CALL2 in one chunk — no token boundary may hide
+    // the visible content between the calls (Round 8 §3.10).
+    {
+        ToolCallGrammarConstraint constraint(64, Mode::Compatibility, Intent::RequireToolAtContentStart);
+        constraint.commit(std::string(call1) + "\nvisible prose\n" + call2);
+        check(!constraint.active(), "r8 J: the region breaks at the visible content");
+        constraint.commit(marker);
+        check(!constraint.active(), "r8 J: CALL2 and any later marker stay content");
+    }
+
+    // I (partial failed marker): CALL1 + \n<tool_ then x> then CALL2 — the failed
+    // candidate is visible content and locks the gate (Round 8 §3.15).
+    {
+        ToolCallGrammarConstraint constraint(64, Mode::Compatibility, Intent::RequireToolAtContentStart);
+        constraint.commit(std::string(call1) + "\n<tool_");
+        check(constraint.active(), "r8 I: the partial second entry stays a legal prefix");
+        constraint.commit("x>");
+        check(!constraint.active(), "r8 I: the failed candidate closes the region");
+        constraint.commit(call2);
+        constraint.commit(marker);
+        check(!constraint.active(), "r8 I: the failed candidate keeps later markers content");
+    }
+
+    // H (control, partial immediate CALL2): no visible content between the calls — the
+    // second wrapper resumes as a legal prefix and then triggers (Round 8 §3.14).
+    {
+        ToolCallGrammarConstraint constraint(64, Mode::Compatibility, Intent::RequireToolAtContentStart);
+        constraint.commit(std::string(call1) + "\n<tool_");
+        check(constraint.active(), "r8 H: the partial immediate CALL2 stays a legal prefix");
+        constraint.commit("call>");
+        check(constraint.active(), "r8 H: the second wrapper resumes and triggers");
+    }
+
+    // M (checkpoint): the post-call gate is value-semantic — a draft that emitted prose
+    // locks the draft, and the restore recovers the exact pre-draft eligibility.
+    {
+        ToolCallGrammarConstraint constraint(64, Mode::Compatibility, Intent::RequireToolAtContentStart);
+        constraint.commit(call1);
+        const ToolCallGrammarConstraint cp = constraint.checkpoint();
+        constraint.commit("visible prose");
+        constraint.commit(marker);
+        check(!constraint.active(), "r8 M: the draft prose locks the draft gate");
+        constraint.restore(cp);
+        constraint.commit(std::string("\n") + marker);
+        check(constraint.active(), "r8 M: the restore keeps the post-call gate open");
+    }
+
+    // TC control: the same E text under TemplateCompatible keeps the historical entry
+    // semantics (the marker after prose still triggers; Round 8 §3.18).
+    {
+        ToolCallGrammarConstraint constraint(64, Mode::Compatibility, Intent::TemplateCompatible);
+        constraint.commit(std::string(call1) + "\nvisible prose\n" + call2);
+        constraint.commit(marker);
+        check(constraint.active(), "r8 TC: TemplateCompatible keeps the post-prose entry");
+    }
+}
 } // namespace
 
 int main() {
@@ -630,6 +730,7 @@ int main() {
     test_r6_constraint_parser_entry_cross_check();
     test_r6_constraint_checkpoint_restore_preserves_syntax();
     test_r7_intent_content_start_gate();
+    test_r8_constraint_post_call_gate();
     if (failures == 0) { std::puts("tool_call_grammar_state tests: all passed"); }
     return failures == 0 ? 0 : 1;
 }
