@@ -90,6 +90,41 @@ markup). The fence state is also computed over the latched region's bytes, indep
 chunk partition: recovery retry entries skip markers inside a recognized fence, and the
 diagnostics report `fenced_markers_suppressed` (complete markers a fence suppressed, pre-latch
 and retry) and `ended_in_unclosed_fence` (the pre-latch stream ended inside an unclosed fence).
+
+## Indented literal lines
+
+Before a tool entry has latched, a possible tool marker that begins a physical line at
+visual indentation of four columns or more is classified as **literal content** and cannot
+become executable tool markup. This is a deterministic tool-safety rule, not complete
+CommonMark parsing:
+
+- Visual columns count the line's leading indentation only: a space is one column, a
+  tab the next multiple of four (a tab at column 0, 1, 2, or 3 lands on column 4), and a
+  line break resets the line; the column is frozen once the line's first
+  non-formatting-whitespace byte has arrived (CR is never a column). That first byte at
+  column four or more makes the whole line literal; columns 0-3 keep their baseline
+  eligibility (a genuine call indented by at most three spaces still latches).
+- A whitespace-only indented line (for example `    ` followed by a break) carries no
+  visible byte and does not lock the `start-of-content` intent gate: a genuine call on
+  the next line at column zero still executes.
+- Once a line is literal, every byte of that line is ordinary content, held for
+  publication, and never enters the marker candidate machine. This is a pre-latch rule:
+  a marker line indented inside a latched region's parameter value is parsed by the wire
+  grammar and preserved byte-exact.
+- Fence classification has precedence: a byte the fence tracker owns is fed to the fence
+  shadow, never to the indentation shadow, so a marker on an indented line inside a
+  recognized fence is counted as fence-suppressed only, never double-counted.
+- A literal marker is an entry-classification decision, not a parse failure: the output
+  is returned verbatim as ordinary content with `fallback_reason` `None`, the
+  `indented_markers_suppressed` diagnostic set, and (for the serve product) an
+  operational warning. Under `start-of-content`, the literal line's visible bytes lock
+  the intent gate, so a later genuine call in the same response stays text.
+
+The pre-latch classification (fence suppression, indented-literal classification, the
+marker candidate, failed-candidate rescans, and the intent gate) runs in one shared
+entry-scanner that both the production parser and the CPU grammar-constraint core
+consume, so the two consumers decide entry eligibility on the same byte.
+
 ## Strict vs. tolerant
 
 Both modes parse with the same grammar and the same state machine; the policy changes only
@@ -270,6 +305,10 @@ acceptance gate for the sampling integration are documented in
 - `fenced_markers_suppressed` / `ended_in_unclosed_fence`: complete markers a recognized code
   fence suppressed (pre-latch and retry), and whether the pre-latch stream ended inside an
   unclosed fence.
+- `indented_markers_suppressed`: complete top-level markers suppressed because their `<`
+  began on an indented literal line (visual column >= 4 outside a fence, pre-latch only).
+  The output remains ordinary content; this is an entry-classification diagnostic, not a
+  parse failure.
 - `parse_budget_exhausted`: the Stage-2 work budget was exhausted and the region was returned
   as text.
 - `duplicate_parameters_repaired`: counts repeated parameter names in one call of a tool the

@@ -64,7 +64,7 @@ ToolCallGrammarConstraint::ToolCallGrammarConstraint(std::size_t max_tool_name_l
                                                      ToolCallSyntaxMode syntax,
                                                      ToolCallIntentPolicy intent)
     : max_tool_name_length_(max_tool_name_length == 0 ? 64 : max_tool_name_length),
-      syntax_(syntax), intent_(intent) {}
+      syntax_(syntax), intent_(intent), entry_(syntax, intent) {}
 
 ToolCallParsePolicy ToolCallGrammarConstraint::parse_policy() const {
     ToolCallParsePolicy policy;
@@ -82,62 +82,32 @@ ToolCallParsePolicy ToolCallGrammarConstraint::parse_policy() const {
     return policy;
 }
 
-// R9-01 (Round 9 §3.5): the pre-trigger lazy scan. Under TemplateCompatible any byte is
-// ordinary prose. Under RequireToolAtContentStart the first visible non-whitespace byte or
-// a failed marker candidate transitions the phase to TextLocked (R8-01), and a complete
-// marker under a locked gate is ordinary content (never a trigger). A complete marker in
-// PreTrigger seeds the region buffer and returns Triggered.
+// R10 (R10-I1, Round 10 §8.1): the pre-trigger scan delegates to the shared entry
+// classifier — the same machine the production pre-latch parser consumes. Fence
+// suppression, indented-literal classification, the marker candidate, the failed-candidate
+// rescan, and the intent lock all run there, so the constraint's entry eligibility can
+// never drift from the parser's. The constraint still owns the higher-level phases:
+// PreTrigger -> InRegion on trigger; PreTrigger -> TextLocked when the gate locks
+// (R8-01); BetweenCalls stays a separate strict scan (R9-I1, unchanged).
 InactiveScanResult
 ToolCallGrammarConstraint::advance_pretrigger(ToolCallGrammarConstraint& state,
                                               std::string_view text) {
-    std::size_t i = 0;
-    while (i < text.size()) {
-        const char byte = text[i];
-        if (state.phase_ == ToolConstraintPhase::TextLocked) {
-            // R9-I2: after visible text is committed, later bytes stay ordinary text; the
-            // marker candidate is no longer tracked (EOS stays legal, Round 9 §3.13).
-            break;
-        }
-        if (state.marker_prefix_.empty()) {
-            if (byte == '<') {
-                state.marker_prefix_.push_back(byte);
-            } else if (state.intent_ == ToolCallIntentPolicy::RequireToolAtContentStart &&
-                       !is_tool_format_whitespace(byte)) {
-                // R8-01: visible content locks the gate at any point (R8-I2: the first
-                // latch is not permanent permission).
-                state.phase_ = ToolConstraintPhase::TextLocked;
-                state.marker_prefix_.clear();
-                break;
-            }
-            ++i;
-            continue;
-        }
-        state.marker_prefix_.push_back(byte);
-        ToolOpenTag marker = {};
-        const ToolMarkerStatus status =
-            classify_tool_marker_prefix(state.marker_prefix_, marker, state.syntax_);
-        if (status == ToolMarkerStatus::Complete) {
-            state.phase_ = ToolConstraintPhase::InRegion;
-            state.buffer_ = state.marker_prefix_ + std::string(text.substr(i + 1));
-            state.marker_prefix_.clear();
-            return InactiveScanResult::Triggered;
-        }
-        if (status == ToolMarkerStatus::NotMarker) {
-            if (state.intent_ == ToolCallIntentPolicy::RequireToolAtContentStart) {
-                // R8-01: a failed marker candidate is visible content at any point.
-                state.phase_ = ToolConstraintPhase::TextLocked;
-                state.marker_prefix_.clear();
-                break;
-            }
-            // F8: a breaking '<' starts a fresh candidate (shared split rule).
-            const std::size_t rescan_start =
-                failed_marker_candidate_rescan_start(state.marker_prefix_);
-            state.marker_prefix_ = rescan_start == std::string_view::npos
-                                       ? std::string{}
-                                       : std::string(state.marker_prefix_.substr(rescan_start));
-        }
-        ++i;
+    const ToolCallEntryScanner::FeedResult r = state.entry_.feed(text);
+    if (r.triggered) {
+        state.phase_  = ToolConstraintPhase::InRegion;
+        // Seed the region buffer with the same prefix the production parser seeds its
+        // region with (held formatting whitespace plus the accepted marker) plus the
+        // remaining bytes of this candidate; the region re-parse skips leading format
+        // whitespace, so the verdicts agree byte for byte.
+        state.buffer_ = r.region_prefix + std::string(text.substr(r.consumed));
+        return InactiveScanResult::Triggered;
     }
+    // Ordinary content: under RequireToolAtContentStart the visible bytes lock the gate
+    // (the scanner's intent lock, R8-01); TemplateCompatible stays lazy. The scanner
+    // keeps tracking fence/indent state after the lock (the diagnostics stay live), but
+    // a locked gate never triggers again.
+    state.phase_ = state.entry_.locked() ? ToolConstraintPhase::TextLocked
+                                         : ToolConstraintPhase::PreTrigger;
     return InactiveScanResult::Continued;
 }
 
@@ -278,13 +248,20 @@ ToolCallGrammarConstraint::advance(std::string_view decoded_bytes,
     if (target != nullptr) { *target = state; }
 
     // The candidate ended inside a marker trigger: the grammar cannot decide yet. The
-    // pending candidate is only tracked in PreTrigger (lazy) and BetweenCalls (strict);
-    // TextLocked tracks none (EOS is legal, §3.13).
-    if (state.phase_ != ToolConstraintPhase::InRegion && !state.marker_prefix_.empty()) {
-        ToolOpenTag marker = {};
-        if (classify_tool_marker_prefix(state.marker_prefix_, marker,
-                                        state.syntax_) == ToolMarkerStatus::NeedMore) {
-            return ToolCallConstraintVerdict::NeedMore;
+    // pending candidate is tracked in PreTrigger (the shared entry scanner, R10-I1) and
+    // BetweenCalls (the strict scan); TextLocked tracks none (EOS is legal, §3.13).
+    if (state.phase_ != ToolConstraintPhase::InRegion &&
+        state.phase_ != ToolConstraintPhase::TextLocked) {
+        const std::string_view pending =
+            state.phase_ == ToolConstraintPhase::BetweenCalls
+                ? std::string_view(state.marker_prefix_)
+                : state.entry_.pending_candidate();
+        if (!pending.empty()) {
+            ToolOpenTag marker = {};
+            if (classify_tool_marker_prefix(pending, marker,
+                                            state.syntax_) == ToolMarkerStatus::NeedMore) {
+                return ToolCallConstraintVerdict::NeedMore;
+            }
         }
     }
     return ToolCallConstraintVerdict::Allowed;
@@ -313,13 +290,22 @@ bool ToolCallGrammarConstraint::finished() const noexcept {
 
 // R9-01 (Round 9 §3.13): EOS legality — a stream may end only when no open structure
 // needs more bytes: an open region and a pending marker candidate both forbid it.
+// R10-I1: the pre-trigger candidate lives in the shared entry scanner.
 bool ToolCallGrammarConstraint::can_terminate() const noexcept {
-    return phase_ != ToolConstraintPhase::InRegion && marker_prefix_.empty();
+    if (phase_ == ToolConstraintPhase::InRegion) { return false; }
+    if (phase_ == ToolConstraintPhase::TextLocked) { return true; }
+    if (phase_ == ToolConstraintPhase::BetweenCalls) { return marker_prefix_.empty(); }
+    return entry_.pending_candidate().empty();
 }
 
 std::size_t ToolCallGrammarConstraint::observed_bytes() const noexcept {
-    return phase_ == ToolConstraintPhase::InRegion ? buffer_.size()
-                                                   : marker_prefix_.size();
+    switch (phase_) {
+    case ToolConstraintPhase::InRegion:     return buffer_.size();
+    case ToolConstraintPhase::BetweenCalls: return marker_prefix_.size();
+    case ToolConstraintPhase::TextLocked:   return 0;
+    case ToolConstraintPhase::PreTrigger:   return entry_.pending_candidate().size();
+    }
+    return 0;
 }
 
 } // namespace ninfer::models::qwen3_5::frontend

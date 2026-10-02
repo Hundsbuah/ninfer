@@ -1,5 +1,6 @@
 #pragma once
 
+#include "models/qwen3_5/frontend/tool_call_entry_scan.h"
 #include "models/qwen3_5/frontend/tool_call_stream.h"
 
 #include <cstddef>
@@ -142,10 +143,19 @@ private:
     ToolCallIntentPolicy intent_ = ToolCallIntentPolicy::TemplateCompatible;
     // Bytes of the open region since the trigger (empty while inactive).
     std::string buffer_;
-    // The accumulating marker-trigger candidate while inactive (starts with '<'; may
-    // contain further '<' bytes inside a quoted header value). Never tracked in
-    // TextLocked (later bytes are ordinary text, R9-I2) or across a completed region
-    // (a stale closer would flush as a failed candidate and reject the gate).
+    // R10 (R10-I1): the shared pre-trigger entry classifier — the same machine the
+    // production pre-latch parser consumes. It owns the pre-trigger fence state, the
+    // indented-literal state, the marker candidate, the held whitespace, and the intent
+    // lock, so the constraint can never latch an entry the parser treats as prose (or
+    // vice versa). BetweenCalls keeps its own strict marker scan (R9-I1: post-call is
+    // deliberately stricter than the lazy pre-trigger; no fence escape hatch).
+    // Value-semantic: checkpoint()/restore() carry it with the state words.
+    ToolCallEntryScanner entry_;
+    // The accumulating marker-trigger candidate of the between-calls strict scan (starts
+    // with '<'; may contain further '<' bytes inside a quoted header value). Never tracked
+    // in TextLocked (later bytes are ordinary text, R9-I2) or across a completed region
+    // (a stale closer would flush as a failed candidate and reject the gate). The
+    // pre-trigger candidate lives in the shared entry scanner (R10-I1).
     std::string marker_prefix_;
     // R9-01: the explicit phase (replaces the old triggered_ + entry_locked_ booleans).
     ToolConstraintPhase phase_ = ToolConstraintPhase::PreTrigger;

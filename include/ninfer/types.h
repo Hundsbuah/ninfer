@@ -566,6 +566,10 @@ struct ToolCallParseDiagnostics {
     // R3-06: complete top-level markers a recognized code fence suppressed (pre-latch and
     // retry), and whether the pre-latch stream ended inside an unclosed fence.
     std::uint32_t fenced_markers_suppressed       = 0;
+    // R10-03: complete top-level markers suppressed because their '<' began on an indented
+    // literal line (visual column >= 4 outside a fence, pre-latch only). The output remains
+    // ordinary content; this is an entry-classification diagnostic, not a parse failure.
+    std::uint32_t indented_markers_suppressed     = 0;
     bool ended_in_unclosed_fence                  = false;
     // Round 4 (N-07): the Stage-2 work budget was exhausted; the region was returned as text.
     bool parse_budget_exhausted                  = false;

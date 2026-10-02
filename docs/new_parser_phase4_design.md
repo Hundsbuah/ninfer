@@ -104,17 +104,21 @@ directly, so parser and constraint cannot drift.
 ### D2 — lazy trigger
 
 No restriction before a complete marker trigger (ordinary prose and reasoning blocks stay
-free, matching the Qwen3-Coder reference's trigger choice). The inactive scan is a
-**superset approximation** of the parser's pre-latch machine, not a byte-for-byte mirror
-(R3-11, verified by probe2 P-F): since CR6 the parser runs a line-oriented fence tracker
-over the pre-latch bytes (a complete marker inside a recognized fence never latches), and
-since R3-05 its `NotMarker` handling publishes the failed candidate head and re-feeds the
-bytes from the next `<` (a deterministic rescan) — the inactive scan runs neither, so it
-can trigger where the parser does not latch (e.g. a `<tool_call>` inside a ```` ``` ````
-fence).
-The first trigger is the parser's latch **modulo the fence**: `<tool_call>`,
-`<function_calls>`, or a complete function/invoke opener
-(`classify_tool_marker_prefix == Complete`).
+free, matching the Qwen3-Coder reference's trigger choice). The pre-trigger inactive scan
+is **not** an independent approximation of the parser's pre-latch machine: since Round 10
+(R10-02) the production pre-latch parsing and the CPU grammar-constraint core share the
+same entry classifier (`tool_call_entry_scan.{h,cpp}`, `ToolCallEntryScanner`) for fences,
+indentation, marker prefixes, failed-marker rescans, and intent locking. The constraint's
+`PreTrigger` phase delegates its whole scan to that shared scanner, so a trigger in the
+constraint and a latch in the parser happen on the same byte (verified by the
+cross-equivalence corpus in `test_tool_call_grammar_state.cpp`). The first trigger is the
+parser's latch: `<tool_call>`, `<function_calls>`, or a complete function/invoke opener
+(`classify_tool_marker_prefix == Complete`), suppressed by a recognized fence or an
+indented literal line exactly as in the parser.
+
+**Not part of the shared classifier:** the `BetweenCalls` scan after a completed call is
+a deliberately strict marker machine (Round 9 R9-I1) and does not use the fence/indentation
+escape hatches; see below.
 
 **After a region closes** (Round 9 R9-01) the state enters the explicit
 `BetweenCalls` phase: only formatting whitespace, a legal next wrapper
@@ -256,7 +260,7 @@ the mode would claim a constraint the sampling path does not enforce.
 | CPU grammar-state core (`ToolCallGrammarConstraint`) | implemented, pure CPU, deterministic |
 | CPU grammar logic (P4.12 matrix) | verified by `ninfer_tool_call_grammar_state_test` (16 test groups incl. every-byte-split property, checkpoint/restore, draft accept/rollback/correction) |
 | Parser grammar as source of truth | verified: the constraint consumes `classify_tool_marker_prefix` + `parse_tool_call_region` directly; no second wire grammar |
-| Lazy trigger | tested (partial marker → `NeedMore`; prose never rejects) — the inactive scan is a superset approximation of the parser's pre-latch machine (no fence tracker, no R3-05 rescan; R3-11), not a byte-for-byte mirror |
+| Lazy trigger | tested (partial marker → `NeedMore`; prose never rejects) — the pre-trigger inactive scan delegates to the shared entry classifier that the production pre-latch parser consumes (fences, indentation, marker prefixes, failed-marker rescans, intent locking); trigger and latch agree on the same byte (Round 10 R10-02). The post-call `BetweenCalls` scan stays a deliberately strict machine (R9-I1) |
 | Checkpoint/rollback (P4.8) | tested (value semantics; restore reproduces fresh-state behavior) |
 | Speculative semantics | documented (D7); CPU state semantics tested; GPU runtime flow build-verified only, **not verified** |
 | Sampling integration | **not implemented in this build**: the grammar-state core compiles into `ninfer_model_runtime`, but the sampling pipeline never consults it; the engine refuses the flag at startup (F10) |

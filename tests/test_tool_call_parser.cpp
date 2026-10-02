@@ -2406,6 +2406,483 @@ int test_fence_split_at_every_byte() {
     return failures;
 }
 
+
+// ===== Round 10 (R10-01/02/03): indented literal lines =====
+
+std::string r10_indent_lines(const std::string& text, const std::string& prefix) {
+    std::string out;
+    std::size_t start = 0;
+    while (true) {
+        const std::size_t end = text.find('\n', start);
+        const std::size_t len = (end == std::string::npos) ? text.size() - start : end - start;
+        if (len > 0) { out += prefix; out.append(text, start, len); }
+        if (end == std::string::npos) { break; }
+        out += '\n';
+        start = end + 1;
+    }
+    return out;
+}
+
+fi::ToolCallParsePolicy r10_policy(ninfer::ToolCallSyntaxMode syntax,
+                                   ninfer::ToolCallIntentPolicy intent) {
+    fi::ToolCallParsePolicy policy;
+    policy.max_name_length = 64;
+    policy.syntax          = syntax;
+    policy.intent          = intent;
+    return policy;
+}
+
+// Runs one machine over `text` (byte-wise when split == 1, one-shot otherwise) and returns
+// the finish result plus the published visible bytes.
+fi::ToolCallStreamResult r10_machine_run(const fi::ToolCallParsePolicy& policy,
+                                         const std::string& text, std::size_t split,
+                                         std::string* published = nullptr) {
+    fi::ToolCallStreamParser machine(policy);
+    std::string visible;
+    if (split == 1) {
+        for (std::size_t i = 0; i < text.size(); ++i) {
+            visible += machine.feed(std::string_view(text.data() + i, 1));
+        }
+    } else {
+        visible += machine.feed(std::string_view(text));
+    }
+    if (published != nullptr) { *published = visible; }
+    return machine.finish(ninfer::FinishReason::None);
+}
+
+int test_r10_indented_wrapper_is_literal() {
+    // R10-01 / §9.1: an indented wrapper (every non-empty line + 4 spaces) is ordinary
+    // content: 0 calls, byte-identical, marker_seen false, indented diagnostic set.
+    int failures = 0;
+    const std::string call     = tool_call("bash", {{"command", "echo example"}});
+    const std::string indented = r10_indent_lines(call, "    ");
+    const std::string tabbed   = r10_indent_lines(call, "\t"); // §9.2
+    for (const std::string& fixture : {indented, tabbed}) {
+        for (const auto syntax :
+             {ninfer::ToolCallSyntaxMode::QwenWrappedNative, ninfer::ToolCallSyntaxMode::Compatibility}) {
+            for (const auto intent :
+                 {ninfer::ToolCallIntentPolicy::TemplateCompatible,
+                  ninfer::ToolCallIntentPolicy::RequireToolAtContentStart}) {
+                for (const std::size_t split : {std::size_t{1}, fixture.size()}) {
+                    std::string published;
+                    const auto res = r10_machine_run(r10_policy(syntax, intent), fixture, split, &published);
+                    failures += check(res.marker_seen == false, "R10 indented wrapper latched a marker");
+                    failures += check(res.indented_markers_suppressed >= 1,
+                                      "R10 indented wrapper missing the suppression diagnostic");
+                    failures += check(res.fenced_markers_suppressed == 0,
+                                      "R10 indented wrapper double-counted as fenced");
+                    failures += check(res.ended_in_unclosed_fence == false,
+                                      "R10 indented wrapper reported an unclosed fence");
+                    failures += check(res.status == fi::ToolCallStreamStatus::Invalid &&
+                                         res.failure == fi::ToolCallParseFailure::MalformedStructure,
+                                      "R10 indented wrapper was not plain content");
+                    failures += check(res.tail == fixture,
+                                      "R10 indented content was not byte-identical");
+                }
+            }
+        }
+    }
+    // Entry level: both strict and tolerant, both intent policies, reason None.
+    const auto contract = contract_for("bash", Json{{"command", Json{{"type", "string"}}}});
+    for (const auto syntax :
+         {ninfer::ToolCallSyntaxMode::QwenWrappedNative, ninfer::ToolCallSyntaxMode::Compatibility}) {
+        for (const auto intent :
+             {ninfer::ToolCallIntentPolicy::TemplateCompatible,
+              ninfer::ToolCallIntentPolicy::RequireToolAtContentStart}) {
+            for (const bool tolerant : {false, true}) {
+                const auto parsed =
+                    fi::parse_qwen_tool_call_output(indented, 64, contract, tolerant,
+                                                    ninfer::FinishReason::None, syntax,
+                                                    ninfer::ToolCallAmbiguityPolicy::PayloadFidelity,
+                                                    intent);
+                failures += check(!parsed.is_tool_call_response && parsed.tool_calls.empty(),
+                                  "R10 indented wrapper produced a call");
+                failures += check(parsed.content == indented,
+                                  "R10 indented wrapper content was not byte-identical");
+                failures += check(parsed.diagnostics.fallback_reason ==
+                                      ninfer::ToolCallParseFallbackReason::None,
+                                  "R10 indented wrapper reported a parse failure");
+                failures += check(parsed.diagnostics.indented_markers_suppressed >= 1,
+                                  "R10 indented wrapper diagnostic missing at the entry");
+            }
+        }
+    }
+    return failures;
+}
+
+int test_r10_mixed_indentation_suppressed() {
+    // §9.3: TAB/space mixes placing '<' at visual column >= 4 are all literal.
+    int failures = 0;
+    const auto contract = contract_for("bash", Json{{"command", Json{{"type", "string"}}}});
+    const std::vector<std::string> fixtures = {" \t<tool_call>",
+                                               "  \t<tool_call>",
+                                               "   \t<tool_call>",
+                                               "\t <tool_call>"};
+    for (const std::string& fixture : fixtures) {
+        const auto res = r10_machine_run(r10_policy(ninfer::ToolCallSyntaxMode::QwenWrappedNative,
+                                                    ninfer::ToolCallIntentPolicy::TemplateCompatible),
+                                         fixture, 1);
+        failures += check(res.marker_seen == false,
+                          std::string("R10 mixed-indent fixture latched: ") + fixture);
+        failures += check(res.indented_markers_suppressed >= 1,
+                          std::string("R10 mixed-indent fixture not counted: ") + fixture);
+        const auto parsed = fi::parse_qwen_tool_call_output(
+            fixture, 64, contract, false, ninfer::FinishReason::None,
+            ninfer::ToolCallSyntaxMode::QwenWrappedNative,
+            ninfer::ToolCallAmbiguityPolicy::PayloadFidelity,
+            ninfer::ToolCallIntentPolicy::TemplateCompatible);
+        failures += check(parsed.tool_calls.empty() && parsed.content == fixture,
+                          "R10 mixed-indent fixture was not plain content");
+        failures += check(parsed.diagnostics.fallback_reason ==
+                              ninfer::ToolCallParseFallbackReason::None,
+                          "R10 mixed-indent fixture reported a parse failure");
+    }
+    return failures;
+}
+
+int test_r10_three_space_control_still_latches() {
+    // §9.4: three spaces is not an indented literal: the genuine call still executes.
+    int failures = 0;
+    const std::string call = r10_indent_lines(tool_call("bash", {{"command", "echo example"}}), "   ");
+    const auto contract = contract_for("bash", Json{{"command", Json{{"type", "string"}}}});
+    for (const auto syntax :
+         {ninfer::ToolCallSyntaxMode::QwenWrappedNative, ninfer::ToolCallSyntaxMode::Compatibility}) {
+        const auto parsed =
+            fi::parse_qwen_tool_call_output(call, 64, contract, false, ninfer::FinishReason::None,
+                                            syntax, ninfer::ToolCallAmbiguityPolicy::PayloadFidelity,
+                                            ninfer::ToolCallIntentPolicy::TemplateCompatible);
+        failures += check(parsed.is_tool_call_response && parsed.tool_calls.size() == 1 &&
+                              parsed.tool_calls.front().name == "bash",
+                          "R10 3-space genuine call did not latch");
+        failures += check(parsed.diagnostics.indented_markers_suppressed == 0,
+                          "R10 3-space control was counted as indented");
+    }
+    return failures;
+}
+
+int test_r10_blank_indented_line_does_not_lock() {
+    // §9.5: a whitespace-only indented line carries no visible byte and does not lock the
+    // intent gate: the following genuine call executes even under SOC.
+    int failures = 0;
+    const std::string fixture = "    \n" + tool_call("bash", {{"command", "echo example"}});
+    const auto contract = contract_for("bash", Json{{"command", Json{{"type", "string"}}}});
+    for (const auto intent :
+         {ninfer::ToolCallIntentPolicy::TemplateCompatible,
+          ninfer::ToolCallIntentPolicy::RequireToolAtContentStart}) {
+        const auto parsed =
+            fi::parse_qwen_tool_call_output(fixture, 64, contract, false,
+                                            ninfer::FinishReason::None,
+                                            ninfer::ToolCallSyntaxMode::QwenWrappedNative,
+                                            ninfer::ToolCallAmbiguityPolicy::PayloadFidelity, intent);
+        failures += check(parsed.is_tool_call_response && parsed.tool_calls.size() == 1,
+                          "R10 blank indented line locked the intent gate");
+        failures += check(parsed.diagnostics.indented_markers_suppressed == 0,
+                          "R10 blank indented line counted a marker");
+    }
+    return failures;
+}
+
+int test_r10_indented_example_then_real_call() {
+    // §9.6: an indented example followed by a genuine call — TemplateCompatible still
+    // executes the call (the example is content); RequireToolAtContentStart locks after
+    // the example's visible bytes and returns everything as text.
+    int failures = 0;
+    const std::string example =
+        r10_indent_lines(tool_call("bash", {{"command", "echo example"}}), "    ");
+    const std::string call    = tool_call("bash", {{"command", "echo real"}});
+    const std::string fixture = example + "\n" + call;
+    const auto contract = contract_for("bash", Json{{"command", Json{{"type", "string"}}}});
+    {
+        const auto parsed =
+            fi::parse_qwen_tool_call_output(fixture, 64, contract, false,
+                                            ninfer::FinishReason::None,
+                                            ninfer::ToolCallSyntaxMode::QwenWrappedNative,
+                                            ninfer::ToolCallAmbiguityPolicy::PayloadFidelity,
+                                            ninfer::ToolCallIntentPolicy::TemplateCompatible);
+        failures += check(parsed.is_tool_call_response && parsed.tool_calls.size() == 1 &&
+                              parsed.tool_calls.front().arguments_json ==
+                                  Json{{"command", "echo real"}}.dump(),
+                          "R10 TC: the real call after an indented example did not execute");
+        failures += check(parsed.content == example,
+                          "R10 TC: the indented example was not returned as content");
+    }
+    {
+        const auto parsed =
+            fi::parse_qwen_tool_call_output(fixture, 64, contract, false,
+                                            ninfer::FinishReason::None,
+                                            ninfer::ToolCallSyntaxMode::QwenWrappedNative,
+                                            ninfer::ToolCallAmbiguityPolicy::PayloadFidelity,
+                                            ninfer::ToolCallIntentPolicy::RequireToolAtContentStart);
+        failures += check(!parsed.is_tool_call_response && parsed.tool_calls.empty(),
+                          "R10 SOC: the real call after an indented example executed");
+        failures += check(parsed.content == fixture,
+                          "R10 SOC: the indented-example input was not plain content");
+        failures += check(parsed.diagnostics.fallback_reason ==
+                              ninfer::ToolCallParseFallbackReason::None,
+                          "R10 SOC: the gate lock reported a parse failure");
+        failures += check(parsed.diagnostics.indented_markers_suppressed >= 1,
+                          "R10 SOC: the indented example was not counted");
+    }
+    return failures;
+}
+
+int test_r10_fenced_control_unaffected() {
+    // §9.7: a marker inside a recognized fence is fence-suppressed, not indented-suppressed,
+    // even when the fenced lines are indented.
+    int failures = 0;
+    const std::string fenced = "```xml\n    <tool_call>\n    <function=bash>\n    </function>\n"
+                               "    </tool_call>\n```";
+    const auto res = r10_machine_run(
+        r10_policy(ninfer::ToolCallSyntaxMode::QwenWrappedNative,
+                   ninfer::ToolCallIntentPolicy::TemplateCompatible),
+        fenced, 1);
+    failures += check(res.fenced_markers_suppressed > 0,
+                      "R10 fence control: the fenced marker was not fence-suppressed");
+    failures += check(res.indented_markers_suppressed == 0,
+                      "R10 fence control: the fenced marker was double-counted as indented");
+    failures += check(res.marker_seen == false, "R10 fence control: a fence byte latched");
+    return failures;
+}
+
+int test_r10_compat_indented_bare_function_suppressed() {
+    // §9.8: Compatibility mode suppresses the indented bare <function=> entry family too.
+    int failures = 0;
+    const std::string bare = r10_indent_lines(
+        "<function=bash>\n<parameter=command>\necho example\n</parameter>\n</function>", "    ");
+    const auto contract = contract_for("bash", Json{{"command", Json{{"type", "string"}}}});
+    const auto parsed = fi::parse_qwen_tool_call_output(
+        bare, 64, contract, false, ninfer::FinishReason::None,
+        ninfer::ToolCallSyntaxMode::Compatibility,
+        ninfer::ToolCallAmbiguityPolicy::PayloadFidelity,
+        ninfer::ToolCallIntentPolicy::TemplateCompatible);
+    failures += check(!parsed.is_tool_call_response && parsed.tool_calls.empty(),
+                      "R10 compat indented bare function executed");
+    failures += check(parsed.content == bare, "R10 compat indented bare function content changed");
+    failures += check(parsed.diagnostics.fallback_reason ==
+                          ninfer::ToolCallParseFallbackReason::None,
+                      "R10 compat indented bare function reported a parse failure");
+    failures += check(parsed.diagnostics.indented_markers_suppressed >= 1,
+                      "R10 compat indented bare function missing the diagnostic");
+    return failures;
+}
+
+int test_r10_native_bare_function_unchanged() {
+    // §9.9: a bare <function=> entry at column 0 under QwenWrappedNative was already
+    // non-executable; Round 10 must not change that.
+    int failures = 0;
+    const std::string bare =
+        "<function=bash>\n<parameter=command>\necho example\n</parameter>\n</function>";
+    const auto contract = contract_for("bash", Json{{"command", Json{{"type", "string"}}}});
+    const auto parsed = fi::parse_qwen_tool_call_output(
+        bare, 64, contract, false, ninfer::FinishReason::None,
+        ninfer::ToolCallSyntaxMode::QwenWrappedNative,
+        ninfer::ToolCallAmbiguityPolicy::PayloadFidelity,
+        ninfer::ToolCallIntentPolicy::TemplateCompatible);
+    failures += check(!parsed.is_tool_call_response && parsed.tool_calls.empty(),
+                      "R10 native bare function became executable");
+    failures += check(parsed.content == bare, "R10 native bare function content changed");
+    return failures;
+}
+
+int test_r10_indented_payload_preserved() {
+    // §9.10: an indented markup line inside a parameter value of a genuine call is
+    // byte-exact — the literal guard is pre-latch only.
+    int failures = 0;
+    const std::string fixture = "<tool_call>\n<function=write>\n<parameter=content>\n    "
+                                "<tool_call>\n    example only\n    </tool_call>\n</parameter>\n"
+                                "</function>\n</tool_call>";
+    const std::string expected_value = "    <tool_call>\n    example only\n    </tool_call>";
+    const auto contract = contract_for("write", Json{{"content", Json{{"type", "string"}}}});
+    for (const auto syntax :
+         {ninfer::ToolCallSyntaxMode::QwenWrappedNative, ninfer::ToolCallSyntaxMode::Compatibility}) {
+        const auto parsed =
+            fi::parse_qwen_tool_call_output(fixture, 64, contract, false,
+                                            ninfer::FinishReason::None, syntax,
+                                            ninfer::ToolCallAmbiguityPolicy::PayloadFidelity,
+                                            ninfer::ToolCallIntentPolicy::TemplateCompatible);
+        failures += check(parsed.is_tool_call_response && parsed.tool_calls.size() == 1 &&
+                              parsed.tool_calls.front().name == "write" &&
+                              parsed.tool_calls.front().arguments_json ==
+                                  Json{{"content", expected_value}}.dump(),
+                          "R10 payload: the indented markup line was not byte-exact");
+    }
+    return failures;
+}
+
+fi::ToolCallOutputDecoder::Terminal r10_decoder_terminal(
+    std::shared_ptr<const fi::ToolCallOutputContract> contract, const std::string& text,
+    std::size_t split, ninfer::ToolCallSyntaxMode syntax,
+    ninfer::ToolCallIntentPolicy intent) {
+    fi::ToolCallOutputDecoder decoder(contract, 64, false, syntax,
+                                      ninfer::ToolCallAmbiguityPolicy::PayloadFidelity, intent);
+    std::string discarded;
+    if (split == text.size()) {
+        discarded += decoder.feed(std::string_view(text));
+    } else if (split != 0) {
+        discarded += decoder.feed(std::string_view(text).substr(0, split));
+        discarded += decoder.feed(std::string_view(text).substr(split));
+    } else {
+        discarded += decoder.feed(std::string_view(text).substr(0, 0));
+        discarded += decoder.feed(std::string_view(text).substr(0));
+    }
+    (void)discarded;
+    return decoder.finish(ninfer::FinishReason::None);
+}
+
+bool r10_terminal_equal(const fi::ToolCallOutputDecoder::Terminal& a,
+                        const fi::ToolCallOutputDecoder::Terminal& b) {
+    if (a.content != b.content || a.tool_calls.size() != b.tool_calls.size()) { return false; }
+    for (std::size_t i = 0; i < a.tool_calls.size(); ++i) {
+        if (a.tool_calls[i].name != b.tool_calls[i].name ||
+            a.tool_calls[i].arguments_json != b.tool_calls[i].arguments_json) {
+            return false;
+        }
+    }
+    const auto& da = a.diagnostics;
+    const auto& db = b.diagnostics;
+    return da.fallback_reason == db.fallback_reason && da.marker_seen == db.marker_seen &&
+           da.fenced_markers_suppressed == db.fenced_markers_suppressed &&
+           da.indented_markers_suppressed == db.indented_markers_suppressed &&
+           da.ended_in_unclosed_fence == db.ended_in_unclosed_fence;
+}
+
+int test_r10_every_byte_split() {
+    // §9.11: every split point of the new representative fixtures must equal one-shot.
+    int failures = 0;
+    const auto contract = output_contract_for("bash", Json{{"command", Json{{"type", "string"}}}});
+    const std::string native_example =
+        r10_indent_lines(tool_call("bash", {{"command", "echo example"}}), "    ");
+    const std::string tab_example = r10_indent_lines(tool_call("bash", {{"command", "echo example"}}), "\t");
+    const std::string mixed_example = " \t<tool_call>";
+    const std::string three_space_call =
+        r10_indent_lines(tool_call("bash", {{"command", "echo real"}}), "   ");
+    const std::string example_then_call = native_example + "\n" +
+                                           tool_call("bash", {{"command", "echo real"}});
+    const std::vector<std::pair<std::string, std::size_t>> fixtures = {
+        {native_example, 0}, {tab_example, 0}, {mixed_example, 0},
+        {three_space_call, 1}, {example_then_call, 1},
+    };
+    for (const auto& [text, expected_calls] : fixtures) {
+        const auto reference =
+            r10_decoder_terminal(contract, text, text.size(),
+                                 ninfer::ToolCallSyntaxMode::QwenWrappedNative,
+                                 ninfer::ToolCallIntentPolicy::TemplateCompatible);
+        failures += check(reference.tool_calls.size() == expected_calls,
+                          std::string("R10 split corpus: unexpected one-shot call count for ") + text);
+        for (std::size_t split = 0; split <= text.size(); ++split) {
+            const auto streamed =
+                r10_decoder_terminal(contract, text, split,
+                                     ninfer::ToolCallSyntaxMode::QwenWrappedNative,
+                                     ninfer::ToolCallIntentPolicy::TemplateCompatible);
+            failures += check(r10_terminal_equal(streamed, reference),
+                              (std::string("R10 split corpus: split ") + std::to_string(split) +
+                               " diverged from one-shot for ") + text);
+        }
+    }
+    return failures;
+}
+
+int test_r10_multi_boundary_splits() {
+    // §9.12: explicit splits inside indentation, the TAB transition, the marker prefix,
+    // CRLF framing, the fence opener, and a failed marker candidate.
+    int failures = 0;
+    const auto contract = output_contract_for("bash", Json{{"command", Json{{"type", "string"}}}});
+    const auto run = [&](std::string_view first, std::string_view second,
+                         bool expect_call) -> int {
+        const std::string text = std::string(first) + std::string(second);
+        fi::ToolCallOutputDecoder decoder(contract, 64, false,
+                                          ninfer::ToolCallSyntaxMode::QwenWrappedNative,
+                                          ninfer::ToolCallAmbiguityPolicy::PayloadFidelity,
+                                          ninfer::ToolCallIntentPolicy::TemplateCompatible);
+        std::string discarded;
+        discarded += decoder.feed(first);
+        discarded += decoder.feed(second);
+        (void)discarded;
+        const auto terminal = decoder.finish(ninfer::FinishReason::None);
+        return check(terminal.tool_calls.size() == (expect_call ? 1 : 0),
+                     "R10 multi-boundary split gave the wrong call count");
+    };
+    const std::string call = tool_call("bash", {{"command", "echo example"}});
+    // Split inside the indentation (after two of the four spaces).
+    const std::string indented_call = r10_indent_lines(call, "    ");
+    failures += run(indented_call.substr(0, 2), indented_call.substr(2), false);
+    // The TAB transition.
+    failures += run(" \t", "<tool_call>", false);
+    // Split inside the suppressed marker prefix.
+    failures += run("\t<tool_", "call>", false);
+    // CRLF framing of an indented wrapper.
+    {
+        const std::string crlf = r10_indent_lines(
+            std::string("<tool_call>\n<function=bash>\n</function>\n</tool_call>"), "    ");
+        std::string crlf_text;
+        for (char byte : crlf) { crlf_text += byte; if (byte == '\n') { crlf_text += '\r'; } }
+        // One-shot and split: the full content is the published visible bytes plus the
+        // held tail the terminal carries.
+        fi::ToolCallOutputDecoder ref_decoder(contract, 64, false,
+                                              ninfer::ToolCallSyntaxMode::QwenWrappedNative,
+                                              ninfer::ToolCallAmbiguityPolicy::PayloadFidelity,
+                                              ninfer::ToolCallIntentPolicy::TemplateCompatible);
+        std::string visible = ref_decoder.feed(std::string_view(crlf_text));
+        const auto reference = ref_decoder.finish(ninfer::FinishReason::None);
+        fi::ToolCallOutputDecoder split_decoder(contract, 64, false,
+                                                ninfer::ToolCallSyntaxMode::QwenWrappedNative,
+                                                ninfer::ToolCallAmbiguityPolicy::PayloadFidelity,
+                                                ninfer::ToolCallIntentPolicy::TemplateCompatible);
+        std::string visible2;
+        visible2 += split_decoder.feed(crlf_text.substr(0, 5));
+        visible2 += split_decoder.feed(crlf_text.substr(5));
+        const auto streamed = split_decoder.finish(ninfer::FinishReason::None);
+        failures += check(reference.tool_calls.empty() && streamed.tool_calls.empty(),
+                          "R10 CRLF indented wrapper latched");
+        failures += check(r10_terminal_equal(streamed, reference),
+                          "R10 CRLF indented wrapper split diverged");
+        failures += check(visible + reference.content == crlf_text &&
+                              visible2 + streamed.content == crlf_text,
+                          "R10 CRLF indented wrapper content was not byte-identical");
+        failures += check(reference.diagnostics.indented_markers_suppressed >= 1,
+                          "R10 CRLF indented wrapper missing the diagnostic");
+    }
+    // Split inside the fence opener.
+    {
+        const std::string fence = "```xml\n    <tool_call>\n    </tool_call>\n```";
+        const auto reference = r10_decoder_terminal(
+            contract, fence, fence.size(), ninfer::ToolCallSyntaxMode::QwenWrappedNative,
+            ninfer::ToolCallIntentPolicy::TemplateCompatible);
+        fi::ToolCallOutputDecoder decoder(contract, 64, false,
+                                          ninfer::ToolCallSyntaxMode::QwenWrappedNative,
+                                          ninfer::ToolCallAmbiguityPolicy::PayloadFidelity,
+                                          ninfer::ToolCallIntentPolicy::TemplateCompatible);
+        std::string discarded;
+        discarded += decoder.feed("``");
+        discarded += decoder.feed(fence.substr(2));
+        (void)discarded;
+        const auto streamed = decoder.finish(ninfer::FinishReason::None);
+        failures += check(r10_terminal_equal(streamed, reference),
+                          "R10 fence-opener split diverged");
+        failures += check(reference.diagnostics.fenced_markers_suppressed > 0 &&
+                              reference.diagnostics.indented_markers_suppressed == 0,
+                          "R10 fence-opener split misclassified the suppression");
+    }
+    // A failed marker candidate on an indented line, then a genuine call.
+    {
+        const std::string text = "    <toolx not a marker>\n" + call;
+        fi::ToolCallOutputDecoder decoder(contract, 64, false,
+                                          ninfer::ToolCallSyntaxMode::QwenWrappedNative,
+                                          ninfer::ToolCallAmbiguityPolicy::PayloadFidelity,
+                                          ninfer::ToolCallIntentPolicy::TemplateCompatible);
+        std::string visible;
+        visible += decoder.feed(text.substr(0, 1));
+        visible += decoder.feed(text.substr(1));
+        const auto terminal = decoder.finish(ninfer::FinishReason::None);
+        failures += check(terminal.tool_calls.size() == 1 &&
+                              terminal.tool_calls.front().name == "bash",
+                          "R10 failed-candidate line blocked the genuine call");
+        failures += check(visible + terminal.content == "    <toolx not a marker>",
+                          "R10 failed-candidate literal line was not content");
+    }
+    return failures;
+}
+
 } // namespace
 
 int test_duplicate_parameter_keeps_last_value() {
@@ -4318,9 +4795,11 @@ int test_r6_intent_policy_matrix() {
         failures += check(parsed.is_tool_call_response && parsed.tool_calls.size() == 1,
                           "R6-05 A: plain call commits under both intent modes");
     }
-    // Case B — whitespace before call: both → call (formatting whitespace never locks).
+    // Case B — whitespace before call: both → call (formatting whitespace never locks;
+    // the marker stays at visual column <= 3, so the Round-10 literal guard does not
+    // apply — a tab that lands the marker on column 4 is literal, §9.3).
     {
-        const std::string text = "\n  \t" + call;
+        const std::string text = "\n   " + call;
         for (const auto intent : both_intents) {
             const auto parsed = parse_intent(text, intent);
             failures += check(parsed.is_tool_call_response && parsed.tool_calls.size() == 1,
@@ -4934,6 +5413,17 @@ int main() {
     failures += test_r7_intent_retry_cross_matrix();
     failures += test_r7_hardened_intent_blocks_later_retry_base();
     failures += test_r8_parser_constraint_post_call_cross_check();
+    failures += test_r10_indented_wrapper_is_literal();
+    failures += test_r10_mixed_indentation_suppressed();
+    failures += test_r10_three_space_control_still_latches();
+    failures += test_r10_blank_indented_line_does_not_lock();
+    failures += test_r10_indented_example_then_real_call();
+    failures += test_r10_fenced_control_unaffected();
+    failures += test_r10_compat_indented_bare_function_suppressed();
+    failures += test_r10_native_bare_function_unchanged();
+    failures += test_r10_indented_payload_preserved();
+    failures += test_r10_every_byte_split();
+    failures += test_r10_multi_boundary_splits();
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }

@@ -6,6 +6,7 @@
 #include <string_view>
 #include <vector>
 
+#include "models/qwen3_5/frontend/tool_call_entry_scan.h"
 #include "models/qwen3_5/frontend/tool_call_grammar.h"
 #include "ninfer/types.h"
 
@@ -247,9 +248,12 @@ struct ToolCallStreamResult {
     // Round 4 (N-07): the global Stage-2 work budget was exhausted; fail closed (nothing from
     // Stage 2 is accepted; the region falls back to the Stage-1/Stage-3 result).
     bool parse_budget_exhausted = false;
-    // R3-06/R3-07: fence and completion diagnostics for the request/operational log.
+    // R3-06/R10: fence and completion diagnostics for the request/operational log.
     bool markup_tolerant_completion = false;
     std::uint32_t fenced_markers_suppressed = 0;
+    // R10-03: complete top-level markers suppressed because their '<' began on an indented
+    // literal line (visual column >= 4 outside a fence, pre-latch only).
+    std::uint32_t indented_markers_suppressed = 0;
     bool ended_in_unclosed_fence = false;
 };
 
@@ -318,78 +322,17 @@ public:
     [[nodiscard]] std::string_view latched_region() const noexcept { return region_; }
     // The bytes held back after the published content: the whitespace prefix plus the
     // pending marker candidate (both empty after a latch).
-    [[nodiscard]] std::string held_tail() const { return pending_ws_ + marker_prefix_; }
+    [[nodiscard]] std::string held_tail() const { return entry_.held_tail(); }
 
-    // R3-06: a line-oriented, streaming-safe fence tracker for the pre-latch content channel.
-    // It decides which bytes belong to a recognized fenced code block and therefore cannot
-    // start a top-level tool marker (fence bytes are ordinary content; a tool marker inside a
-    // fence never latches). Deterministic rules (a practical CommonMark subset, documented so
-    // the behavior is line-oriented, not full Markdown):
-    //   * a line starts at the stream start or after a LF and may carry up to 3 spaces of
-    //     indentation (an opener line; a closing run additionally up to opener_indent + 3);
-    //   * outside a fence, a run of >= 3 '`' or '~' at line start opens a fence with that
-    //     character; extra fence characters on the opener line extend the run length;
-    //   * inside a fence, a run of the same character, indented up to opener_indent + 3
-    //     spaces, of length >= the opener length, followed only by format whitespace up to
-    //     the line end (CR, spaces, tabs) closes the fence; a different character, a shorter
-    //     run, or a non-whitespace byte after a close run keeps the line as fence content
-    //     (no nested fences);
-    //   * a backtick info string containing a backtick cancels the opener (the line is
-    //     inline code); CRLF framing of the close line keeps the close valid;
-    //   * an unclosed fence stays open through EOF (suppression is the safe direction).
-    class FenceTracker {
-    public:
-        enum class Verdict : std::uint8_t {
-            Pass,    // the byte is not fence structure: the marker machine handles it
-            Content, // the byte is fence structure: publish as ordinary content, no candidate
-        };
-        [[nodiscard]] Verdict consume(char byte) noexcept;
-        // True while a fence is still open (the pre-latch stream ended in an unclosed fence).
-        [[nodiscard]] bool open() const noexcept { return in_fence_; }
-
-    private:
-        enum class Phase : std::uint8_t {
-            LineIndent, // line start: counting indentation before a run or body byte
-            LineRun,    // a fence-character run (opener candidate or close candidate)
-            OpenerTail, // the rest of an opener line (run extension or info string)
-            LineTail,   // format whitespace after a close run: the close is still valid
-            LineBody,   // the line is classified (fence content or ordinary text)
-        };
-        bool in_fence_ = false;
-        char fence_char_ = '\0';
-        std::size_t fence_len_ = 0;
-        std::size_t fence_indent_ = 0;
-        Phase phase_ = Phase::LineIndent;
-        char run_char_ = '\0';
-        std::size_t run_len_ = 0;
-        std::size_t indent_ = 0;
-        bool close_ok_ = false;
-        bool opener_line_ = false;
-    };
-
-    void publish(std::string_view bytes, std::string& visible);
-    void latch(std::string_view marker);
-    // R3-05: one marker-machine byte; true on latch. A NotMarker result publishes the failed
-    // candidate head (trailing format whitespace held, R3-07) and re-feeds the bytes from
-    // the next '<' through this same transition (the deterministic rescan; R3-14 counts the
-    // re-fed bytes). Recursion depth is bounded by the '<' count of one candidate, which is
-    // bounded by kMaxToolHeaderBytes.
-    [[nodiscard]] bool marker_byte(char byte, std::string& visible);
+    // R10 (R10-I1): the shared pre-trigger entry classifier (tool_call_entry_scan.h) owns
+    // the pre-latch fence/indentation/marker/intent state; the parser owns the latched
+    // region and the content stream.
+    [[nodiscard]] const ToolCallEntryScanner& entry() const noexcept { return entry_; }
 
     ToolCallParsePolicy policy_;
-    FenceTracker fence_;
-    // R3-14: deterministic pre-latch rescan counter (bytes re-fed after a NotMarker);
-    // copied to ToolCallStreamResult::rescan_steps at finish().
-    std::uint64_t rescan_steps_ = 0;
-
-    std::string content_;       // all bytes determined to be ordinary content
-    std::string pending_ws_;    // whitespace since the last published byte (held: may precede a marker)
-    std::string marker_prefix_; // held bytes that may become a top-level marker
-    bool latched_    = false;
-    // R6-05 intent gate: a visible content byte was committed before any latch; under
-    // RequireToolAtContentStart no later marker may latch. Set by publish() (the single
-    // pre-latch visible-content funnel); irrelevant once latched (region bytes bypass it).
-    bool entry_locked_ = false;
+    ToolCallEntryScanner entry_;
+    std::string content_; // all bytes determined to be ordinary content
+    bool latched_   = false;
     std::string region_;
     bool marker_seen_ = false;
 };

@@ -351,6 +351,36 @@ std::optional<OperationalRecord> render_tool_call_fallback(const RequestLogConte
         return OperationalRecord{.severity = OperationalSeverity::Warning,
                                  .message  = std::move(message)};
     }
+    // R10-03: a complete top-level marker that began on an indented literal line (visual
+    // column >= 4 outside a fence) was suppressed before latch. That is an intentional
+    // entry-classification decision, not a parser failure: the output remains ordinary
+    // assistant content. Record the suppression so markup-less text is diagnosable.
+    if (!outcome.tool_call_parse.marker_seen && outcome.tool_calls.empty() &&
+        outcome.tool_call_parse.indented_markers_suppressed > 0) {
+        std::string message = "req#" + std::to_string(context.id) +
+                              " tool-call marker suppressed in indented literal content | "
+                              "indented_markers_suppressed=" +
+                              std::to_string(outcome.tool_call_parse.indented_markers_suppressed);
+        const std::array<std::string_view, 4> kIndentedMarkerFamilies = {
+            "<tool_call>", "<function_calls>", "<function=", "<invoke "};
+        std::size_t marker = std::string::npos;
+        for (const std::string_view family : kIndentedMarkerFamilies) {
+            const std::size_t found = outcome.text.find(family);
+            if (found != std::string::npos && (marker == std::string::npos || found < marker)) {
+                marker = found;
+            }
+        }
+        if (marker != std::string::npos) {
+            const std::size_t limit = std::min(marker + 80, outcome.text.size());
+            std::string snippet = outcome.text.substr(marker, limit - marker);
+            for (char& byte : snippet) {
+                if (byte == '\n' || byte == '\r' || byte == '\t') { byte = ' '; }
+            }
+            message += " | " + snippet;
+        }
+        return OperationalRecord{.severity = OperationalSeverity::Warning,
+                                 .message  = std::move(message)};
+    }
     if (!outcome.tool_call_parse.marker_seen ||
         reason == ninfer::ToolCallParseFallbackReason::None) {
         return std::nullopt;

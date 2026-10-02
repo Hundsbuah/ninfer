@@ -1143,8 +1143,11 @@ unspecified. `enable_thinking` records whether the response starts in thinking m
 call count, empty non-string arguments omitted during normalization, schema-mismatched arguments
 preserved for consumer validation, repaired duplicate parameters, `markup_tolerant_completion` (a
 Stage-2 completion repaired broken markup), `fenced_markers_suppressed` (complete markers
-suppressed by a recognized code fence), `ended_in_unclosed_fence` (the stream ended inside an
-unclosed fence), `parse_budget_exhausted` (a Stage-2 work-budget exhaustion), and a stable fallback
+suppressed by a recognized code fence), `indented_markers_suppressed` (complete markers
+suppressed because they began on an indented literal line, visual column >= 4 outside a
+fence; the output is returned as ordinary content, not executed), `ended_in_unclosed_fence`
+(the stream ended inside an unclosed fence), `parse_budget_exhausted` (a Stage-2 work-budget
+exhaustion), and a stable fallback
 reason. A parameter named more than once in one call keeps its last value, as in JSON object syntax,
 and counts once in `duplicate_parameters_repaired` for each repeat instead of demoting the call to
 text. Fallback reasons are `none`, `malformed_structure`, `invalid_tool_name`, `undeclared_tool`,

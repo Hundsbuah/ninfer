@@ -852,207 +852,8 @@ ToolCallParseProgress parse_tool_call_region(std::string_view text, const ToolCa
     return parse_region(text, policy);
 }
 
-ToolCallStreamParser::ToolCallStreamParser(ToolCallParsePolicy policy) : policy_(policy) {}
-ToolCallStreamParser::FenceTracker::Verdict
-ToolCallStreamParser::FenceTracker::consume(char byte) noexcept {
-    if (byte == '\n') {
-        // R3-06: a close line is a run of the opener character of at least the opener length,
-        // followed only by format whitespace (CR, spaces, tabs) up to the line end — CRLF and
-        // LF-only framing both keep the close valid. The opener line never closes the fence.
-        if (in_fence_ && !opener_line_ && close_ok_ &&
-            (phase_ == Phase::LineRun || phase_ == Phase::LineTail) && run_len_ >= fence_len_) {
-            in_fence_  = false;
-            fence_len_ = 0;
-        }
-        opener_line_ = false;
-        close_ok_    = false;
-        run_len_     = 0;
-        indent_      = 0;
-        phase_       = Phase::LineIndent;
-        return in_fence_ ? Verdict::Content : Verdict::Pass;
-    }
-    if (!in_fence_) {
-        // Outside a fence: only a run of >= 3 '`' or '~' at line start (indent <= 3) is fence
-        // structure; everything else is left to the marker machine.
-        if (phase_ == Phase::LineIndent) {
-            if (byte == ' ') {
-                ++indent_;
-                if (indent_ > 3) { phase_ = Phase::LineBody; }
-                return Verdict::Pass;
-            }
-            if (byte == '`' || byte == '~') {
-                phase_    = Phase::LineRun;
-                run_char_ = byte;
-                run_len_  = 1;
-                return Verdict::Content;
-            }
-            phase_ = Phase::LineBody;
-            return Verdict::Pass;
-        }
-        if (phase_ == Phase::LineRun) {
-            if (byte == run_char_) {
-                ++run_len_;
-                if (run_len_ == 3) {
-                    // The run opens the fence at its third character; the rest of the line is
-                    // the info string, and further run characters extend the fence length.
-                    in_fence_     = true;
-                    fence_char_   = byte;
-                    fence_len_    = 3;
-                    fence_indent_ = indent_;
-                    opener_line_  = true;
-                }
-                return Verdict::Content;
-            }
-            phase_ = Phase::LineBody;
-            return Verdict::Pass;
-        }
-        return Verdict::Pass; // LineBody
-    }
-    // Inside a fence.
-    if (opener_line_) {
-        if (phase_ == Phase::LineRun) {
-            if (byte == fence_char_) { ++fence_len_; return Verdict::Content; }
-            // The run ended: the info string starts (the cancel rule only applies from the
-            // info string on, where a backtick means inline code, not a longer run).
-            phase_ = Phase::OpenerTail;
-            return Verdict::Content;
-        }
-        if (fence_char_ == '`' && byte == '`') {
-            // A backtick in a backtick opener's info string: the line is inline code, not a
-            // fence (CommonMark). Cancel the opener; the line is ordinary content from here.
-            in_fence_    = false;
-            fence_len_   = 0;
-            opener_line_ = false;
-            phase_       = Phase::LineBody;
-            return Verdict::Pass;
-        }
-        return Verdict::Content; // the info string
-    }
-    // Other lines inside a fence (always content; no nested fences).
-    if (phase_ == Phase::LineIndent) {
-        if (byte == ' ') {
-            ++indent_;
-            if (indent_ > fence_indent_ + 3) { phase_ = Phase::LineBody; }
-            return Verdict::Content;
-        }
-        if (byte == fence_char_) {
-            phase_    = Phase::LineRun;
-            run_char_ = byte;
-            run_len_  = 1;
-            close_ok_ = true;
-            return Verdict::Content;
-        }
-        phase_ = Phase::LineBody;
-        return Verdict::Content;
-    }
-    if (phase_ == Phase::LineRun) {
-        if (byte == run_char_) { ++run_len_; return Verdict::Content; }
-        if (is_tool_format_whitespace(byte)) { phase_ = Phase::LineTail; }
-        else { close_ok_ = false; phase_ = Phase::LineBody; }
-        return Verdict::Content;
-    }
-    if (phase_ == Phase::LineTail) {
-        if (!is_tool_format_whitespace(byte)) { close_ok_ = false; phase_ = Phase::LineBody; }
-        return Verdict::Content;
-    }
-    return Verdict::Content; // LineBody
-}
-
-void ToolCallStreamParser::publish(std::string_view bytes, std::string& visible) {
-    content_.append(bytes);
-    visible.append(bytes);
-    // R6-05 intent gate: once a visible (non-formatting-whitespace) content byte is
-    // committed before a latch, the turn locks to text under RequireToolAtContentStart.
-    // publish() is the single funnel for pre-latch visible content (ordinary marker-byte
-    // bytes, failed-candidate heads, and fence Content bytes), so this is the only lock
-    // point. Formatting whitespace (' ', '\t', '\r', '\n') never locks; form feed is not
-    // format whitespace here, so it locks like any other visible byte.
-    if (policy_.intent == ToolCallIntentPolicy::RequireToolAtContentStart && !latched_) {
-        for (const char byte : bytes) {
-            if (!is_tool_format_whitespace(byte)) {
-                entry_locked_ = true;
-                break;
-            }
-        }
-    }
-}
-
-void ToolCallStreamParser::latch(std::string_view marker) {
-    latched_    = true;
-    marker_seen_ = true;
-    // The whitespace held before the marker is kept at the start of the region: the accepted
-    // path rtrims it away from the content, the verbatim path keeps it, matching one-shot.
-    region_ = std::move(pending_ws_);
-    pending_ws_.clear();
-    region_.append(marker);
-    marker_prefix_.clear();
-}
-
-bool ToolCallStreamParser::marker_byte(char byte, std::string& visible) {
-    if (!marker_prefix_.empty()) {
-        marker_prefix_.push_back(byte);
-        ToolOpenTag marker = {};
-        const ToolMarkerStatus state = classify_tool_marker_prefix(marker_prefix_, marker,
-                                                                  policy_.syntax);
-        if (state == ToolMarkerStatus::Complete) {
-            if (policy_.intent == ToolCallIntentPolicy::RequireToolAtContentStart &&
-                entry_locked_) {
-                // R6-05: visible content was committed before this marker: the policy
-                // locks the turn to text. The complete marker is ordinary content and can
-                // never latch. A failed marker-like prefix cannot bypass the gate: the
-                // NotMarker path publishes the candidate head through the same funnel,
-                // which already locked the gate.
-                publish(pending_ws_, visible);
-                pending_ws_.clear();
-                publish(marker_prefix_, visible);
-                marker_prefix_.clear();
-                return false;
-            }
-            latch(marker_prefix_);
-            return true;
-        }
-        if (state == ToolMarkerStatus::NotMarker) {
-            // R3-05 (generalized F8): publish the failed candidate's head up to the next '<'
-            // (the head's trailing format whitespace stays held in pending_ws_, R3-07, so
-            // streaming output equals one-shot output), and re-feed the remaining bytes
-            // through this same transition. They already passed the fence tracker, so no
-            // fence re-scan is needed here.
-            std::string failed = std::move(marker_prefix_);
-            marker_prefix_.clear();
-            publish(pending_ws_, visible);
-            pending_ws_.clear();
-            const std::size_t next = failed_marker_candidate_rescan_start(failed);
-            const std::string_view head =
-                std::string_view(failed).substr(0, next == std::string_view::npos ? failed.size() : next);
-            std::size_t keep = head.size();
-            while (keep > 0 && is_tool_format_whitespace(head[keep - 1])) { --keep; }
-            publish(head.substr(0, keep), visible);
-            if (keep < head.size()) { pending_ws_.assign(head.substr(keep)); }
-            if (next != std::string_view::npos) {
-                const std::string_view rest = std::string_view(failed).substr(next);
-                rescan_steps_ += rest.size(); // R3-14: deterministic work counter
-                for (std::size_t j = 0; j < rest.size(); ++j) {
-                    if (marker_byte(rest[j], visible)) {
-                        region_.append(rest.substr(j + 1));
-                        return true;
-                    }
-                }
-            }
-        }
-        return false;
-    }
-    if (byte == '<') {
-        marker_prefix_.push_back(byte);
-    } else if (is_tool_format_whitespace(byte)) {
-        pending_ws_.push_back(byte);
-    } else {
-        publish(pending_ws_, visible);
-        pending_ws_.clear();
-        publish(std::string_view(&byte, 1), visible);
-    }
-    return false;
-}
-
+ToolCallStreamParser::ToolCallStreamParser(ToolCallParsePolicy policy)
+    : policy_(policy), entry_(policy.syntax, policy.intent) {}
 std::string ToolCallStreamParser::feed(std::string_view chunk) {
     std::string visible;
     if (chunk.empty()) { return visible; }
@@ -1060,73 +861,26 @@ std::string ToolCallStreamParser::feed(std::string_view chunk) {
         region_.append(chunk);
         return visible;
     }
-    for (std::size_t i = 0; i < chunk.size(); ++i) {
-        const char byte = chunk[i];
-        if (fence_.consume(byte) == FenceTracker::Verdict::Content) {
-            // N-08: a fence Content byte that is format whitespace is held instead of
-            // published, so the streamed output equals the one-shot entry (which rtrims the
-            // whitespace before an accepted region). The fence tracker's verdicts are
-            // unchanged; only the publication timing of whitespace changes.
-            if (is_tool_format_whitespace(byte)) {
-                if (!marker_prefix_.empty()) {
-                    publish(pending_ws_, visible);
-                    pending_ws_.clear();
-                    publish(marker_prefix_, visible);
-                    marker_prefix_.clear();
-                }
-                pending_ws_.push_back(byte); // held like any other whitespace: may precede a latch
-                continue;
-            }
-            // R2-I6 (CR6): a fence byte is ordinary content and cannot continue a top-level
-            // marker. Publish the held bytes as content.
-            publish(pending_ws_, visible);
-            pending_ws_.clear();
-            publish(marker_prefix_, visible);
-            marker_prefix_.clear();
-            publish(std::string_view(&byte, 1), visible);
-            continue;
-        }
-        if (marker_byte(byte, visible)) {
-            region_.append(chunk.substr(i + 1));
-            return visible;
-        }
+    // R10 (R10-I1): the pre-latch classification (fence suppression, indented-literal
+    // guard, marker candidate, failed-candidate rescan, intent gate) runs in the shared
+    // entry scanner — the same machine the grammar-constraint core consumes. The parser
+    // owns the published content and the latched region; Stage-1/2/3 are untouched
+    // (R10-I11: the region bytes are interpreted only by the region parser).
+    const ToolCallEntryScanner::FeedResult r = entry_.feed(chunk);
+    content_.append(r.visible);
+    if (r.triggered) {
+        latched_     = true;
+        marker_seen_ = true;
+        region_      = std::move(r.region_prefix);
+        region_.append(chunk.substr(r.consumed));
     }
-    return visible;
+    return r.visible;
 }
-namespace {
-
-// R3-06: the shadow marker scan: the same classify_tool_marker_prefix transition over fence
-// bytes, never latching — it counts the complete top-level markers a fence suppressed.
-struct ShadowMarkerScan {
-    std::string candidate;
-    std::uint32_t complete = 0;
-    explicit ShadowMarkerScan(ToolCallSyntaxMode syntax) : syntax_(syntax) {}
-    ToolCallSyntaxMode syntax_;
-    void consume(char byte) {
-        if (candidate.empty()) {
-            if (byte == '<') { candidate.push_back(byte); }
-            return;
-        }
-        candidate.push_back(byte);
-        ToolOpenTag marker = {};
-        const ToolMarkerStatus state = classify_tool_marker_prefix(candidate, marker, syntax_);
-        if (state == ToolMarkerStatus::Complete) {
-            ++complete;
-            candidate.clear();
-        } else if (state == ToolMarkerStatus::NotMarker) {
-            const std::size_t next = candidate.find('<', 1);
-            candidate = (next == std::string_view::npos) ? std::string{} : candidate.substr(next);
-        }
-    }
-};
-
-} // namespace
-
 std::vector<char> fence_mask(std::string_view region) {
     std::vector<char> mask(region.size(), 0);
-    ToolCallStreamParser::FenceTracker tracker;
+    ToolCallFenceTracker tracker;
     for (std::size_t i = 0; i < region.size(); ++i) {
-        if (tracker.consume(region[i]) == ToolCallStreamParser::FenceTracker::Verdict::Content) {
+        if (tracker.consume(region[i]) == ToolCallFenceTracker::Verdict::Content) {
             mask[i] = 1;
         }
     }
@@ -1138,15 +892,15 @@ FenceDiagnostics compute_fence_diagnostics(std::string_view pre_latch,
                                            ToolCallSyntaxMode syntax) {
     FenceDiagnostics diagnostics;
     auto scan = [&](std::string_view bytes) {
-        ToolCallStreamParser::FenceTracker tracker;
-        ShadowMarkerScan shadow(syntax);
+        ToolCallFenceTracker tracker;
+        ToolCallShadowMarkerScan shadow(syntax);
         for (const char byte : bytes) {
-            if (tracker.consume(byte) == ToolCallStreamParser::FenceTracker::Verdict::Content) {
+            if (tracker.consume(byte) == ToolCallFenceTracker::Verdict::Content) {
                 shadow.consume(byte);
             }
         }
         if (tracker.open()) { diagnostics.ended_in_unclosed_fence = true; }
-        diagnostics.suppressed_markers += shadow.complete;
+        diagnostics.suppressed_markers += shadow.complete();
     };
     scan(pre_latch);
     scan(region);
@@ -1155,18 +909,18 @@ FenceDiagnostics compute_fence_diagnostics(std::string_view pre_latch,
 ToolCallStreamResult ToolCallStreamParser::finish(FinishReason finish_reason) const {
     ToolCallStreamResult result;
     result.marker_seen  = marker_seen_;
-    result.rescan_steps = rescan_steps_;
-    // N-06: the pre-latch part is always computed. When a marker latched, the pre-latch
-    // stream ends outside a fence (a latch only happens outside a fence), so its
-    // unclosed-fence flag is false and its suppressed-marker count is unaffected. The region
+    result.rescan_steps = entry_.rescan_steps();
+    // N-06/R10: the pre-latch part comes from the shared entry scanner — the same pre-latch
+    // bytes, deterministic over the byte stream; its shadow counters are fed by the same
+    // fence verdicts the old separate scan recomputed at finish. When a marker latched, the
+    // pre-latch stream ends outside a fence (a latch only happens outside a fence), so its
+    // unclosed-fence flag is false and its suppression counts are unaffected. The region
     // part is added only on the paths that return the region as text (Stage-2 ambiguity and
     // the final reject), so accepting paths no longer scan the accepted call's values.
-    const std::string pre_latch = content_ + pending_ws_ + marker_prefix_;
-    FenceDiagnostics fence_diag = compute_fence_diagnostics(pre_latch, std::string_view{},
-                                                            policy_.syntax);
-    if (latched_) { fence_diag.ended_in_unclosed_fence = false; }
-    result.fenced_markers_suppressed = fence_diag.suppressed_markers;
-    result.ended_in_unclosed_fence   = fence_diag.ended_in_unclosed_fence;
+    result.fenced_markers_suppressed   = entry_.fenced_markers_suppressed();
+    result.indented_markers_suppressed = entry_.indented_markers_suppressed();
+    result.ended_in_unclosed_fence     = entry_.ended_in_unclosed_fence();
+    if (latched_) { result.ended_in_unclosed_fence = false; }
     auto add_region_fence_part = [&result, this]() {
         const FenceDiagnostics region_diag =
             compute_fence_diagnostics(std::string_view{}, region_, policy_.syntax);
@@ -1179,7 +933,7 @@ ToolCallStreamResult ToolCallStreamParser::finish(FinishReason finish_reason) co
         // default diagnostics; the fence fields stay visible).
         result.status  = ToolCallStreamStatus::Invalid;
         result.failure = ToolCallParseFailure::MalformedStructure;
-        result.tail    = std::move(pre_latch);
+        result.tail    = content_ + entry_.held_tail();
         return result;
     }
     // R3-06: the retry search skips markers inside a recognized fence (the fence state is

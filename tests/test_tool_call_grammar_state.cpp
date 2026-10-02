@@ -957,6 +957,132 @@ void test_r9_constraint_termination_predicate() {
     }
 }
 
+
+// R10-02 (Round 10 §10): cross-equivalence. The production pre-latch parser and the
+// grammar-constraint pre-trigger scan share the entry classifier (R10-I1); the latch /
+// InRegion-entry decision must agree on the same byte index for every corpus line and
+// every syntax/intent quadrant.
+void test_r10_constraint_parser_entry_cross_equivalence() {
+    using Mode = ninfer::ToolCallSyntaxMode;
+    using Intent = ninfer::ToolCallIntentPolicy;
+    const std::string call =
+        "<tool_call>\n<function=bash>\n<parameter=command>\necho hi\n</parameter>\n</function>\n</tool_call>";
+    const std::string bare =
+        "<function=bash>\n<parameter=command>\necho hi\n</parameter>\n</function>";
+    const auto indent_lines = [](const std::string& text, const std::string& prefix) {
+        std::string out;
+        std::size_t start = 0;
+        while (true) {
+            const std::size_t end = text.find('\n', start);
+            const std::size_t len = (end == std::string::npos) ? text.size() - start : end - start;
+            if (len > 0) { out += prefix; out.append(text, start, len); }
+            if (end == std::string::npos) { break; }
+            out += '\n';
+            start = end + 1;
+        }
+        return out;
+    };
+    // A genuine call; B/C indented but still eligible (columns 1 and 3); D/E indented
+    // literal (column >= 4); F/G fenced (closed/unclosed); H prose + call; I a failed
+    // marker candidate + call; J a whitespace-only indented line + call; K a partial
+    // marker; L the compatibility bare entry; M the same bare entry indented.
+    const std::vector<std::string> corpus = {
+        call,
+        " " + call,
+        "   " + call,
+        indent_lines(call, "    "),
+        indent_lines(call, "\t"),
+        "```xml\n" + call + "\n```",
+        "```xml\n" + call,
+        "prose " + call,
+        "abc <foo bar> " + call,
+        "    \n" + call,
+        "<tool_",
+        bare,
+        indent_lines(bare, "    "),
+    };
+    const auto parser_latch = [](const std::string& text, Mode syntax, Intent intent) {
+        ninfer::models::qwen3_5::frontend::ToolCallParsePolicy policy;
+        policy.max_name_length = 64;
+        policy.syntax          = syntax;
+        policy.intent          = intent;
+        ninfer::models::qwen3_5::frontend::ToolCallStreamParser machine(policy);
+        int latch = -1;
+        for (std::size_t i = 0; i < text.size(); ++i) {
+            machine.feed(text.substr(i, 1));
+            if (latch < 0 && machine.latched()) { latch = static_cast<int>(i); }
+        }
+        return latch;
+    };
+    const auto constraint_latch = [](const std::string& text, Mode syntax, Intent intent) {
+        ToolCallGrammarConstraint constraint(64, syntax, intent);
+        int latch = -1;
+        for (std::size_t i = 0; i < text.size(); ++i) {
+            const std::string_view byte = text.substr(i, 1);
+            const ToolCallConstraintVerdict verdict = constraint.check(byte);
+            if (verdict != ToolCallConstraintVerdict::Rejected) { constraint.commit(byte); }
+            if (latch < 0 && constraint.active()) { latch = static_cast<int>(i); }
+        }
+        return latch;
+    };
+    for (const Mode syntax : {Mode::QwenWrappedNative, Mode::Compatibility}) {
+        for (const Intent intent :
+             {Intent::TemplateCompatible, Intent::RequireToolAtContentStart}) {
+            for (const std::string& text : corpus) {
+                check(parser_latch(text, syntax, intent) == constraint_latch(text, syntax, intent),
+                      "r10 cross: parser and constraint entry bytes diverged");
+            }
+        }
+    }
+    // Absolute pins: the genuine call latches in every quadrant; the 4-space-indented
+    // copy never latches in any quadrant (both consumers agree on "no entry").
+    for (const Mode syntax : {Mode::QwenWrappedNative, Mode::Compatibility}) {
+        for (const Intent intent :
+             {Intent::TemplateCompatible, Intent::RequireToolAtContentStart}) {
+            check(parser_latch(call, syntax, intent) != -1,
+                  "r10 cross: the genuine call never latched");
+            check(constraint_latch(call, syntax, intent) != -1,
+                  "r10 cross: the genuine call never triggered the constraint");
+            check(parser_latch(indent_lines(call, "    "), syntax, intent) == -1 &&
+                      constraint_latch(indent_lines(call, "    "), syntax, intent) == -1,
+                  "r10 cross: the indented copy latched");
+        }
+    }
+}
+
+// R10-01 at the constraint level: an indented complete wrapper is inert (never activates),
+// and under RequireToolAtContentStart its visible bytes lock the gate so a later column-0
+// call stays text; under TemplateCompatible the later call still triggers.
+void test_r10_indented_entry_suppression() {
+    using Mode = ninfer::ToolCallSyntaxMode;
+    using Intent = ninfer::ToolCallIntentPolicy;
+    const std::string indented_wrapper = "    <tool_call>";
+    const std::string call =
+        "<tool_call>\n<function=bash>\n<parameter=command>\necho hi\n</parameter>\n</function>\n</tool_call>";
+    for (const Mode syntax : {Mode::QwenWrappedNative, Mode::Compatibility}) {
+        {
+            ToolCallGrammarConstraint constraint(64, syntax, Intent::TemplateCompatible);
+            constraint.commit(std::string(indented_wrapper));
+            check(!constraint.active(), "r10 tc: the indented wrapper never activates");
+            constraint.commit("\n");
+            constraint.commit("<tool_call>");
+            check(constraint.active(),
+                  "r10 tc: the genuine call after an indented wrapper activates");
+        }
+        {
+            ToolCallGrammarConstraint constraint(64, syntax, Intent::RequireToolAtContentStart);
+            constraint.commit(std::string(indented_wrapper));
+            check(!constraint.active(), "r10 soc: the indented wrapper never activates");
+            check(constraint.can_terminate(),
+                  "r10 soc: the locked preamble has no open structure and may terminate");
+            constraint.commit("\n");
+            constraint.commit("<tool_call>");
+            check(!constraint.active(),
+                  "r10 soc: the locked gate keeps the later column-0 call text");
+        }
+    }
+}
+
 } // namespace
 
 int main() {
@@ -988,6 +1114,8 @@ int main() {
     test_r8_post_call_chunk_checkpoint_matrix();
     test_r9_constraint_post_call_suffix();
     test_r9_constraint_termination_predicate();
+    test_r10_constraint_parser_entry_cross_equivalence();
+    test_r10_indented_entry_suppression();
     if (failures == 0) { std::puts("tool_call_grammar_state tests: all passed"); }
     return failures == 0 ? 0 : 1;
 }

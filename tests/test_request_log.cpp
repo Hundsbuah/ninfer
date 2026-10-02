@@ -541,6 +541,7 @@ int main() {
         .duplicate_parameters_repaired = 4,
         .markup_tolerant_completion    = true,
         .fenced_markers_suppressed     = 5,
+        .indented_markers_suppressed   = 6,
         .ended_in_unclosed_fence       = true,
         .parse_budget_exhausted        = true,
         .fallback_reason               = ninfer::ToolCallParseFallbackReason::TrailingContent,
@@ -556,6 +557,7 @@ int main() {
                           norm_parse.at("duplicate_parameters_repaired") == 4 &&
                           norm_parse.at("markup_tolerant_completion") == true &&
                           norm_parse.at("fenced_markers_suppressed") == 5 &&
+                          norm_parse.at("indented_markers_suppressed") == 6 &&
                           norm_parse.at("ended_in_unclosed_fence") == true &&
                           norm_parse.at("parse_budget_exhausted") == true &&
                           norm_parse.at("fallback_reason") == "trailing_content",
@@ -640,6 +642,40 @@ int main() {
                           "req#7 tool markup returned as text | trailing content | "
                           "fenced_markers_suppressed=2 | parse budget exhausted",
                       "R5-04: the budget part follows the fence part");
+
+    // R10-03: no marker seen, no calls, a marker suppressed on an indented literal line:
+    // the separate indented-suppression warning (not a parser failure).
+    GenerationOutcome indented_outcome = outcome;
+    indented_outcome.tool_call_parse = {
+        .marker_seen               = false,
+        .structured_call_count     = 0,
+        .indented_markers_suppressed = 1,
+        .fallback_reason           = ninfer::ToolCallParseFallbackReason::None,
+    };
+    indented_outcome.text = "prefix prose\n    <tool_call>\n    <function=bash>\n"
+                            "    </function>\n    </tool_call>";
+    const std::optional<OperationalRecord> indented_rec =
+        render_tool_call_fallback(context, indented_outcome);
+    failures += check(indented_rec &&
+                          indented_rec->severity == OperationalSeverity::Warning &&
+                          indented_rec->message ==
+                              "req#7 tool-call marker suppressed in indented literal content | "
+                              "indented_markers_suppressed=1 | <tool_call>     "
+                              "<function=bash>     </function>     </tool_call>" &&
+                          indented_rec->message.find("prefix prose") == std::string::npos,
+                      "R10-03: the indented-suppression warning is absent or leaks prior text");
+    // A marker that actually latched (marker_seen, a real fallback reason) emits the
+    // markup-fallback warning instead, whatever the indented counter says.
+    indented_outcome.tool_call_parse.marker_seen = true;
+    indented_outcome.tool_call_parse.fallback_reason =
+        ninfer::ToolCallParseFallbackReason::MalformedStructure;
+    const std::optional<OperationalRecord> no_indented_rec =
+        render_tool_call_fallback(context, indented_outcome);
+    failures += check(
+        !no_indented_rec || no_indented_rec->message.find(
+                                "tool-call marker suppressed in indented literal content") ==
+                               std::string::npos,
+        "R10-03: the indented warning fired for a latched marker");
     // The snippet starts at the first marker of any Qwen marker family, not only <tool_call>.
     GenerationOutcome family_outcome = outcome;
     family_outcome.tool_call_parse = {

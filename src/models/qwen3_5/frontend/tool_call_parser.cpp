@@ -492,6 +492,7 @@ ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text,
         // false) — the fence fields stay visible for the operational log.
         ToolCallParseDiagnostics diagnostics;
         diagnostics.fenced_markers_suppressed = result.fenced_markers_suppressed;
+        diagnostics.indented_markers_suppressed = result.indented_markers_suppressed;
         diagnostics.ended_in_unclosed_fence   = result.ended_in_unclosed_fence;
         return fallback(text, diagnostics);
     }
@@ -503,6 +504,7 @@ ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text,
         diagnostics.marker_seen     = true;
         diagnostics.fallback_reason = failure;
         diagnostics.fenced_markers_suppressed = result.fenced_markers_suppressed;
+        diagnostics.indented_markers_suppressed = result.indented_markers_suppressed;
         diagnostics.ended_in_unclosed_fence   = result.ended_in_unclosed_fence;
         diagnostics.parse_budget_exhausted      = result.parse_budget_exhausted;
         return fallback(text, diagnostics);
@@ -571,6 +573,7 @@ ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text,
         diagnostics.marker_seen     = true;
         diagnostics.fallback_reason = FallbackReason::AmbiguousStructure;
         diagnostics.fenced_markers_suppressed = result.fenced_markers_suppressed; // N-06 item 3
+        diagnostics.indented_markers_suppressed = result.indented_markers_suppressed; // R10-03
         diagnostics.ended_in_unclosed_fence   = result.ended_in_unclosed_fence;     // N-06 item 3
         diagnostics.parse_budget_exhausted = result.parse_budget_exhausted;
         return fallback(text, diagnostics);
@@ -582,6 +585,7 @@ ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text,
     out.diagnostics.fallback_reason = failure;
     out.diagnostics.markup_tolerant_completion = result.markup_tolerant_completion;
     out.diagnostics.fenced_markers_suppressed  = result.fenced_markers_suppressed;
+    out.diagnostics.indented_markers_suppressed = result.indented_markers_suppressed;
     out.diagnostics.ended_in_unclosed_fence    = result.ended_in_unclosed_fence;
     out.diagnostics.parse_budget_exhausted   = result.parse_budget_exhausted;
 
@@ -632,16 +636,17 @@ ToolCallOutputDecoder::Terminal ToolCallOutputDecoder::finish(FinishReason finis
     ParsedToolCallOutput parsed = parse_qwen_tool_call_output(region, max_tool_name_length_,
                                                               *contract_, tolerant_, finish_reason,
                                                               syntax_, ambiguity_, intent_);
-    // R3-06: the entry re-parse sees only the region; the pre-latch fence diagnostic comes
-    // from this machine (the same pre-latch bytes, deterministic over the byte stream).
-    // N-06: apply the same latch rule as the one-shot entry — a latch only happens outside a
-    // fence, so the pre-latch stream cannot end inside one; force its unclosed-fence flag to
-    // false when latched so streaming stays equal to one-shot.
-    FenceDiagnostics pre_fence = compute_fence_diagnostics(
-        machine_.content_prefix() + machine_.held_tail(), std::string_view{}, syntax_);
-    if (machine_.latched()) { pre_fence.ended_in_unclosed_fence = false; }
-    parsed.diagnostics.fenced_markers_suppressed += pre_fence.suppressed_markers;
-    parsed.diagnostics.ended_in_unclosed_fence   |= pre_fence.ended_in_unclosed_fence;
+    // R3-06/R10: the entry re-parse sees only the region; the pre-latch diagnostics come
+    // from the live entry scanner (the same pre-latch bytes, deterministic over the byte
+    // stream). N-06: apply the same latch rule as the one-shot entry — a latch only happens
+    // outside a fence, so the unclosed-fence flag is not ORed in when latched, keeping
+    // streaming equal to one-shot.
+    const ToolCallEntryScanner& entry = machine_.entry();
+    parsed.diagnostics.fenced_markers_suppressed   += entry.fenced_markers_suppressed();
+    parsed.diagnostics.indented_markers_suppressed += entry.indented_markers_suppressed();
+    if (!machine_.latched()) {
+        parsed.diagnostics.ended_in_unclosed_fence |= entry.ended_in_unclosed_fence();
+    }
     if (machine_.latched() && parsed.is_tool_call_response) {
         // The parser reports the held bytes before the accepted structured region, which are
         // the bytes after an earlier quoted marker that this decoder has not published yet.
