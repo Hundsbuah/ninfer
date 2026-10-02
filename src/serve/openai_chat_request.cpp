@@ -693,8 +693,14 @@ void parse_tools(const Json& body, GenerationRequest& output) {
             if (!function.at("strict").is_boolean()) {
                 bad_request("function strict must be a boolean", prefix + ".function.strict");
             }
-            // strict:true is accepted as advisory. NInfer cannot constrain decoding to the declared
-            // schema, so the flag does not change generation (docs/serving.md).
+            // R9-02: strict:true is a schema-adherence guarantee that requires constrained
+            // decoding; the Engine does not provide it, so the guarantee cannot be honored
+            // (mirrors the Responses philosophy; do not substitute post-validation).
+            if (function.at("strict").get<bool>()) {
+                bad_request("strict function schema enforcement requires constrained decoding, "
+                            "which the Engine does not provide",
+                            prefix + ".function.strict", "strict_tools_not_supported");
+            }
         }
         output.tools.push_back(std::move(tool));
     }

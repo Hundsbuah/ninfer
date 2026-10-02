@@ -203,8 +203,6 @@ The endpoint supports:
 - `tool_choice` `auto` and `none`, plus `allowed_tools` selections with mode `auto` (function-only
   or custom, nested or direct), which narrow the effective tool set as an explicit subset filter;
 - `parallel_tool_calls:true`;
-- `strict:true` as an advisory flag: the Engine does not enforce JSON Schema through
-  constrained decoding;
 - assistant tool-call history, tool-result messages, and legacy function-call history;
 - the top-level `reasoning_effort` field, where the `default` and `auto` aliases resolve to the
   server-configured level;
@@ -236,6 +234,11 @@ weakened to automatic selection, consistent with the Responses adapter:
 | `parallel_tool_calls:true` | supported |
 | `parallel_tool_calls:false` + callable tools | rejected (`parallel_tool_calls_not_supported`) |
 | `parallel_tool_calls:false` + no effective tools | accepted neutral |
+
+Round 9 (R9-02) extends the same contract to strict schema guarantees: `tools[i].function.strict`
+`true` is rejected (`strict_tools_not_supported`) — the flag is a schema-adherence guarantee that
+requires constrained decoding, which the Engine does not provide. Omitted or `false` remains
+accepted, and non-boolean values keep the field-type error.
 
 This is an intentional correctness change: clients that relied on the silent downgrade of
 `required`, named choices, `allowed_tools` mode `required`, or `parallel_tool_calls:false` to

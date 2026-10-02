@@ -373,13 +373,25 @@ int test_tools() {
         api_error([&] { (void)parse(body); }).param == "tool_choice.allowed_tools.tools[0].name",
         "allowed_tools rejects names absent from the declared tool set");
 
+    // R9-02: strict:true is a schema-adherence guarantee that requires constrained
+    // decoding; the Engine does not provide it, so the request is rejected before it
+    // reaches PromptInput. Omitted/false remain accepted.
     body          = base_request();
     body["tools"] = Json::array({function_tool("weather", true)});
-    const OpenAIChatRequest strict_tools = parse(body);
-    failures += check(strict_tools.generation.tools.size() == 1 &&
-                          prompt(strict_tools.generation).options.tool_jsons[0].find(
-                              "\"strict\":false") != std::string::npos,
-                      "strict tools are accepted as advisory without reaching the prompt");
+    const ApiError strict_true_error = api_error([&] { (void)parse(body); });
+    failures += check(strict_true_error.param == "tools[0].function.strict" &&
+                          strict_true_error.code == "strict_tools_not_supported",
+                      "R9-02: strict true is rejected as an unguaranteeable guarantee");
+    body["tools"] = Json::array({function_tool("weather", false)});
+    const OpenAIChatRequest strict_false_tools = parse(body);
+    failures += check(strict_false_tools.generation.tools.size() == 1,
+                      "R9-02: strict false remains accepted");
+    Json omitted = function_tool("weather");
+    omitted["function"].erase("strict");
+    body["tools"] = Json::array({omitted});
+    const OpenAIChatRequest strict_omitted_tools = parse(body);
+    failures += check(strict_omitted_tools.generation.tools.size() == 1,
+                      "R9-02: omitted strict remains accepted");
     body["tools"] = Json::array({Json{{"type", "custom"},
                                       {"custom",
                                        Json{{"name", "shell"},
