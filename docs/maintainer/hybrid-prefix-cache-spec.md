@@ -16,7 +16,8 @@ were tried and reverted.
 
 Scope: an alternative to NInfer's prefix-reuse, checkpoint-retention and cache-pressure
 system for `Qwen3_5ForCausalLM` / `Qwen3_5MoeForCausalLM` on one RTX 5090 (`sm_120a`), with
-`max_concurrency` 1..8, every KV profile (BF16, INT8-G64, FP8-E4M3FN-row256, NVFP4-G16, K8V4),
+`max_concurrency` 1..8, every KV profile (BF16, INT8-G64, FP8-E4M3FN-row256, NVFP4-G16, K8V4, K4V2,
+VQ2),
 and every speculative backend (none, MTP, DFlash, DFlash2).
 
 Coexistence rules:
@@ -169,9 +170,14 @@ Per token, all full-attention layers, K+V including scales (from paged-kv §4.3)
 | FP8-row256 | 516 B | 32.3 KiB | 2.02 MiB | 10.1 KiB | 0.63 MiB |
 | K8V4 | 402 B | 25.1 KiB | 1.57 MiB | 7.9 KiB | 0.49 MiB |
 | NVFP4-G16 | 288 B | 18.0 KiB | 1.13 MiB | 5.6 KiB | 0.35 MiB |
+| K4V2 | 196 B | 12.3 KiB | 0.77 MiB | 3.8 KiB | 0.24 MiB |
+| VQ2 | 132 B | 8.3 KiB | 0.52 MiB | 2.6 KiB | 0.16 MiB |
 
 MTP adds one layer's worth of pages to the bundle (+1/16 for 27B). A DFlash draft with
-full-attention layers adds its own BF16 pool.
+full-attention layers adds its own BF16 pool. K4V2 and VQ2 also keep an exact recent-key window
+in every StateImage (paged-kv §9.3): 1088 × KV heads × 536 B per attention layer, about 39.7 MB
+for 27B with MTP (17 layers × 4 heads), so their checkpoint images are that much larger than the
+other profiles'.
 
 ### 3.2 State image
 

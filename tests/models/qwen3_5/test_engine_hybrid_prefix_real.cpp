@@ -1,6 +1,7 @@
 // Real-artifact scenarios for the hybrid prefix cache (docs/maintainer/hybrid-prefix-cache-spec.md
 // §13.3). Requires NINFER_TEST_ARTIFACT; NINFER_HYBRID_REAL_SCENARIO selects one scenario.
 
+#include "kv_cache_storage.h"
 #include "ninfer/engine.h"
 
 #include <algorithm>
@@ -14,6 +15,7 @@
 #include <filesystem>
 #include <iostream>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -30,23 +32,6 @@ constexpr std::uint32_t kBlock = 64;
 // NINFER_HYBRID_KV_DTYPE selects the KV storage every scenario runs with (default bf16), so the
 // Host tier's page records and restores are exercised for each profile.
 ninfer::KvCacheStorage kv_storage = ninfer::KvCacheStorage::BFloat16;
-
-bool select_kv_storage(std::string_view name) {
-    if (name == "bf16") {
-        kv_storage = ninfer::KvCacheStorage::BFloat16;
-    } else if (name == "int8") {
-        kv_storage = ninfer::KvCacheStorage::Int8Group64;
-    } else if (name == "fp8") {
-        kv_storage = ninfer::KvCacheStorage::Fp8E4M3Row256;
-    } else if (name == "nvfp4") {
-        kv_storage = ninfer::KvCacheStorage::Nvfp4Group16;
-    } else if (name == "k8v4") {
-        kv_storage = ninfer::KvCacheStorage::Fp8KeyNvfp4Value;
-    } else {
-        return false;
-    }
-    return true;
-}
 
 // Deterministic ordinary-vocabulary tokens; the content only has to be reproducible.
 std::vector<ninfer::TokenId> synthetic_tokens(std::size_t count, std::uint32_t seed) {
@@ -776,9 +761,13 @@ int main() {
         return 77;
     }
     if (const char* storage = std::getenv("NINFER_HYBRID_KV_DTYPE");
-        storage != nullptr && *storage != '\0' && !select_kv_storage(storage)) {
-        std::cerr << "unknown NINFER_HYBRID_KV_DTYPE " << storage << '\n';
-        return 1;
+        storage != nullptr && *storage != '\0') {
+        try {
+            kv_storage = ninfer::test::parse_kv_cache_storage(storage);
+        } catch (const std::invalid_argument&) {
+            std::cerr << "unknown NINFER_HYBRID_KV_DTYPE " << storage << '\n';
+            return 1;
+        }
     }
     const char* selected            = std::getenv("NINFER_HYBRID_REAL_SCENARIO");
     const std::string_view scenario = selected != nullptr && *selected != '\0' ? selected : "all";

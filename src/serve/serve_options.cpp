@@ -54,6 +54,8 @@ KvCacheStorage parse_kv_dtype(const char* text) {
     if (value == "fp8") { return KvCacheStorage::Fp8E4M3Row256; }
     if (value == "nvfp4") { return KvCacheStorage::Nvfp4Group16; }
     if (value == "k8v4") { return KvCacheStorage::Fp8KeyNvfp4Value; }
+    if (value == "vq2") { return KvCacheStorage::Vq2; }
+    if (value == "k4v2") { return KvCacheStorage::Q4KeyVq2Value; }
     throw std::invalid_argument("invalid kv-dtype: " + value);
 }
 
@@ -141,7 +143,7 @@ std::string serve_usage_text(const char* argv0) {
            "                             (default " +
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
            ")\n"
-           "  --kv-dtype T               KV storage: bf16 (default) | int8 | fp8 | nvfp4 | k8v4\n"
+           "  --kv-dtype T               KV storage: bf16 (default) | int8 | fp8 | nvfp4 | k8v4 | vq2 | k4v2\n"
            "  --no-prefix-reuse          disable prefix caching in either system below\n"
            "                             (enabled by default); cannot be combined with any\n"
            "                             prefix-cache option\n"

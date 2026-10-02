@@ -104,8 +104,9 @@ set_tests_properties(
   ninfer_qwen3_5_dflash2_real_test
   PROPERTIES SKIP_RETURN_CODE 77)
 
-# DFlash2 tree verification at K=7 over every batch-size route, on the INT8, K8V4 and NVFP4 caches.
-foreach(kv IN ITEMS int8 k8v4 nvfp4)
+# DFlash2 tree verification at K=7 over every batch-size route, on the INT8, K8V4, NVFP4, VQ2 and
+# K4V2 caches.
+foreach(kv IN ITEMS int8 k8v4 nvfp4 vq2 k4v2)
   add_test(NAME ninfer_qwen3_5_dflash2_tree_${kv}_real_test
     COMMAND ninfer_qwen3_5_dflash2_real_test 7 1 1 4 ${kv} 0 3 16,12,12,10)
   set_tests_properties(ninfer_qwen3_5_dflash2_tree_${kv}_real_test PROPERTIES SKIP_RETURN_CODE 77)
@@ -123,7 +124,7 @@ set_tests_properties(
   ninfer_qwen3_5_dflash2_tree_greedy_real_test
   PROPERTIES SKIP_RETURN_CODE 77)
 
-foreach(kv IN ITEMS k8v4 nvfp4)
+foreach(kv IN ITEMS k8v4 nvfp4 vq2 k4v2)
   add_test(NAME ninfer_qwen3_5_dflash2_tree_greedy_${kv}_real_test
     COMMAND ninfer_qwen3_5_dflash2_tree_greedy_real_test ${kv})
   set_tests_properties(ninfer_qwen3_5_dflash2_tree_greedy_${kv}_real_test
