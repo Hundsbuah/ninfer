@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <iterator>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -320,9 +321,19 @@ ChatTurn parse_assistant_blocks(const Json& content) {
             }
             const std::string thinking =
                 require_string(block, "thinking", "messages", "thinking block");
-            // NInfer has no encrypted reasoning state to restore. The wire signature is therefore
-            // intentionally outside the lowered request; only visible Thinking reaches the model.
-            assistant.reasoning_content += thinking;
+            // Visible Thinking text is the prompt. A block returned under display:"omitted" has
+            // empty text and carries its reasoning in an NInfer signature; any other signature is
+            // transport metadata and stays outside the lowered request.
+            std::optional<std::string> hidden;
+            if (thinking.empty() && block.contains("signature") &&
+                block.at("signature").is_string()) {
+                try {
+                    hidden = decode_thinking_signature(block.at("signature").get<std::string>());
+                } catch (const std::invalid_argument& error) {
+                    bad_request(error.what(), "messages", "invalid_thinking_signature");
+                }
+            }
+            assistant.reasoning_content += hidden ? *hidden : thinking;
         } else if (type == "redacted_thinking") {
             if (cache_boundary(block, "messages")) {
                 bad_request("cache_control is not valid on redacted_thinking blocks", "messages",
@@ -648,7 +659,6 @@ enum class ToolSelectionKind {
 struct ToolSelection {
     ToolSelectionKind kind = ToolSelectionKind::Auto;
     std::string name;
-    bool disable_parallel_tool_use = false;
 };
 
 ToolSelection parse_tool_choice(const Json& body) {
@@ -671,8 +681,7 @@ ToolSelection parse_tool_choice(const Json& body) {
     } else {
         bad_request("unsupported tool_choice type: " + type, "tool_choice");
     }
-    result.disable_parallel_tool_use =
-        optional_bool(choice, "disable_parallel_tool_use", false);
+    (void)optional_bool(choice, "disable_parallel_tool_use", false);
     return result;
 }
 
@@ -687,7 +696,6 @@ struct ParsedTool {
     ToolSource source = ToolSource::UserDefined;
     std::string source_type;
     bool defer_loading = false;
-    bool strict = false;
     std::optional<std::vector<std::string>> allowed_callers;
 };
 
@@ -745,7 +753,6 @@ std::vector<ParsedTool> parse_tool_definitions(const Json& body) {
             if (!item.at("strict").is_boolean()) {
                 bad_request("tool strict must be a boolean", "tools");
             }
-            parsed.strict = item.at("strict").get<bool>();
         }
         if (item.contains("defer_loading") && !item.at("defer_loading").is_null()) {
             if (!item.at("defer_loading").is_boolean()) {
@@ -781,32 +788,15 @@ void lower_tools(const Json& body, GenerationRequest& request) {
         return tool.definition.name == selection.name;
     };
 
-    // R9-04: forced choices and single-call guarantees are guarantees NInfer cannot
-    // provide. A named choice validates the declared name first (unknown names keep the
-    // existing unknown-tool error), then a known name or any is rejected; prompting or
-    // post-generation filtering would fake the guarantee (Round 9 §6.2/§6.3/§6.4/§6.6/§6.7).
+    // Forced choices are advisory, as on the OpenAI endpoints: the Engine cannot force a call, so a
+    // named choice is checked against the declared tools and automatic selection proceeds. Qwen
+    // Code, for one, sends tool_choice any for every JSON side query (docs/serving.md).
     if (selection.kind == ToolSelectionKind::Named &&
         std::none_of(definitions.begin(), definitions.end(), named)) {
         bad_request("tool_choice references unknown tool: " + selection.name, "tool_choice");
     }
     if (selection.kind == ToolSelectionKind::Any && definitions.empty()) {
         bad_request("tool_choice requires tools", "tool_choice");
-    }
-    if (selection.kind == ToolSelectionKind::Any || selection.kind == ToolSelectionKind::Named) {
-        bad_request(
-            selection.kind == ToolSelectionKind::Any
-                ? "tool_choice 'any' forces a tool call, which NInfer cannot guarantee"
-                : "tool_choice 'tool' forces an exact tool call, which NInfer cannot guarantee",
-            "tool_choice", "tool_choice_not_supported");
-    }
-    const bool callable =
-        std::any_of(definitions.begin(), definitions.end(),
-                    [](const ParsedTool& tool) { return tool.source == ToolSource::UserDefined; });
-    if (selection.disable_parallel_tool_use && selection.kind != ToolSelectionKind::None &&
-        callable) {
-        bad_request("disable_parallel_tool_use limits tool execution to a single call, which "
-                    "NInfer cannot guarantee",
-                    "tool_choice.disable_parallel_tool_use", "parallel_tool_calls_not_supported");
     }
 
     request.tool_choice.mode =
@@ -820,8 +810,7 @@ void lower_tools(const Json& body, GenerationRequest& request) {
         return;
     }
 
-    for (std::size_t index = 0; index < definitions.size(); ++index) {
-        ParsedTool& tool = definitions[index];
+    for (ParsedTool& tool : definitions) {
         if (tool.source == ToolSource::Toolset) {
             bad_request("Anthropic toolsets require a tool loader that NInfer does not provide",
                         "tools", "toolsets_not_supported");
@@ -832,14 +821,7 @@ void lower_tools(const Json& body, GenerationRequest& request) {
                             "NInfer does not provide",
                         "tools", "anthropic_tools_not_supported");
         }
-        if (tool.strict) {
-            // R9-04: strict=true is a schema-adherence guarantee that requires constrained
-            // decoding; it is neutral only under tool_choice:none (handled above).
-            bad_request("strict function schema enforcement requires constrained decoding, "
-                        "which the Engine does not provide",
-                        "tools[" + std::to_string(index) + "].strict",
-                        "strict_tools_not_supported");
-        }
+        // strict=true is advisory: generation is not constrained to the declared JSON Schema.
         if (tool.defer_loading) {
             bad_request("defer_loading=true requires a deferred tool loader that NInfer does not "
                         "provide",
@@ -854,9 +836,10 @@ void lower_tools(const Json& body, GenerationRequest& request) {
         }
         request.tools.push_back(std::move(tool.definition));
     }
+    // disable_parallel_tool_use=true is advisory: the model may still emit several calls.
 }
 
-void parse_thinking(const Json& body, GenerationRequest& request, ParsePurpose purpose) {
+void parse_thinking(const Json& body, GenerationRequest& request) {
     if (!body.contains("thinking") || body.at("thinking").is_null()) { return; }
     const Json& thinking = body.at("thinking");
     if (!thinking.is_object() || !thinking.contains("type") || !thinking.at("type").is_string()) {
@@ -893,12 +876,13 @@ void parse_thinking(const Json& body, GenerationRequest& request, ParsePurpose p
             bad_request("thinking.display is valid only when thinking is adaptive or enabled",
                         "thinking");
         }
-        if (purpose == ParsePurpose::Messages && display == "omitted") {
-            bad_request("thinking.display='omitted' requires encrypted hidden-reasoning restore "
-                        "semantics that NInfer does not provide",
-                        "thinking", "thinking_display_not_supported");
-        }
     }
+}
+
+bool thinking_display_omitted(const Json& body) {
+    if (!body.contains("thinking") || !body.at("thinking").is_object()) { return false; }
+    const Json& thinking = body.at("thinking");
+    return thinking.contains("display") && thinking.at("display") == "omitted";
 }
 
 void parse_effort(const Json& body, GenerationRequest& request, ParsePurpose purpose) {
@@ -1027,7 +1011,7 @@ void parse_common_prompt(const Json& body, GenerationRequest& request, ParsePurp
     lower_tools(body, request);
     parse_system(body, request);
     parse_messages(body, request);
-    parse_thinking(body, request, purpose);
+    parse_thinking(body, request);
     parse_effort(body, request, purpose);
     apply_anthropic_prompt_cache_policy(body, request);
     if (body.contains("container") && !body.at("container").is_null()) {
@@ -1073,6 +1057,7 @@ AnthropicMessagesRequest parse_anthropic_messages_request(const Json& body,
     }
 
     parse_common_prompt(body, result.generation, ParsePurpose::Messages);
+    result.hide_thinking = thinking_display_omitted(body);
     parse_generation_fields(body, result.generation);
     return result;
 }

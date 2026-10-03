@@ -2953,8 +2953,16 @@ int test_tolerant_recovery() {
                       "tolerant suffix lost the recovered call");
     failures += check(tolerant.diagnostics.fallback_reason == Reason::TruncatedTail,
                       "tolerant suffix was not flagged as a truncated tail");
+    failures += check(tolerant.diagnostics.tolerant_recovered,
+                      "tolerant suffix recovery was not reported as tolerant_recovered");
+    const auto clean = fi::parse_qwen_tool_call_output(tool_call("configure", {{"value", "x"}}), 64,
+                                                       contract, true);
+    failures += check(clean.is_tool_call_response && !clean.diagnostics.tolerant_recovered,
+                      "a well-formed call in tolerant mode was reported as tolerant_recovered");
     const auto strict = fi::parse_qwen_tool_call_output(suffixed, 64, contract);
     failures += check(!strict.is_tool_call_response, "strict suffix was recovered instead of text");
+    failures +=
+        check(!strict.diagnostics.tolerant_recovered, "strict mode reported tolerant_recovered");
     failures += check(strict.tool_calls.empty(), "strict suffix retained the recovered call");
     failures += check(strict.diagnostics.fallback_reason == Reason::TrailingContent,
                       "strict suffix was not flagged as trailing content");
@@ -2982,7 +2990,8 @@ int test_tolerant_recovery() {
                       "tolerant increment leaked recovered bytes to visible content");
     failures += check(terminal.tool_calls.size() == 1,
                       "tolerant increment did not commit the recovered call");
-    failures += check(terminal.diagnostics.fallback_reason == Reason::TruncatedTail,
+    failures += check(terminal.diagnostics.fallback_reason == Reason::TruncatedTail &&
+                          terminal.diagnostics.tolerant_recovered,
                       "tolerant increment lost the truncated-tail diagnostic");
     return failures;
 }
@@ -3066,6 +3075,8 @@ int test_tolerant_missing_function_close_bracket() {
     }
     failures += check(tolerant.diagnostics.fallback_reason == Reason::None,
                       "tolerant recovery of a missing bracket reported a spurious fallback reason");
+    failures += check(tolerant.diagnostics.tolerant_recovered,
+                      "a repaired missing bracket was not reported as tolerant_recovered");
     const auto strict = fi::parse_qwen_tool_call_output(text, 64, *contract);
     failures += check(!strict.is_tool_call_response,
                       "strict mode recovered a call with a missing closing bracket after the function name");
@@ -3089,9 +3100,13 @@ int test_tolerant_undeclared_and_value_cut() {
     // R2-I5/CR5: tolerant mode repairs syntax damage; it does not accept undeclared
     // identities. The undeclared call is never emitted in either mode.
     const auto tolerant = fi::parse_qwen_tool_call_output(undeclared, 64, *contract, true);
+    // Deliberate difference from the pre-merge master test: master's tolerant mode kept the
+    // undeclared name as a call and reported tolerant_recovered; the branch never accepts
+    // undeclared identities (R2-I5), so no call and no flag (R13-03).
     failures += check(!tolerant.is_tool_call_response && tolerant.tool_calls.empty() &&
                           tolerant.content == undeclared && tolerant.diagnostics.marker_seen &&
-                          tolerant.diagnostics.fallback_reason == Reason::UndeclaredTool,
+                          tolerant.diagnostics.fallback_reason == Reason::UndeclaredTool &&
+                          !tolerant.diagnostics.tolerant_recovered,
                       "tolerant mode emitted a syntactically valid undeclared call (CR5)");
     const auto strict = fi::parse_qwen_tool_call_output(undeclared, 64, *contract);
     failures += check(!strict.is_tool_call_response &&
@@ -3106,7 +3121,11 @@ int test_tolerant_undeclared_and_value_cut() {
                                   "<function=delete_file>\n"
                                   + open_tag + "/tmp/out";
     const auto cut_tolerant = fi::parse_qwen_tool_call_output(value_cut, 64, *contract, true);
-    failures += check(!cut_tolerant.is_tool_call_response && cut_tolerant.tool_calls.empty(),
+    // Deliberate difference from the pre-merge master test: master's tolerant mode committed
+    // the call with its partial value and reported tolerant_recovered; the branch never
+    // commits an open value, so the region is text and the flag stays false (R13-03).
+    failures += check(!cut_tolerant.is_tool_call_response && cut_tolerant.tool_calls.empty() &&
+                          !cut_tolerant.diagnostics.tolerant_recovered,
                       "tolerant mode committed a cut string value");
     failures += check(cut_tolerant.diagnostics.fallback_reason == Reason::TruncatedTail,
                       "tolerant value-cut was not flagged as a truncated tail");
@@ -3122,12 +3141,120 @@ int test_tolerant_undeclared_and_value_cut() {
     const auto name_tolerant = fi::parse_qwen_tool_call_output(name_only, 64, *contract, true);
     failures += check(!name_tolerant.is_tool_call_response && name_tolerant.tool_calls.empty(),
                       "tolerant mode kept a zero-parameter truncated call");
-    failures += check(name_tolerant.diagnostics.fallback_reason == Reason::TruncatedTail,
-                      "zero-parameter truncation was not flagged as a truncated tail");
+    failures += check(name_tolerant.diagnostics.fallback_reason == Reason::TruncatedTail &&
+                          !name_tolerant.diagnostics.tolerant_recovered,
+                      "zero-parameter truncation was not a truncated tail returned as text");
     const auto name_strict = fi::parse_qwen_tool_call_output(name_only, 64, *contract);
     failures += check(!name_strict.is_tool_call_response &&
                           name_strict.diagnostics.fallback_reason == Reason::MalformedStructure,
                       "strict mode misclassified a zero-parameter truncated call");
+    return failures;
+}
+
+int test_r13_03_tolerant_recovered_suffix() {
+    // R13-03 (ported from master d2ab7524 with branch semantics): a complete call followed by
+    // a visible suffix commits in tolerant mode with TruncatedTail and the flag; strict
+    // returns text with TrailingContent and no flag; a clean tolerant call has no flag.
+    using Reason = ninfer::ToolCallParseFallbackReason;
+    int failures = 0;
+    const auto contract = contract_for("configure", Json{{"value", Json{{"type", "string"}}}});
+    const std::string suffixed = tool_call("configure", {{"value", "x"}}) + "\nDone.";
+    const auto tolerant = fi::parse_qwen_tool_call_output(suffixed, 64, contract, true);
+    failures += check(tolerant.is_tool_call_response && tolerant.tool_calls.size() == 1 &&
+                          tolerant.diagnostics.fallback_reason == Reason::TruncatedTail &&
+                          tolerant.diagnostics.tolerant_recovered,
+                      "R13-03: tolerant suffix recovery must commit with the flag");
+    const auto strict = fi::parse_qwen_tool_call_output(suffixed, 64, contract);
+    failures += check(!strict.is_tool_call_response &&
+                          strict.diagnostics.fallback_reason == Reason::TrailingContent &&
+                          !strict.diagnostics.tolerant_recovered,
+                      "R13-03: strict suffix must be text without the flag");
+    const auto clean =
+        fi::parse_qwen_tool_call_output(tool_call("configure", {{"value", "x"}}), 64, contract, true);
+    failures += check(clean.is_tool_call_response &&
+                          clean.diagnostics.fallback_reason == Reason::None &&
+                          !clean.diagnostics.tolerant_recovered,
+                      "R13-03: a clean tolerant call must not set the flag");
+    return failures;
+}
+
+int test_r13_03_tolerant_recovered_missing_bracket() {
+    // R13-03 (ported from master test_tolerant_missing_function_close_bracket): a missing '>'
+    // after the function name is a Stage-1 tolerant header repair; the committed call carries
+    // repaired=true, so the flag is true with fallback_reason None.
+    using Reason = ninfer::ToolCallParseFallbackReason;
+    int failures = 0;
+    const auto contract =
+        output_contract_for("memory", Json{{"content", Json{{"type", "string"}}}});
+    const std::string text = "<tool_call>\n<function=memory\n<parameter=content>\nremember x\n"
+                             "</parameter>\n</function>\n</tool_call>";
+    const auto tolerant = fi::parse_qwen_tool_call_output(text, 64, *contract, true);
+    failures += check(tolerant.is_tool_call_response && tolerant.tool_calls.size() == 1 &&
+                          tolerant.tool_calls.front().name == "memory" &&
+                          tolerant.diagnostics.fallback_reason == Reason::None &&
+                          tolerant.diagnostics.tolerant_recovered,
+                      "R13-03: a repaired missing bracket must report the flag");
+    const auto strict = fi::parse_qwen_tool_call_output(text, 64, *contract);
+    failures += check(!strict.is_tool_call_response && !strict.diagnostics.tolerant_recovered,
+                      "R13-03: strict mode must not repair or flag the missing bracket");
+    return failures;
+}
+
+int test_r13_03_tolerant_recovered_undeclared_stays_text() {
+    // R13-03 (deliberate difference from master): master's tolerant mode kept an undeclared
+    // name as a call (flag true). The branch never accepts undeclared identities (R2-I5), so
+    // tolerant mode returns text with UndeclaredTool and the flag stays false.
+    using Reason = ninfer::ToolCallParseFallbackReason;
+    int failures = 0;
+    const auto contract =
+        output_contract_for("delete_file", Json{{"filePath", Json{{"type", "string"}}}});
+    const std::string undeclared = "<tool_call>\n<function=not_a_declared_tool>\n"
+                                   "<parameter=filePath>\n/tmp/out.js\n</parameter>\n"
+                                   "</function>\n</tool_call>";
+    const auto tolerant = fi::parse_qwen_tool_call_output(undeclared, 64, *contract, true);
+    failures += check(!tolerant.is_tool_call_response && tolerant.tool_calls.empty() &&
+                          tolerant.diagnostics.fallback_reason == Reason::UndeclaredTool &&
+                          !tolerant.diagnostics.tolerant_recovered,
+                      "R13-03: an undeclared call must stay text without the flag");
+    return failures;
+}
+
+int test_r13_03_tolerant_recovered_parity() {
+    // R13-03: the flag is a diagnostic of the logical input — one-shot, bytewise and every
+    // two-chunk split must agree, including the flag itself (P1/P2 via operator==).
+    int failures = 0;
+    const auto contract =
+        output_contract_for("configure", Json{{"value", Json{{"type", "string"}}}});
+    const std::vector<std::pair<std::string, bool>> inputs = {
+        {tool_call("configure", {{"value", "x"}}) + "\nDone.", true},
+        {"<tool_call>\n<function=configure\n<parameter=value>\ny\n</parameter>\n</function>\n"
+         "</tool_call>",
+         true},
+        {"<tool_call>\n<function=not_declared>\n</function>\n</tool_call>", false},
+    };
+    for (const auto& [text, expected_flag] : inputs) {
+        const auto run = [&](std::size_t split) {
+            fi::ToolCallOutputDecoder decoder(contract, 64, /*tolerant*/ true);
+            std::string discarded;
+            if (split == text.size()) {
+                discarded += decoder.feed(std::string_view(text));
+            } else {
+                discarded += decoder.feed(std::string_view(text).substr(0, split));
+                discarded += decoder.feed(std::string_view(text).substr(split));
+            }
+            (void)discarded;
+            return decoder.finish(ninfer::FinishReason::None);
+        };
+        const auto reference = run(text.size());
+        failures += check(reference.diagnostics.tolerant_recovered == expected_flag,
+                          "R13-03 parity: one-shot flag does not match the expected verdict");
+        for (std::size_t split = 0; split <= text.size(); ++split) {
+            const auto streamed = run(split);
+            failures += check(streamed.diagnostics == reference.diagnostics &&
+                                  same_tool_calls(streamed.tool_calls, reference.tool_calls),
+                              "R13-03 parity: split diverged from one-shot diagnostics");
+        }
+    }
     return failures;
 }
 
@@ -5896,6 +6023,10 @@ int main() {
     failures += test_tolerant_truncated_final_call();
     failures += test_tolerant_missing_function_close_bracket();
     failures += test_tolerant_undeclared_and_value_cut();
+    failures += test_r13_03_tolerant_recovered_suffix();
+    failures += test_r13_03_tolerant_recovered_missing_bracket();
+    failures += test_r13_03_tolerant_recovered_undeclared_stays_text();
+    failures += test_r13_03_tolerant_recovered_parity();
     failures += test_grammar_header_forms_one_shot();
     failures += test_streaming_recognizes_grammar_markers();
     failures += test_recovery_policy_phase3();

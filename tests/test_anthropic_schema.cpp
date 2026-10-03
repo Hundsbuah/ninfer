@@ -9,6 +9,7 @@
 #include <functional>
 #include <iostream>
 #include <iterator>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -392,70 +393,43 @@ int test_tools() {
                              rendered["function"]["input_examples"].is_array(),
                          "Anthropic tool schema/examples did not reach the Qwen prompt");
 
-    // R9-04: strict=true is a schema-adherence guarantee that requires constrained
-    // decoding: reject for callable tools, neutral under tool_choice:none.
-    body["tools"] = Json::array({ordinary_tool(true)});
-    failures += check(api_code([&] { (void)parse(body); }) == "strict_tools_not_supported" &&
-                          api_param([&] { (void)parse(body); }) == "tools[0].strict",
-                      "R9-04: strict true with callable tools is rejected");
-    body["tool_choice"] = Json{{"type", "none"}};
-    failures += check(!parse(body).generation.uses_tools(),
-                      "R9-04: strict true under tool_choice:none stays neutral");
-    body["tools"][0]["strict"]             = "yes";
-    body["tools"][0]["defer_loading"]      = true;
+    // strict=true is advisory, as on the OpenAI endpoints: the tool is served unconstrained.
+    body["tools"]                        = Json::array({ordinary_tool(true)});
+    const GenerationRequest strict_tools = parse(body).generation;
+    failures += check(strict_tools.uses_tools() && strict_tools.tools.size() == 1,
+                      "an advisory strict tool was rejected or dropped");
+    body["tool_choice"]               = Json{{"type", "none"}, {"disable_parallel_tool_use", true}};
+    body["tools"][0]["defer_loading"] = true;
     body["tools"][0]["allowed_callers"] = Json::array({"code_execution"});
-    failures += check(api_param([&] { (void)parse(body); }) == "tools",
-                      "a non-boolean strict keeps the field-type error");
-    body["tools"][0]["strict"] = false;
     const GenerationRequest disabled    = parse(body).generation;
     failures += check(!disabled.uses_tools() && prompt(disabled).options.tool_jsons.empty(),
                       "tool_choice:none did not neutralize inactive tool guarantees");
 
-    // R9-04: forced choices and the single-call guarantee are rejected fail-fast instead of
-    // being faked by prompting or post-generation filtering.
+    // Forced, named and single-call choices are advisory: the Engine cannot force a call, so the
+    // tools stay offered under automatic selection. Qwen Code sends any for its JSON side queries.
     body          = base_request();
     body["tools"] = Json::array({ordinary_tool()});
-    body["tool_choice"] = Json{{"type", "any"}};
-    failures += check(api_code([&] { (void)parse(body); }) == "tool_choice_not_supported" &&
-                          api_param([&] { (void)parse(body); }) == "tool_choice",
-                      "R9-04: tool_choice any is rejected as unguaranteeable forcing");
-    body["tool_choice"] = Json{{"type", "tool"}, {"name", "weather"}};
-    failures += check(api_code([&] { (void)parse(body); }) == "tool_choice_not_supported",
-                      "R9-04: a named declared tool is rejected as unguaranteeable forcing");
-    body["tool_choice"] = Json{{"type", "auto"}, {"disable_parallel_tool_use", true}};
-    failures += check(
-        api_code([&] { (void)parse(body); }) == "parallel_tool_calls_not_supported" &&
-            api_param([&] { (void)parse(body); }) == "tool_choice.disable_parallel_tool_use",
-        "R9-04: auto + disable_parallel_tool_use + callable tools is rejected");
-    body["tool_choice"] = Json{{"type", "none"}, {"disable_parallel_tool_use", true}};
-    failures += check(!parse(body).generation.uses_tools(),
-                      "R9-04: none + disable_parallel_tool_use stays accepted neutral");
+    for (const Json& choice : {Json{{"type", "any"}}, Json{{"type", "tool"}, {"name", "weather"}},
+                               Json{{"type", "auto"}, {"disable_parallel_tool_use", true}},
+                               Json{{"type", "any"}, {"disable_parallel_tool_use", true}}}) {
+        body["tool_choice"]              = choice;
+        const GenerationRequest advisory = parse(body).generation;
+        failures += check(advisory.uses_tools() &&
+                              advisory.tool_choice.mode == ToolChoiceMode::Auto &&
+                              prompt(advisory).options.tool_jsons.size() == 1,
+                          "an advisory tool choice was rejected or did not keep the tools offered");
+    }
     body["tool_choice"] = Json{{"type", "tool"}, {"name", "forecast"}};
     failures += check(api_param([&] { (void)parse(body); }) == "tool_choice",
-                      "a named choice of an undeclared tool keeps the unknown-tool error");
+                      "a named choice of an undeclared tool was accepted");
     body["tool_choice"] = Json{{"type", "tool"}, {"name", "weather"},
                                {"disable_parallel_tool_use", "yes"}};
     failures += check(api_param([&] { (void)parse(body); }) == "disable_parallel_tool_use",
-                      "a non-boolean disable_parallel_tool_use keeps the field-type error");
+                      "a non-boolean disable_parallel_tool_use was accepted");
     body          = base_request();
     body["tool_choice"] = Json{{"type", "any"}};
     failures += check(api_param([&] { (void)parse(body); }) == "tool_choice",
-                      "tool_choice any without tools keeps the param error");
-
-    // R9-04 §6.10: Count Tokens shares the Messages prompt normalization
-    // (parse_common_prompt -> lower_tools), so the tool-choice guarantees are rejected
-    // identically on both endpoints.
-    body          = base_request();
-    body["tools"] = Json::array({ordinary_tool()});
-    body["tool_choice"] = Json{{"type", "any"}};
-    failures += check(api_code([&] { (void)parse_anthropic_count_tokens_request(body); }) ==
-                          "tool_choice_not_supported",
-                      "R9-04: Count Tokens rejects tool_choice any like Messages");
-    body["tools"] = Json::array({ordinary_tool(true)});
-    body["tool_choice"] = Json{{"type", "auto"}};
-    failures += check(api_code([&] { (void)parse_anthropic_count_tokens_request(body); }) ==
-                          "strict_tools_not_supported",
-                      "R9-04: Count Tokens rejects strict true like Messages");
+                      "tool_choice any without tools was accepted");
 
     body          = base_request();
     body["tools"] = Json::array({Json{{"type", "web_search_20250305"}, {"name", "web_search"}}});
@@ -537,8 +511,19 @@ int test_thinking_and_count_tokens() {
     failures += check(api_param([&] { (void)parse(body); }) == "thinking",
                       "unknown Thinking mode defaulted to enabled");
     body["thinking"] = Json{{"type", "adaptive"}, {"display", "omitted"}};
-    failures += check(api_code([&] { (void)parse(body); }) == "thinking_display_not_supported",
-                      "hidden Thinking was accepted without restore semantics");
+    const AnthropicMessagesRequest hidden = parse(body);
+    failures += check(hidden.hide_thinking && hidden.generation.enable_thinking == true &&
+                          !parse(base_request()).hide_thinking,
+                      "display:omitted was not parsed as hidden adaptive Thinking");
+    body["thinking"] = Json{{"type", "adaptive"}, {"display", "summarized"}};
+    failures += check(!parse(body).hide_thinking, "display:summarized hid the Thinking text");
+    body["thinking"] = Json{{"type", "adaptive"}, {"display", "future"}};
+    failures += check(api_param([&] { (void)parse(body); }) == "thinking",
+                      "unknown Thinking display was accepted");
+    body["thinking"] = Json{{"type", "disabled"}, {"display", "omitted"}};
+    failures += check(api_param([&] { (void)parse(body); }) == "thinking",
+                      "display was accepted with disabled Thinking");
+    body["thinking"] = Json{{"type", "adaptive"}, {"display", "omitted"}};
 
     body["max_tokens"]                        = 0;
     body["temperature"]                       = "ignored for counting";
@@ -828,6 +813,109 @@ int test_stream() {
     return failures;
 }
 
+// Every remainder class of the Base64 codec, plus multi-byte UTF-8 and control bytes.
+int test_hidden_reasoning_signature() {
+    int failures = 0;
+    for (const std::string reasoning :
+         {std::string(), std::string("a"), std::string("ab"), std::string("abc"),
+          std::string("abcd"),
+          std::string("na\xC3\xAFve \xE2\x80\x94 \xE6\x80\x9D\xE8\x80\x83\n\t\"quoted\"") +
+              std::string(1, '\0') + "nul"}) {
+        const std::string signature = encode_thinking_signature(reasoning);
+        failures += check(decode_thinking_signature(signature) == reasoning,
+                          "hidden-reasoning signature did not round-trip");
+    }
+    // RFC 4648 test vectors pin the alphabet and padding independently of the decoder.
+    failures += check(encode_thinking_signature("foobar") == "ninfer-reasoning.v1:Zm9vYmFy" &&
+                          encode_thinking_signature("fooba") == "ninfer-reasoning.v1:Zm9vYmE=" &&
+                          encode_thinking_signature("foob") == "ninfer-reasoning.v1:Zm9vYg==",
+                      "hidden-reasoning signature is not standard Base64");
+    failures +=
+        check(!decode_thinking_signature("msg_0123456789abcdef") &&
+                  !decode_thinking_signature("") && !decode_thinking_signature("EuYBCkQIARgCKkD"),
+              "a foreign signature was interpreted as hidden reasoning");
+    for (const char* malformed :
+         {"ninfer-reasoning.v1:Zm9", "ninfer-reasoning.v1:Zm9v!mFy", "ninfer-reasoning.v1:Zg=A",
+          "ninfer-reasoning.v1:=m9v", "ninfer-reasoning.v1:Zm9vYg==Zm9v"}) {
+        bool threw = false;
+        try {
+            (void)decode_thinking_signature(malformed);
+        } catch (const std::invalid_argument&) { threw = true; }
+        failures += check(threw, std::string("malformed signature was accepted: ") + malformed);
+    }
+    return failures;
+}
+
+int test_hidden_reasoning_round_trip() {
+    const AnthropicResponseIdentity identity =
+        make_anthropic_response_identity("req_hidden", "claude-local");
+    const GenerationOutcome outcome = sample_outcome();
+
+    const Json aggregate =
+        Json::parse(make_anthropic_messages_response(identity, outcome, /*hide_thinking=*/true));
+    const Json& block = aggregate["content"][0];
+    int failures = check(block["type"] == "thinking" && block["thinking"] == "" &&
+                             decode_thinking_signature(block["signature"].get<std::string>()) ==
+                                 outcome.reasoning &&
+                             aggregate["content"][1]["text"] == "answer",
+                         "aggregate hidden Thinking leaked text or lost its signature");
+
+    AnthropicMessagesStream stream(identity, 100, /*hide_thinking=*/true);
+    std::vector<std::string> events{stream.start()};
+    const auto append = [&](std::vector<std::string> values) {
+        events.insert(events.end(), std::make_move_iterator(values.begin()),
+                      std::make_move_iterator(values.end()));
+    };
+    append(stream.reasoning_delta("tho"));
+    append(stream.reasoning_delta("ught"));
+    append(stream.content_delta("answer"));
+    append(stream.finish(outcome));
+    bool saw_thinking_delta = false;
+    std::optional<std::string> streamed;
+    for (const std::string& wire : events) {
+        const Json parsed = parse_event(wire);
+        if (parsed.at("type") != "content_block_delta") { continue; }
+        if (parsed["delta"]["type"] == "thinking_delta") { saw_thinking_delta = true; }
+        if (parsed["delta"]["type"] == "signature_delta") {
+            streamed = decode_thinking_signature(parsed["delta"]["signature"].get<std::string>());
+        }
+    }
+    failures += check(!saw_thinking_delta && streamed == outcome.reasoning,
+                      "streamed hidden Thinking leaked text or lost its signature");
+
+    // The client returns the block it received; lowering restores the reasoning from it.
+    Json body        = base_request();
+    body["thinking"] = Json{{"type", "adaptive"}, {"display", "omitted"}};
+    body["messages"].push_back(
+        Json{{"role", "assistant"},
+             {"content", Json::array({block, Json{{"type", "text"}, {"text", "answer"}}})}});
+    body["messages"].push_back(Json{{"role", "user"}, {"content", "next"}});
+    const auto assistant_reasoning = [](const GenerationRequest& request) {
+        const auto assistant = std::ranges::find_if(request.messages, [](const ChatTurn& turn) {
+            return turn.role == ninfer::ChatRole::Assistant;
+        });
+        return assistant == request.messages.end() ? std::optional<std::string>()
+                                                   : assistant->reasoning_content;
+    };
+    failures += check(assistant_reasoning(parse(body).generation) == outcome.reasoning,
+                      "hidden reasoning was not restored from the returned block");
+
+    // Visible text wins, a foreign signature stays metadata, a corrupt NInfer one is a 400.
+    body["messages"][1]["content"][0] =
+        Json{{"type", "thinking"}, {"thinking", "visible"}, {"signature", block["signature"]}};
+    failures += check(assistant_reasoning(parse(body).generation) == "visible",
+                      "visible Thinking text lost to its signature");
+    body["messages"][1]["content"][0] =
+        Json{{"type", "thinking"}, {"thinking", ""}, {"signature", "EuYBCkQIARgCKkD"}};
+    failures += check(assistant_reasoning(parse(body).generation) == std::string(),
+                      "a foreign signature produced reasoning");
+    body["messages"][1]["content"][0] =
+        Json{{"type", "thinking"}, {"thinking", ""}, {"signature", "ninfer-reasoning.v1:Zm9"}};
+    failures += check(api_code([&] { (void)parse(body); }) == "invalid_thinking_signature",
+                      "a corrupt hidden-reasoning signature was accepted");
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -844,6 +932,8 @@ int main() {
     failures += test_aggregate_and_errors();
     failures += test_tool_call_presentation();
     failures += test_stream();
+    failures += test_hidden_reasoning_signature();
+    failures += test_hidden_reasoning_round_trip();
     if (failures != 0) {
         std::cerr << failures << " Anthropic adapter checks failed\n";
         return 1;

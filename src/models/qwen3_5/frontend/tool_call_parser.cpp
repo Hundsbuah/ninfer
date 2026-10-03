@@ -575,6 +575,15 @@ MaterializedToolCallResult materialize_tool_call_result(const ToolCallStreamResu
     materialized.diagnostics.indented_markers_suppressed = result.indented_markers_suppressed;
     materialized.diagnostics.ended_in_unclosed_fence    = result.ended_in_unclosed_fence;
     materialized.diagnostics.parse_budget_exhausted   = result.parse_budget_exhausted;
+    // R13-03: tolerant mode turned output the strict parser would return as text into
+    // structured calls. Only tolerant paths can set the truncated-tail reason on an
+    // accepted region or the per-call repaired flag, so the expression is false in strict
+    // mode by construction. An undeclared tool is never accepted (R2-I5), so it can never
+    // make the flag true — a deliberate difference from the pre-merge parser.
+    materialized.diagnostics.tolerant_recovered =
+        failure == ToolCallParseFallbackReason::TruncatedTail ||
+        std::any_of(calls.begin(), calls.end(),
+                    [](const ParsedFunctionCall& c) { return c.repaired; });
 
     materialized.calls.reserve(calls.size());
     for (const ParsedFunctionCall& call : calls) {

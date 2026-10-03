@@ -47,6 +47,10 @@ struct ParsedParameter {
 struct ParsedFunctionCall {
     std::string name;
     std::vector<ParsedParameter> parameters;
+    // R13-03: tolerant Stage-1 header repair produced this call's function opener (a
+    // dropped/doubled '<', a leaked turn marker, or a missing '>' after the name). Strict
+    // parsing never sets it; it feeds ToolCallParseDiagnostics::tolerant_recovered.
+    bool repaired = false;
 };
 
 struct ParsedToolRegion {

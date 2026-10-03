@@ -699,6 +699,9 @@ ToolCallParseProgress parse_region_at(std::string_view text, const ToolCallParse
                 invalid(ToolCallParseFailure::UndeclaredTool, i);
                 return out;
             }
+            // R13-03: only the tolerant Stage-1 header repairs above can set these; strict
+            // parsing takes the canonical opener, so the flag is false there by construction.
+            s.current.repaired = from_boundary || ws_boundary;
             s.current.name  = std::string(name);
             s.fn_family     = opener.kind;
             s.mode          = RegionState::Mode::FunctionBody;

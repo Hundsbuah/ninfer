@@ -58,7 +58,7 @@ void configure_text_card(TextContext& card, const ExecutionCore& execution,
     card.set_linear_state_slots(state_source_slot, state_destination_slot);
     card.set_gdn_state_action(GdnStateAction::UpdateInPlace, nullptr);
     card.set_mtp_proposal_extent(mtp_proposal_extent);
-    card.set_fast_prefill_kernel(execution.fast_prefill_kernel);
+    card.set_prompt_attention(execution.prompt_attention);
     if (execution.proposal_head == ProposalHead::Full) {
         card.set_proposal_head(nullptr, nullptr, 0);
         return;
@@ -73,7 +73,7 @@ PrefillChunkResult prefill_text_chunk(PrefillContext& state, std::span<const Tok
                                       std::optional<std::uint32_t> split_frontier,
                                       bool finalize_at_end) {
     TextContext card(state.execution.device, state.execution.parameters, state.execution.work,
-                     state.text_kv, state.execution.linear_attention, state.execution.io,
+                     state.text_kv, state.execution.state_images, state.execution.io,
                      state.execution.prefill_hidden, state.execution.prefill_chunk,
                      state.text_kv_base, state.mtp_kv, &state.text_cache, state.mtp_cache);
     configure_text_card(card, state.execution, state.sampling, state.state_source_slot,
@@ -97,7 +97,7 @@ PrefillChunkResult prefill_multimodal_chunk(PrefillContext& state, const Prepare
                                             std::optional<std::uint32_t> split_frontier,
                                             bool finalize_at_end) {
     TextContext card(state.execution.device, state.execution.parameters, state.execution.work,
-                     state.text_kv, state.execution.linear_attention, state.execution.io,
+                     state.text_kv, state.execution.state_images, state.execution.io,
                      state.execution.prefill_hidden, state.execution.prefill_chunk,
                      state.text_kv_base, state.mtp_kv, &state.text_cache, state.mtp_cache);
     configure_text_card(card, state.execution, state.sampling, state.state_source_slot,
@@ -291,9 +291,9 @@ void ProgramImpl::start_sequence(std::uint32_t lane, SequenceState& sequence,
                 sequence.state = ActiveStateBinding{.read = current, .write = current};
             } else {
                 const StateImageSelectors selectors = state_store->begin_fork(selected, current);
-                if (is_masked_draft_backend(speculative_backend)) {
-                    state_images->copy_dflash_local(selectors.source, selectors.destination,
-                                                    device.stream);
+                if (state_images->has_fork_local()) {
+                    state_images->copy_fork_local(selectors.source, selectors.destination,
+                                                  device.stream);
                 }
                 sequence.state = ActiveStateBinding{
                     .read           = selected,
@@ -486,9 +486,9 @@ void ProgramImpl::start_sequence(std::uint32_t lane, SequenceState& sequence,
                                                      : StateReadOwnership::ExternalOwner;
                 const StateImageSelectors selectors =
                     state_store->begin_fork(selected, destination);
-                if (is_masked_draft_backend(speculative_backend)) {
-                    state_images->copy_dflash_local(selectors.source, selectors.destination,
-                                                    device.stream);
+                if (state_images->has_fork_local()) {
+                    state_images->copy_fork_local(selectors.source, selectors.destination,
+                                                  device.stream);
                 }
                 sequence.state = ActiveStateBinding{
                     .read           = selected,
@@ -689,10 +689,11 @@ void ProgramImpl::start_sequence(std::uint32_t lane, SequenceState& sequence,
     }
 }
 
-runtime::PrefillStepResult
-ProgramImpl::advance_prefill_raw(std::uint32_t lane, runtime::ExecutionTiming* failed_timing) {
+runtime::PrefillStepResult ProgramImpl::advance_prefill_raw(std::uint32_t lane,
+                                                            runtime::ExecutionTiming* failed_timing,
+                                                            runtime::PrefillStepWidth width) {
     if (lane >= max_concurrency) { throw std::out_of_range("request lane is out of range"); }
-    return advance_prefill(active_sequence(lane), requests[lane], failed_timing);
+    return advance_prefill(active_sequence(lane), requests[lane], failed_timing, width);
 }
 
 runtime::ExecutionTiming ProgramImpl::resolve_prefill_raw(std::uint32_t lane, bool terminal,
@@ -846,7 +847,8 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
             Tensor selected;
             Tensor destinations;
             if (speculative_backend == SpeculativeBackend::Mtp && io.mtp_decode) {
-                qwen3_5::MtpDecodeState& frame = *io.mtp_decode;
+                const qwen3_5::MtpDecodeState frame =
+                    io.mtp_decode->narrowed(verify_drafts, neural_draft_window);
                 selector_tensor                = frame.current_extents.slice(0, 0, batch);
                 hidden                         = frame.target_hidden.slice(2, 0, batch);
                 selected     = frame.target_continuation_hidden.slice(1, 0, batch);
@@ -982,7 +984,8 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
 
 runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                                                         RequestControl& request,
-                                                        runtime::ExecutionTiming* failed_timing) {
+                                                        runtime::ExecutionTiming* failed_timing,
+                                                        runtime::PrefillStepWidth width) {
     runtime::ExecutionTimingRecorder timing(runtime::ExecutionTimingPhase::Submit, failed_timing);
     if (request.lifecycle != Lifecycle::Prefilling || !request.prefill) {
         throw std::logic_error("staged prefill step requires an active concurrent request");
@@ -1045,9 +1048,9 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
             rewrite_capture_hidden_ptr = &rewrite_capture_hidden;
         }
         execution::PrefillContext schedule_state{
-            {device, parameters, work, state_images->linear(),
+            {device, parameters, work, *state_images,
              replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
-             proposal_head, fast_prefill_kernel},
+             proposal_head, prompt_attention},
             text_kv_view(sequence),
             mtp_kv_view(sequence),
             decoder->text_kv,
@@ -1099,8 +1102,17 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
         }
 
         if (staged.cursor < staged.prompt_tokens) {
+            // One prefill chunk is one planned service unit. A Concurrent step advances at most
+            // the concurrent width of it and leaves the rest of the chunk to later steps; Vision
+            // prompts keep whole chunks.
+            if (staged.chunk_remaining == 0) {
+                staged.chunk_remaining =
+                    std::min(prefill_chunk, staged.prompt_tokens - staged.cursor);
+            }
             const std::uint32_t nominal =
-                std::min(prefill_chunk, staged.prompt_tokens - staged.cursor);
+                width == runtime::PrefillStepWidth::Concurrent && !staged.vision
+                    ? std::min(staged.chunk_remaining, concurrent_prefill_chunk)
+                    : staged.chunk_remaining;
             mark_workspace_usage(staged.prepare_mtp ? workspace_plan.mtp_prefill
                                                     : workspace_plan.text_prefill);
             if (is_masked_draft_backend(speculative_backend)) {
@@ -1174,6 +1186,7 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                 staged.cursor += result.processed_tokens;
                 processed_prompt_tokens += result.processed_tokens;
                 remaining -= result.processed_tokens;
+                staged.chunk_remaining -= result.processed_tokens;
                 final_chunk_tokens     = result.processed_tokens;
                 sequence.text_kv_valid = staged.cursor;
                 if (staged.prepare_mtp) { sequence.mtp_kv_valid = staged.cursor; }
@@ -1198,6 +1211,8 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                             std::chrono::duration<double>(Clock::now() - started).count();
                         if (++next_capture_offer_id_ == 0) { ++next_capture_offer_id_; }
                         staged.pending_capture_offer = next_capture_offer_id_;
+                        // A capture offer ends the chunk, as the plan's service units count.
+                        staged.chunk_remaining = 0;
                         return runtime::PrefillStepResult{
                             .summary                 = summary,
                             .processed_prompt_tokens = processed_prompt_tokens,
@@ -1219,6 +1234,7 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                 return runtime::PrefillStepResult{
                     .summary                 = summary,
                     .processed_prompt_tokens = processed_prompt_tokens,
+                    .completes_service_unit  = staged.chunk_remaining == 0,
                     .timing                  = timing.finish(),
                 };
             }

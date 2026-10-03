@@ -320,26 +320,14 @@ int test_tools() {
         check(!none.generation.uses_tools() && prompt(none.generation).options.tool_jsons.empty(),
               "tool_choice none makes parallel_tool_calls neutral and removes executable tools");
 
-    // R8-02: required guarantees at least one tool call, which the Engine cannot
-    // guarantee: reject it instead of silently weakening to automatic selection.
     body["tool_choice"] = "required";
-    const ApiError required_error = api_error([&] { (void)parse(body); });
-    failures += check(required_error.param == "tool_choice" &&
-                          required_error.code == "tool_choice_not_supported",
-                      "required tool choice is rejected as an unguaranteeable guarantee");
-    // R8-02: a named choice forces one exact tool call. A one-tool set still permits no
-    // tool call, so the forcing is rejected (valid declared name: the failure proves
-    // unsupported forcing, not malformed input).
+    const GenerationRequest required_choice = parse(body).generation;
+    failures += check(required_choice.uses_tools() &&
+                          prompt(required_choice).options.tool_jsons.size() == 1,
+                      "required tool choice is accepted as advisory auto selection");
     body["tool_choice"] = Json{{"type", "function"}, {"function", Json{{"name", "weather"}}}};
-    const ApiError named_error = api_error([&] { (void)parse(body); });
-    failures += check(named_error.param == "tool_choice" &&
-                          named_error.code == "tool_choice_not_supported",
-                      "named function tool choice is rejected as an unguaranteeable forcing");
-    body["tool_choice"] = Json{{"type", "custom"}, {"custom", Json{{"name", "shell"}}}};
-    const ApiError named_custom_error = api_error([&] { (void)parse(body); });
-    failures += check(named_custom_error.param == "tool_choice" &&
-                          named_custom_error.code == "tool_choice_not_supported",
-                      "named custom tool choice is rejected as an unguaranteeable forcing");
+    failures += check(parse(body).generation.uses_tools(),
+                      "named tool choice is accepted as advisory auto selection");
 
     body          = base_request();
     body["tools"] = Json::array({function_tool(), function_tool("search")});
@@ -361,98 +349,42 @@ int test_tools() {
     failures += check(direct_allowed.tools.size() == 1 && direct_allowed.tools[0].name == "weather",
                       "direct allowed_tools compatibility shape is accepted");
     body["tool_choice"]["mode"] = "required";
-    // R8-02: required invocation from an allowed subset cannot be guaranteed (the
-    // filtered set still permits no tool call): reject before mutating the effective set.
-    const ApiError required_allowed_error = api_error([&] { (void)parse(body); });
-    failures += check(required_allowed_error.param == "tool_choice" &&
-                          required_allowed_error.code == "tool_choice_not_supported",
-                      "required allowed_tools is rejected as an unguaranteeable guarantee");
+    const GenerationRequest required_allowed = parse(body).generation;
+    failures += check(required_allowed.tools.size() == 1 &&
+                          required_allowed.tools[0].name == "weather",
+                      "required allowed_tools is accepted as advisory auto selection");
     body["tool_choice"]["mode"]             = "auto";
     body["tool_choice"]["tools"][0]["name"] = "missing";
     failures += check(
         api_error([&] { (void)parse(body); }).param == "tool_choice.allowed_tools.tools[0].name",
         "allowed_tools rejects names absent from the declared tool set");
 
-    // R9-02: strict:true is a schema-adherence guarantee that requires constrained
-    // decoding; the Engine does not provide it, so the request is rejected before it
-    // reaches PromptInput. Omitted/false remain accepted.
     body          = base_request();
     body["tools"] = Json::array({function_tool("weather", true)});
-    const ApiError strict_true_error = api_error([&] { (void)parse(body); });
-    failures += check(strict_true_error.param == "tools[0].function.strict" &&
-                          strict_true_error.code == "strict_tools_not_supported",
-                      "R9-02: strict true is rejected as an unguaranteeable guarantee");
-    body["tools"] = Json::array({function_tool("weather", false)});
-    const OpenAIChatRequest strict_false_tools = parse(body);
-    failures += check(strict_false_tools.generation.tools.size() == 1,
-                      "R9-02: strict false remains accepted");
-    Json omitted = function_tool("weather");
-    omitted["function"].erase("strict");
-    body["tools"] = Json::array({omitted});
-    const OpenAIChatRequest strict_omitted_tools = parse(body);
-    failures += check(strict_omitted_tools.generation.tools.size() == 1,
-                      "R9-02: omitted strict remains accepted");
-    // R9-03: OpenAI custom tools require free-form custom-tool input/output semantics
-    // (free-form input, a custom output wire type, an optional constrained grammar);
-    // the Engine provides none of these, so custom definitions are rejected at the type
-    // field — the previous synthetic single-string-input function overstated support.
-    body          = base_request();
+    const OpenAIChatRequest strict_tools = parse(body);
+    failures += check(strict_tools.generation.tools.size() == 1 &&
+                          prompt(strict_tools.generation).options.tool_jsons[0].find(
+                              "\"strict\":false") != std::string::npos,
+                      "strict tools are accepted as advisory without reaching the prompt");
     body["tools"] = Json::array({Json{{"type", "custom"},
                                       {"custom",
                                        Json{{"name", "shell"},
                                             {"description", "Run a shell command"},
                                             {"format", Json{{"type", "grammar"},
                                                              {"grammar", "start: /.+/"}}}}}}});
-    const ApiError custom_grammar_error = api_error([&] { (void)parse(body); });
-    failures += check(custom_grammar_error.param == "tools[0].type" &&
-                          custom_grammar_error.code == "tool_type_not_supported",
-                      "R9-03: a grammar-bearing custom tool definition is rejected");
-    body["tools"] = Json::array({Json{{"type", "custom"},
-                                      {"custom",
-                                       Json{{"name", "shell"}, {"description", "Run a shell command"}}}}});
-    const ApiError custom_bare_error = api_error([&] { (void)parse(body); });
-    failures += check(custom_bare_error.param == "tools[0].type" &&
-                          custom_bare_error.code == "tool_type_not_supported",
-                      "R9-03: a custom tool definition without a format is rejected");
-
-    // R9-03: allowed_tools is function-only — a custom selector cannot select anything.
-    body          = base_request();
-    body["tools"] = Json::array({function_tool("weather")});
-    body["tool_choice"] = Json{{"type", "allowed_tools"},
-                                {"allowed_tools",
-                                 Json{{"mode", "auto"},
-                                      {"tools",
-                                       Json::array({Json{{"type", "custom"},
-                                                         {"custom", Json{{"name", "shell"}}}}})}}}};
-    const ApiError custom_allowed_error = api_error([&] { (void)parse(body); });
-    failures += check(custom_allowed_error.param == "tool_choice.allowed_tools.tools[0].type" &&
-                          custom_allowed_error.code == "tool_type_not_supported",
-                      "R9-03: a custom allowed_tools selector is rejected");
-
-    // R9-03: a standards-conformant custom tool call cannot be replayed as Chat history.
-    body          = base_request();
-    body["messages"] = Json::array({Json{{"role", "user"}, {"content", "hi"}},
-                                    Json{{"role", "assistant"},
-                                         {"content", ""},
-                                         {"tool_calls",
-                                          Json::array({Json{{"id", "call_1"},
-                                                            {"type", "custom"},
-                                                            {"custom", Json{{"name", "shell"},
-                                                                              {"input", "ls"}}}}})}}});
-    const ApiError custom_history_error = api_error([&] { (void)parse(body); });
-    failures += check(custom_history_error.param == "messages[1].tool_calls[0].type" &&
-                          custom_history_error.code == "tool_type_not_supported",
-                      "R9-03: custom tool_calls in history are explicitly unsupported");
+    const GenerationRequest custom_tools = parse(body).generation;
+    failures += check(custom_tools.tools.size() == 1 && custom_tools.tools[0].name == "shell" &&
+                          custom_tools.tools[0].input_schema_json.find("\"input\"") !=
+                              std::string::npos &&
+                          custom_tools.tools[0].input_schema_json.find("start: /.+/") !=
+                              std::string::npos,
+                      "custom tools are served as a single-string-input function");
 
     body                        = base_request();
     body["tools"]               = Json::array({function_tool()});
     body["parallel_tool_calls"] = false;
-    // R8-02: parallel_tool_calls=false limits the response to zero or one tool call, which
-    // NInfer cannot guarantee while callable tools are enabled: reject it.
-    const ApiError parallel_error = api_error([&] { (void)parse(body); });
-    failures += check(parallel_error.param == "parallel_tool_calls" &&
-                          parallel_error.code == "parallel_tool_calls_not_supported",
-                      "parallel_tool_calls=false with callable tools is rejected");
+    failures += check(parse(body).generation.uses_tools(),
+                      "parallel_tool_calls=false is accepted as advisory with tools enabled");
     body.erase("tools");
     failures += check(parse(body).generation.tools.empty(),
                       "parallel_tool_calls=false is neutral without tools");

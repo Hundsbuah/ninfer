@@ -37,6 +37,10 @@ std::size_t SequencePlan::workspace_capacity_bytes() const noexcept {
     return impl_ != nullptr ? impl_->workspace.capacity : 0;
 }
 
+bool SequencePlan::draft_tree_auto() const noexcept {
+    return impl_ != nullptr && impl_->tree_widths.automatic_mode();
+}
+
 const ContextCacheOptions& SequencePlan::context_cache_options() const noexcept {
     static const ContextCacheOptions empty;
     return impl_ != nullptr ? impl_->context_cache : empty;
@@ -297,8 +301,10 @@ RequestBasePlan Program::plan_request(const PreparedPrompt& prompt,
     return impl_->plan_request(PreparedPromptAccess::view(prompt), options);
 }
 
-std::vector<float> Program::causal_score(PreparedPrompt&& prompt, std::uint32_t first_target) {
-    return impl_->causal_score(PreparedPromptAccess::take(std::move(prompt)), first_target);
+ScoreResult Program::causal_score(PreparedPrompt&& prompt, std::uint32_t first_target,
+                                  const ScoreOptions& options) {
+    return impl_->causal_score(PreparedPromptAccess::take(std::move(prompt)), first_target,
+                               options);
 }
 
 std::optional<AdmissionCandidate> Program::inspect_admission(
@@ -393,8 +399,9 @@ bool Program::has_context_transaction() const noexcept { return impl_->has_conte
 bool Program::wait_context_transfer() noexcept { return impl_->wait_context_transfer(); }
 
 PrefillProgress Program::advance_prefill(SequenceHandle sequence,
-                                         runtime::ExecutionTiming* failed_timing) {
-    return impl_->advance_prefill(sequence, failed_timing);
+                                         runtime::ExecutionTiming* failed_timing,
+                                         runtime::PrefillStepWidth width) {
+    return impl_->advance_prefill(sequence, failed_timing, width);
 }
 
 CaptureAssessment
