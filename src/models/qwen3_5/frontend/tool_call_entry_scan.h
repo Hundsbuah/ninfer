@@ -33,6 +33,10 @@ namespace ninfer::models::qwen3_5::frontend {
 //     (no nested fences);
 //   * a backtick info string containing a backtick cancels the opener (the line is
 //     inline code); CRLF framing of the close line keeps the close valid;
+//   * R13-10: a fence opened on a list-item line (0-3 spaces, an unordered marker `-`,
+//     `+`, or `*` or an ordered marker of 1-9 digits ending in `.` or `)`, then 1-4
+//     spaces, then the run) closes only on a line indented at least to the list prefix
+//     width (a run at smaller indentation is fence content);
 //   * an unclosed fence stays open through EOF (suppression is the safe direction).
 class ToolCallFenceTracker {
 public:
@@ -41,27 +45,42 @@ public:
         Content, // the byte is fence structure: publish as ordinary content, no candidate
     };
     [[nodiscard]] Verdict consume(char byte) noexcept;
-    // True while a fence is still open (the pre-latch stream ended in an unclosed fence).
-    [[nodiscard]] bool open() const noexcept { return in_fence_; }
+    // R13-09: true while the pre-latch stream ended with an unclosed fence — the same
+    // condition the LF close rule applies when a closing line arrives, evaluated on the
+    // final unterminated line (a fence whose closing run is the last thing in the stream
+    // counts as closed).
+    [[nodiscard]] bool open_at_end() const noexcept;
 
 private:
     enum class Phase : std::uint8_t {
-        LineIndent, // line start: counting indentation before a run or body byte
-        LineRun,    // a fence-character run (opener candidate or close candidate)
-        OpenerTail, // the rest of an opener line (run extension or info string)
-        LineTail,   // format whitespace after a close run: the close is still valid
-        LineBody,   // the line is classified (fence content or ordinary text)
+        LineIndent,   // line start: counting indentation before a run or body byte
+        LineRun,      // a fence-character run (opener candidate or close candidate)
+        OpenerTail,   // the rest of an opener line (run extension or info string)
+        LineTail,     // format whitespace after a close run: the close is still valid
+        LineBody,     // the line is classified (fence content or ordinary text)
+        ListOrdinal,  // R13-10: an ordered list marker's digits (before the '.' or ')')
+        ListMarker,   // R13-10: a list marker awaiting its separating gap
+        ListGap,      // R13-10: the 1-4 space gap between list marker and fence run
     };
     bool in_fence_ = false;
     char fence_char_ = '\0';
     std::size_t fence_len_ = 0;
     std::size_t fence_indent_ = 0;
+    // R13-10: the minimum indentation a closing run may sit at: the list prefix width for a
+    // list-item fence, 0 for a top-level fence. Released by the close and the cancel.
+    std::size_t fence_min_close_indent_ = 0;
     Phase phase_ = Phase::LineIndent;
     char run_char_ = '\0';
     std::size_t run_len_ = 0;
     std::size_t indent_ = 0;
     bool close_ok_ = false;
     bool opener_line_ = false;
+    // R13-10: the in-progress list-item opener (line-local): the marker width (digits plus
+    // the '.' or ')', or 1 for an unordered marker), the 1-4 space gap after it, and
+    // whether the current fence was opened by a list item.
+    std::size_t list_width_ = 0;
+    std::size_t gap_ = 0;
+    bool list_opener_ = false;
 };
 
 // R3-06/R10: the shadow marker scan — the same classify_tool_marker_prefix transition over
@@ -94,10 +113,12 @@ private:
 // consulted for them (R10-I11: literal suppression applies only before entry latch; inside
 // an owned region the wire grammar owns the bytes).
 //
-// Indented-literal rule (R10-I2/I3/I5): before a tool entry has latched, a possible tool
-// marker beginning a physical line at visual indentation column 4 or greater is classified
-// as literal content and cannot become executable tool markup. This is a deterministic
-// tool-safety rule, not complete CommonMark parsing.
+// Indented-literal rule (R10-I2/I3/I5, refined by R13-01 to a whole-line rule): before a
+// tool entry has latched, a physical line whose first non-formatting byte arrives at
+// visual indentation column 4 or greater is literal content for its full length — every
+// marker on such a line, including one preceded by text on that line, is literal and
+// cannot become executable tool markup. This is a deterministic tool-safety rule, not
+// complete CommonMark parsing.
 class ToolCallEntryScanner {
 public:
     ToolCallEntryScanner(ToolCallSyntaxMode syntax, ToolCallIntentPolicy intent);
@@ -143,7 +164,7 @@ public:
         return indent_shadow_.complete();
     }
     // True while the pre-latch stream ended inside a recognized unclosed fence.
-    [[nodiscard]] bool ended_in_unclosed_fence() const noexcept { return fence_.open(); }
+    [[nodiscard]] bool ended_in_unclosed_fence() const noexcept { return fence_.open_at_end(); }
 
 private:
     // One marker-machine byte; true on trigger. R3-05: a NotMarker result publishes the
@@ -194,13 +215,15 @@ private:
 // over an adversarial marker-dense single line).
 //
 // A physical line begins at the stream start or at the byte immediately after an LF; a CR
-// never starts a new physical line by itself (R11-I1). A candidate marker is classified as
-// an indented literal entry exactly when (R11-I2):
-//   * its opening '<' is the first non-formatting byte of the physical line (any other
-//     byte before it on the line disqualifies it), and
-//   * the visual indentation before the '<' is at least four columns: a space advances one
-//     column, a tab to the next 4-column stop (next_tab_stop, the Round-10 rule), a CR
-//     advances none. Columns 0-3 remain eligible.
+// never starts a new physical line by itself (R11-I1). The Round-10 indented-literal rule,
+// refined by R13-01 to a whole-line rule, classifies a candidate marker as an indented
+// literal entry exactly when:
+//   * the line's first non-formatting byte arrives at visual indentation column 4 or
+//     greater (a space advances one column, a tab to the next 4-column stop
+//     (next_tab_stop, the Round-10 rule), a CR advances none), and
+//   * the marker's '<' sits at or after the line's first non-formatting byte — every
+//     marker on such a line, including one preceded by text on that line, is literal.
+// A line whose first non-formatting byte sits at columns 0-3 stays fully eligible.
 // Fence precedence (R11-I4) is the caller's: a candidate inside a recognized fence is
 // fence-suppressed and must not be classified or counted here.
 class ToolCallLineIndentationScan {

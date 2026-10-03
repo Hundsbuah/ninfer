@@ -85,7 +85,12 @@ of breaking it.
 Pre-latch content is scanned by a line-oriented fence tracker (a practical CommonMark
 subset): a run of at least three backticks or tildes at the start of a line (up to three
 spaces of indentation) opens a fence, and only a run of the same character of at least the
-opener's length, alone on its line, closes it. Inside a recognized fence the bytes are
+opener's length, alone on its line, closes it. A fence opened on a list-item line (0-3
+spaces, then an unordered marker `-`, `+`, or `*` or an ordered marker of 1-9 digits ending
+in `.` or `)`, then 1-4 spaces, then the run) opens the fence exactly like a top-level run
+and closes only on a line indented at least to the list prefix width (a run at smaller
+indentation is fence content, matching how CommonMark renders the example inside the list
+item). Inside a recognized fence the bytes are
 ordinary content and never enter the marker candidate machine, so a complete tool marker
 written inside a fenced code block of final content cannot latch as a structured call. An
 unclosed fence stays open to the end of the input (suppression is the safe direction). The
@@ -101,10 +106,10 @@ the region is returned as text, the region's own unclosed fence state.
 
 ## Indented literal lines
 
-Before a tool entry has latched, a possible tool marker that begins a physical line at
-visual indentation of four columns or more is classified as **literal content** and cannot
-become executable tool markup. This is a deterministic tool-safety rule, not complete
-CommonMark parsing:
+Before a tool entry has latched, a physical line whose first non-formatting byte is at
+visual indentation of four columns or more is classified as **literal content**: every
+marker on that line (whether it begins the line or not) cannot become executable tool
+markup. This is a deterministic tool-safety rule, not complete CommonMark parsing:
 
 - Visual columns count the line's leading indentation only: a space is one column, a
   tab the next multiple of four (a tab at column 0, 1, 2, or 3 lands on column 4), and a
@@ -119,12 +124,14 @@ CommonMark parsing:
   publication, and never enters the marker candidate machine. A marker line indented inside
   a latched region's parameter value is parsed by the wire grammar and preserved byte-exact
   (it is value payload, not an entry).
-- The same rule applies to recovery retry/rebase entries: a marker may not become
-  executable merely because the recovery search found it instead of the initial entry
-  scanner. A retry candidate's physical line can begin in the pre-latch content, so the
-  classification is computed over the full logical text (pre-latch plus region); a candidate
-  embedded in an open value's payload is not an entry (the value bytes are the wire
-  parser's), so the rule does not apply to it. Each skipped candidate is counted once.
+- The same whole-line rule applies to recovery retry/rebase entries (R13-01): every marker
+  on a literal line is literal at entry and on retry, including one preceded by text on that
+  line — a marker may not become executable merely because the recovery search found it
+  instead of the initial entry scanner. A retry candidate's physical line can begin in the
+  pre-latch content, so the classification is computed over the full logical text (pre-latch
+  plus region); a candidate embedded in an open value's payload is not an entry (the value
+  bytes are the wire parser's), so the rule does not apply to it. Each skipped candidate is
+  counted once.
 - Fence classification has precedence: a byte the fence tracker owns is fed to the fence
   shadow, never to the indentation shadow, so a marker on an indented line inside a
   recognized fence is counted as fence-suppressed only, never double-counted.
@@ -151,13 +158,22 @@ for content after complete calls, `UndeclaredTool` for a name outside the declar
 Tolerant (`--tolerant-tool-calls`): commits only calls whose function close has been
 consumed. A call whose function close was not consumed is never executable, whatever its
 parameter values show: the function close is the executability boundary, not the value
-close. Complete calls before a later broken call, and a function-closed final call cut
-before its wrapper close, are retained with a `truncated_tail` diagnostic after a natural
-stop (StopToken, or no reported reason); after a cut (OutputLimit, StopString,
-ContextCapacity, Cancelled), a definitive break leaves nothing committable behind it, so a
-region with a suffix or trailing content is returned as text and only a region whose
-completion is clean is committed. A name-only
-truncation (no closed parameter and no function close) still falls back to text.
+close. The recovery decision commits by the region outcome and the finish reason:
+
+| Region outcome | Finish reason | Commits |
+|---|---|---|
+| `Complete` | any | all calls |
+| `EndOfInput` (cut inside a later call, partial wrapper or closer, missing wrapper close) | any | all function-closed calls (`truncated_tail`); none when no function-closed call stands |
+| `Definitive`, no committed call has parameters | any | the committed calls |
+| `Definitive`, a committed call has parameters | `StopToken` (or no reported reason) and no parameter closer after the break | the committed calls |
+| `Definitive`, a committed call has parameters | `StopString`, `OutputLimit`, `ContextCapacity`, `Cancelled`, or a parameter closer after the break | nothing (the region is text) |
+| empty `<function_calls>` wrapper | any | nothing |
+
+A parameterized call is committed after a definitive break only when the stream ended
+naturally and the tail after the break carries no `</parameter>`/`</param>` closer (a later
+closer could have extended the committed value); a parameterless call cannot be extended and
+commits unchanged. A name-only truncation (no closed parameter and no function close) still
+falls back to text.
 An undeclared name is a break in tolerant mode as in strict mode: identity is not a syntax
 issue that tolerance repairs, so an undeclared call is never emitted in either mode
 (`UndeclaredTool`). The empty `<function_calls>` wrapper is unrecoverable in both modes;

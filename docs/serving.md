@@ -293,20 +293,36 @@ executable top-level entry is the wrapped `<tool_call>` form, while `<function_c
 restores the wider historical entry set). Strict and tolerant parsing run the same
 Stage-2 consistent-completion pass; tolerant mode only changes what a syntax break or a cut-off tail
 may commit, and it never authorizes a tool name outside the declared tools — an undeclared call is a
-break in both modes and is never returned as a structured call. With `--tolerant-tool-calls` a
-complete, function-closed call before a malformed tail is recovered when the recovery policy proves
-it independent of the missing bytes: a suffix after a complete call, a malformed second call, or a
-missing closing bracket after the function name. `StopString`, `OutputLimit`, `ContextCapacity`, and
-`Cancelled` are deliberate cuts: after one, only a completion that is clean on its own commits, and a
-broken tail leaves the region as text. A natural stop (`StopToken`, or no reported reason) may commit
-a function-closed final call cut before its wrapper close, reported with a `truncated_tail`
-diagnostic (logged at Info severity) rather than demoted to text.
+break in both modes and is never returned as a structured call.
+
+With `--tolerant-tool-calls` the recovery decision commits by the region outcome and the
+finish reason:
+
+| Region outcome | Finish reason | Commits |
+|---|---|---|
+| `Complete` | any | all calls |
+| `EndOfInput` (cut inside a later call, partial wrapper or closer, missing wrapper close) | any | all function-closed calls, with a `truncated_tail` diagnostic; none when no function-closed call stands |
+| `Definitive`, no committed call has parameters | any | the committed calls |
+| `Definitive`, a committed call has parameters | `StopToken` (or no reported reason) and no parameter closer after the break | the committed calls |
+| `Definitive`, a committed call has parameters | `StopString`, `OutputLimit`, `ContextCapacity`, `Cancelled`, or a parameter closer after the break | nothing (the region is text) |
+| empty `<function_calls>` wrapper | any | nothing |
+
+A call whose function close was not consumed is never committed, and an open parameter value
+never contributes bytes. A parameterized call is committed after a definitive break only when
+the stream ended naturally and the tail after the break carries no parameter closer (a later
+closer could have extended the committed value); a parameterless call cannot be extended and
+commits unchanged. The tolerant truncation is reported with a `truncated_tail` diagnostic
+(logged at Info severity) rather than demoted to text. Whenever the finish reason is
+`OutputLimit` or `ContextCapacity`, Chat Completions reports `length`, Anthropic Messages
+reports `max_tokens` or `model_context_window_exceeded`, and Responses reports `incomplete` —
+even when calls commit.
+
 A server can additionally select `--tool-call-intent start-of-content`: a top-level tool region stays eligible only while the output remains a structured tool sequence — the first entry must start at content start (after formatting whitespace), directly consecutive wrappers (separated by formatting whitespace only) stay eligible, and any visible content byte committed at any point — before the first entry or after a completed call — locks the turn to text and makes later tool markup content (Round 8 R8-01: the first latch is not permanent permission, and the grammar constraint agrees with this gate; reasoning-channel text does not count — it never reaches the tool-call scanner). The mode is an NInfer agent-hardening extension, stricter than the upstream Qwen template contract (which permits natural-language text before a function call), and it is a separate dimension from `--tool-call-syntax`, `--tolerant-tool-calls`, and `--tool-call-ambiguity`. It reduces the prose-prefixed unfenced quotation class; a complete declared unfenced call with no preceding content is still indistinguishable from a genuine action on the wire bytes (`docs/tool_call_parser.md`, semantic quotation residual).
 The intent policy and the prompt template are separate dimensions. `--tool-call-intent`
 controls parser execution semantics; the chat template controls what the model is prompted
 to emit. The maintained local template `tools/chat_templates/qwen3_8.jinja` carries the
-upstream-compatible preamble wording (optional natural-language reasoning BEFORE the
-function call), so selecting `start-of-content` changes the parser without changing the
+upstream preamble (optional natural-language reasoning BEFORE the function call, but NOT
+after), so selecting `start-of-content` changes the parser without changing the
 prompt. The hardened variant `tools/chat_templates/qwen3_8_hardened_tools.jinja`
 instructs the model to emit the `<tool_call>` block at the content start and to keep all
 reasoning in the reasoning channel. For the strictest OMP profile, enable both (`--tool-call-intent`
@@ -1037,7 +1053,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--tolerant-tool-calls` | keep function-closed Qwen calls before a cut-off or malformed tail when the recovery policy proves them independent of the missing bytes; never an open value, and an undeclared tool/name is never returned as a call | off |
 | `--tool-call-syntax` | top-level tool-call syntax: `qwen-wrapped` (default; latches only the wrapped `<tool_call>` entry) or `compat` (also accepts the legacy bare `<function=...>`/`<invoke=...>` and `<function_calls>` top-level entries) | `qwen-wrapped` |
 | `--tool-call-ambiguity` | ambiguous-byte protocol policy for tool-call regions: `fail-closed` (default; a Stage-2 value boundary whose closer chain stands while an earlier closer chain had already formed a complete call is refused — the region is returned as text with the `ambiguous_structure` fallback reason, no call executes) or `payload-fidelity` (the later closing chain wins and embedded tool markup in a string value stays byte-exact; the known R1 phantom-acceptance class stays executable) | `fail-closed` |
-| `--tool-call-intent` | tool-call intent policy: `template-compatible` (default; a tool region may latch after any content, as the upstream Qwen template permits natural-language text before a function call) or `start-of-content` (agent-hardening mode, stricter than the upstream template: a tool region may latch only while every emitted Content byte is formatting whitespace — reasoning-channel text does not count; once visible content commits, the turn is locked to text and later tool markup is content). Reduces the prose-prefixed unfenced tool-call quotation class; a byte-identical example-only output remains executable (see the parser docs, semantic quotation residual) The matching prompt-side hardening is the explicit template `tools/chat_templates/qwen3_8_hardened_tools.jinja`; the maintained `qwen3_8.jinja` keeps the upstream-compatible preamble wording, so the parser policy and the prompt policy are independent. | `template-compatible` |
+| `--tool-call-intent` | tool-call intent policy: `template-compatible` (default; a tool region may latch after any content, as the upstream Qwen template permits natural-language text before a function call) or `start-of-content` (agent-hardening mode, stricter than the upstream template: a tool region may latch only while every emitted Content byte is formatting whitespace — reasoning-channel text does not count; once visible content commits, the turn is locked to text and later tool markup is content). Reduces the prose-prefixed unfenced tool-call quotation class; a byte-identical example-only output remains executable (see the parser docs, semantic quotation residual) The matching prompt-side hardening is the explicit template `tools/chat_templates/qwen3_8_hardened_tools.jinja`; the maintained `qwen3_8.jinja` carries the upstream preamble wording (optional natural-language reasoning BEFORE the function call, but NOT after), so the parser policy and the prompt policy are independent. | `template-compatible` |
 | `--cors` | permissive browser CORS headers | off |
 | `--usage-chunk-choice` | give the streamed usage chunk a zero-delta choice, for strict client parsers that reject the OpenAI-conformant empty `choices` array | off |
 | `--temperature F` | process-level temperature override | unset |

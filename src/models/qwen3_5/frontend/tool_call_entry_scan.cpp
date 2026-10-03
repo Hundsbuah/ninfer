@@ -11,14 +11,19 @@ ToolCallFenceTracker::Verdict ToolCallFenceTracker::consume(char byte) noexcept 
         // LF-only framing both keep the close valid. The opener line never closes the fence.
         if (in_fence_ && !opener_line_ && close_ok_ &&
             (phase_ == Phase::LineRun || phase_ == Phase::LineTail) && run_len_ >= fence_len_) {
-            in_fence_  = false;
+            in_fence_ = false;
             fence_len_ = 0;
+            fence_min_close_indent_ = 0; // R13-10: the close releases the list indent rule
         }
         opener_line_ = false;
         close_ok_    = false;
         run_len_     = 0;
         indent_      = 0;
         phase_       = Phase::LineIndent;
+        // R13-10: the list-item opener state belongs to one line only.
+        list_width_  = 0;
+        gap_         = 0;
+        list_opener_ = false;
         return in_fence_ ? Verdict::Content : Verdict::Pass;
     }
     if (!in_fence_) {
@@ -36,6 +41,58 @@ ToolCallFenceTracker::Verdict ToolCallFenceTracker::consume(char byte) noexcept 
                 run_len_  = 1;
                 return Verdict::Content;
             }
+            // R13-10: a list-item marker (unordered `-`/`+`/`*` or ordered 1-9 digits
+            // ending in `.`/`)`) after 0-3 spaces may start a fence run.
+            if (byte == '-' || byte == '+' || byte == '*') {
+                list_width_ = 1;
+                phase_      = Phase::ListMarker;
+                return Verdict::Pass;
+            }
+            if (byte >= '0' && byte <= '9') {
+                list_width_ = 1;
+                phase_      = Phase::ListOrdinal;
+                return Verdict::Pass;
+            }
+            phase_ = Phase::LineBody;
+            return Verdict::Pass;
+        }
+        if (phase_ == Phase::ListOrdinal) {
+            if (byte >= '0' && byte <= '9' && list_width_ < 9) {
+                ++list_width_;
+            } else if (byte == '.' || byte == ')') {
+                ++list_width_;
+                phase_ = Phase::ListMarker;
+                return Verdict::Pass;
+            } else {
+                phase_ = Phase::LineBody;
+                return Verdict::Pass;
+            }
+            return Verdict::Pass;
+        }
+        if (phase_ == Phase::ListMarker) {
+            if (byte == ' ') {
+                gap_   = 1;
+                phase_ = Phase::ListGap;
+            } else {
+                phase_ = Phase::LineBody;
+            }
+            return Verdict::Pass;
+        }
+        if (phase_ == Phase::ListGap) {
+            if (byte == ' ' && gap_ < 4) {
+                ++gap_;
+                return Verdict::Pass;
+            }
+            if (byte == '`' || byte == '~') {
+                // The list prefix (spaces + marker + gap) becomes the fence indentation:
+                // W is recorded as fence_indent_ when the run reaches three.
+                indent_      += list_width_ + gap_;
+                list_opener_  = true;
+                phase_        = Phase::LineRun;
+                run_char_     = byte;
+                run_len_      = 1;
+                return Verdict::Content;
+            }
             phase_ = Phase::LineBody;
             return Verdict::Pass;
         }
@@ -49,7 +106,10 @@ ToolCallFenceTracker::Verdict ToolCallFenceTracker::consume(char byte) noexcept 
                     fence_char_   = byte;
                     fence_len_    = 3;
                     fence_indent_ = indent_;
-                    opener_line_  = true;
+                    // R13-10: a list-item fence only closes on a line indented at least to
+                    // the list prefix width; a top-level fence keeps the minimum at 0.
+                    fence_min_close_indent_ = list_opener_ ? indent_ : 0;
+                    opener_line_            = true;
                 }
                 return Verdict::Content;
             }
@@ -72,8 +132,8 @@ ToolCallFenceTracker::Verdict ToolCallFenceTracker::consume(char byte) noexcept 
             // fence (CommonMark). Cancel the opener; the line is ordinary content from here.
             in_fence_    = false;
             fence_len_   = 0;
+            fence_min_close_indent_ = 0; // R13-10: the cancel releases the list indent rule
             opener_line_ = false;
-            phase_       = Phase::LineBody;
             return Verdict::Pass;
         }
         return Verdict::Content; // the info string
@@ -89,7 +149,9 @@ ToolCallFenceTracker::Verdict ToolCallFenceTracker::consume(char byte) noexcept 
             phase_    = Phase::LineRun;
             run_char_ = byte;
             run_len_  = 1;
-            close_ok_ = true;
+            // R13-10: a list-item fence only closes on a line indented at least to the
+            // list prefix width (fence_min_close_indent_); top-level fences keep 0.
+            close_ok_ = indent_ >= fence_min_close_indent_;
             return Verdict::Content;
         }
         phase_ = Phase::LineBody;
@@ -106,6 +168,15 @@ ToolCallFenceTracker::Verdict ToolCallFenceTracker::consume(char byte) noexcept 
         return Verdict::Content;
     }
     return Verdict::Content; // LineBody
+}
+
+bool ToolCallFenceTracker::open_at_end() const noexcept {
+    // R13-09: the same condition the LF close rule applies when the closing line arrives —
+    // evaluated on the final unterminated line, so a fence whose closing run is the last
+    // thing in the stream counts as closed.
+    const bool closing_line = !opener_line_ && close_ok_ &&
+        (phase_ == Phase::LineRun || phase_ == Phase::LineTail) && run_len_ >= fence_len_;
+    return in_fence_ && !closing_line;
 }
 
 void ToolCallShadowMarkerScan::consume(char byte) {
@@ -275,21 +346,28 @@ ToolCallEntryScanner::FeedResult ToolCallEntryScanner::feed(std::string_view byt
             continue;
         }
         if (literal_line_) {
-            // R10-01: an indented literal line (first meaningful byte at visual column
-            // >= 4): every byte of the line through the LF is ordinary content — the held
-            // indentation is published (not trimmed, R10 §5.4), no marker may latch, and
-            // the indented shadow counts the suppressed markers.
-            out.visible += held_ws_;
-            held_ws_.clear();
+            // R10-01 (whole-line rule per R13-01) + R13-08: an indented literal line
+            // (first non-formatting byte at visual column >= 4): every byte of the line
+            // through the LF is ordinary content — no marker may latch, and the indented
+            // shadow counts the suppressed markers. Formatting whitespace is held like any
+            // other pre-latch whitespace (R13-08): the one-shot entry rtrims the
+            // whitespace before an accepted region, so the streamed path must not publish
+            // it early; a terminal held tail is published at finish.
             if (!candidate_.empty()) {
                 // Cannot happen (a candidate never straddles a line start: a newline inside
                 // a candidate is a NotMarker break), but the funnel stays safe.
                 out.visible += candidate_;
                 candidate_.clear();
             }
+            indent_shadow_.consume(byte);
+            if (is_tool_format_whitespace(byte)) {
+                held_ws_.push_back(byte); // held: may precede a latch
+                continue;
+            }
+            out.visible += held_ws_;
+            held_ws_.clear();
             out.visible.push_back(byte);
             lock_if_visible(std::string_view(&byte, 1));
-            indent_shadow_.consume(byte);
             continue;
         }
         if (marker_byte(byte, out.visible, out.region_prefix)) {
@@ -356,7 +434,11 @@ bool ToolCallLineIndentationScan::marker_is_indented_literal(std::size_t marker_
         [](std::size_t value, const Line& line) { return value < line.start; });
     if (it == lines_.begin()) { return false; }
     const Line& line = *std::prev(it);
-    return full_m == line.first_nonspace && line.column_at_first >= 4;
+    // R13-01 (whole-line rule): the marker is literal when its line's first non-formatting
+    // byte sat at visual column >= 4 — every marker on such a line, including one preceded
+    // by text on that line (full_m past first_nonspace), is literal. A whitespace-only line
+    // has first_nonspace at the line end, so no marker can satisfy full_m >= it.
+    return full_m >= line.first_nonspace && line.column_at_first >= 4;
 }
 
 } // namespace ninfer::models::qwen3_5::frontend

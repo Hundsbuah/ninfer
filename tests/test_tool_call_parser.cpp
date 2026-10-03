@@ -3258,6 +3258,503 @@ int test_r13_03_tolerant_recovered_parity() {
     return failures;
 }
 
+// R13-01 (spec J): the retry/rebase candidate uses the same whole-line indented-literal rule
+// as the entry scanner. Contract: get_weather(city: string).
+namespace r13_01 {
+
+using Reason = ninfer::ToolCallParseFallbackReason;
+
+fi::ParsedToolCallOutput
+parse_strict(const std::string& text,
+             const fi::ToolCallOutputContract& contract) {
+    return fi::parse_qwen_tool_call_output(
+        text, 64, contract, false, ninfer::FinishReason::StopToken,
+        ninfer::ToolCallSyntaxMode::QwenWrappedNative,
+        ninfer::ToolCallAmbiguityPolicy::FailClosed,
+        ninfer::ToolCallIntentPolicy::TemplateCompatible);
+}
+
+fi::ParsedToolCallOutput
+parse_tolerant(const std::string& text,
+               const fi::ToolCallOutputContract& contract) {
+    return fi::parse_qwen_tool_call_output(
+        text, 64, contract, true, ninfer::FinishReason::StopToken,
+        ninfer::ToolCallSyntaxMode::QwenWrappedNative,
+        ninfer::ToolCallAmbiguityPolicy::FailClosed,
+        ninfer::ToolCallIntentPolicy::TemplateCompatible);
+}
+
+// Every one-shot / single-split / bytewise / 200 random chunked (sizes 1-7) decode of TEXT
+// must equal the one-shot PARSE in calls, Content and the full diagnostics record.
+int check_partitions(const std::string& text, const fi::ParsedToolCallOutput& parsed,
+                     std::shared_ptr<const fi::ToolCallOutputContract> contract_ptr,
+                     bool tolerant) {
+    int failures = 0;
+    const auto stream = [&](const auto& feeds) {
+        fi::ToolCallOutputDecoder decoder(
+            contract_ptr, 64, tolerant, ninfer::ToolCallSyntaxMode::QwenWrappedNative,
+            ninfer::ToolCallAmbiguityPolicy::FailClosed,
+            ninfer::ToolCallIntentPolicy::TemplateCompatible);
+        std::string visible;
+        for (const auto& feed : feeds) { visible += decoder.feed(feed); }
+        const auto terminal = decoder.finish(ninfer::FinishReason::StopToken);
+        return std::make_tuple(visible + terminal.content, terminal.tool_calls,
+                               terminal.diagnostics);
+    };
+    std::vector<std::vector<std::string_view>> partitions;
+    partitions.push_back({std::string_view(text)});
+    for (std::size_t split = 0; split <= text.size(); ++split) {
+        partitions.push_back(
+            {std::string_view(text).substr(0, split), std::string_view(text).substr(split)});
+    }
+    // 200 deterministic pseudo-random partitions with chunk sizes 1-7.
+    std::uint32_t state = 0x9e3779b9U;
+    for (int run = 0; run < 200; ++run) {
+        std::vector<std::string_view> pieces;
+        std::size_t at = 0;
+        while (at < text.size()) {
+            state = state * 1664525U + 1013904223U;
+            const std::size_t size =
+                std::min<std::size_t>(1 + (state >> 8) % 7, text.size() - at);
+            pieces.push_back(std::string_view(text).substr(at, size));
+            at += size;
+        }
+        partitions.push_back(std::move(pieces));
+    }
+    for (const auto& pieces : partitions) {
+        const auto [content, calls, diagnostics] = stream(pieces);
+        failures += check(
+            same_tool_calls(calls, parsed.tool_calls) && content == parsed.content &&
+                diagnostics == parsed.diagnostics,
+            "R13-01 parity: a partition diverged from one-shot (calls, content, diagnostics)");
+    }
+    return failures;
+}
+
+} // namespace r13_01
+
+// J1 (reproducer): a prose <tool_call> mention fails the first latch; the complete call in
+// the indented example is preceded by "Assistant:" on its line — literal at entry and on
+// retry, so nothing executes and the skip is counted exactly once.
+int test_r13_01_indented_prose_marker_not_retry_base() {
+    using r13_01::check_partitions;
+    using r13_01::parse_strict;
+    using r13_01::Reason;
+    using r13_01::parse_tolerant;
+    int failures = 0;
+    const auto contract =
+        contract_for("get_weather", Json{{"city", Json{{"type", "string"}}}});
+    const auto contract_ptr =
+        output_contract_for("get_weather", Json{{"city", Json{{"type", "string"}}}});
+    const std::string text =
+        "Wrap every call in the <tool_call> element. An example turn, shown as an indented "
+        "code block:\n"
+        "\n"
+        "    Assistant: <tool_call>\n"
+        "    <function=get_weather>\n"
+        "    <parameter=city>\n"
+        "    Paris\n"
+        "    </parameter>\n"
+        "    </function>\n"
+        "    </tool_call>\n";
+    const auto parsed = parse_strict(text, contract);
+    failures += check(!parsed.is_tool_call_response && parsed.tool_calls.empty(),
+                      "R13-01 J1: the indented prose-preceded marker executed on retry");
+    failures += check(parsed.content == text,
+                      "R13-01 J1: the input was not returned verbatim as content");
+    failures += check(parsed.diagnostics.marker_seen,
+                      "R13-01 J1: the prose marker was not reported seen");
+    failures += check(parsed.diagnostics.fallback_reason == Reason::MalformedStructure,
+                      "R13-01 J1: the first attempt's failure class was lost");
+    failures += check(parsed.diagnostics.indented_markers_suppressed == 1,
+                      "R13-01 J1: the skipped retry candidate was not counted exactly once");
+    failures += check_partitions(text, parsed, contract_ptr, false);
+    // J6: tolerant mode applies the same entry/retry literal classification.
+    const auto tolerant = parse_tolerant(text, contract);
+    failures += check(!tolerant.is_tool_call_response && tolerant.tool_calls.empty(),
+                      "R13-01 J6: tolerant mode executed the indented prose-preceded marker");
+    failures += check(tolerant.content == text,
+                      "R13-01 J6: the tolerant fallback was not byte-exact");
+    return failures;
+}
+
+// J2: the TAB variant — a tab-indented example whose marker line is "\tsee <tool_call>".
+int test_r13_01_tab_indented_prose_marker() {
+    using r13_01::check_partitions;
+    using r13_01::parse_strict;
+    int failures = 0;
+    const auto contract =
+        contract_for("get_weather", Json{{"city", Json{{"type", "string"}}}});
+    const auto contract_ptr =
+        output_contract_for("get_weather", Json{{"city", Json{{"type", "string"}}}});
+    const std::string text =
+        "Wrap every call in the <tool_call> element. An example turn, shown indented:\n"
+        "\n"
+        "\tsee <tool_call>\n"
+        "\t<function=get_weather>\n"
+        "\t<parameter=city>\n"
+        "\tParis\n"
+        "\t</parameter>\n"
+        "\t</function>\n"
+        "\t</tool_call>\n";
+    const auto parsed = parse_strict(text, contract);
+    failures += check(!parsed.is_tool_call_response && parsed.tool_calls.empty(),
+                      "R13-01 J2: the TAB-indented prose-preceded marker executed on retry");
+    failures += check(parsed.content == text,
+                      "R13-01 J2: the input was not returned verbatim as content");
+    failures += check(parsed.diagnostics.indented_markers_suppressed == 1,
+                      "R13-01 J2: the skipped retry candidate was not counted exactly once");
+    failures += check_partitions(text, parsed, contract_ptr, false);
+    return failures;
+}
+
+// J3 (positive control): the same example at three columns keeps its baseline eligibility —
+// the retry base executes.
+int test_r13_01_three_column_control_still_recovers() {
+    using r13_01::check_partitions;
+    using r13_01::parse_strict;
+    int failures = 0;
+    const auto contract =
+        contract_for("get_weather", Json{{"city", Json{{"type", "string"}}}});
+    const auto contract_ptr =
+        output_contract_for("get_weather", Json{{"city", Json{{"type", "string"}}}});
+    const std::string call = tool_call("get_weather", {{"city", "Paris"}});
+    const std::string text =
+        "Wrap every call in the <tool_call> element. An example turn:\n"
+        "\n"
+        "   Assistant: " +
+        call + "\n";
+    const auto parsed = parse_strict(text, contract);
+    failures += check(parsed.is_tool_call_response && parsed.tool_calls.size() == 1 &&
+                          parsed.tool_calls.front().name == "get_weather" &&
+                          parsed.tool_calls.front().arguments_json ==
+                              Json{{"city", "Paris"}}.dump(),
+                      "R13-01 J3: the three-column retry base did not execute");
+    failures += check(parsed.content ==
+                          "Wrap every call in the <tool_call> element. An example turn:\n"
+                          "\n"
+                          "   Assistant:",
+                      "R13-01 J3: the content before the retry base was wrong");
+    failures += check(parsed.diagnostics.indented_markers_suppressed == 0,
+                      "R13-01 J3: an eligible candidate was counted as indented");
+    failures += check_partitions(text, parsed, contract_ptr, false);
+    return failures;
+}
+
+// J4 (positive control): the R11 G shape — prose on the same column-0 line keeps the marker
+// eligible.
+int test_r13_01_column_zero_prose_recovers() {
+    using r13_01::check_partitions;
+    using r13_01::parse_strict;
+    int failures = 0;
+    const auto contract =
+        contract_for("get_weather", Json{{"city", Json{{"type", "string"}}}});
+    const auto contract_ptr =
+        output_contract_for("get_weather", Json{{"city", Json{{"type", "string"}}}});
+    const std::string call = tool_call("get_weather", {{"city", "Paris"}});
+    const std::string text =
+        "<tool_call>\nordinary prose\n</tool_call>\nrecovery " + call;
+    const auto parsed = parse_strict(text, contract);
+    failures += check(parsed.is_tool_call_response && parsed.tool_calls.size() == 1 &&
+                          parsed.tool_calls.front().name == "get_weather",
+                      "R13-01 J4: the column-0 prose-preceded marker did not execute");
+    failures += check(parsed.diagnostics.indented_markers_suppressed == 0,
+                      "R13-01 J4: a column-0 line was classified literal");
+    failures += check_partitions(text, parsed, contract_ptr, false);
+    return failures;
+}
+
+// J5 (equivalence): for every prefix, the verdict of "prefix + call" alone (entry
+// classification) equals the verdict of a failed first latch followed by the same line
+// (retry classification).
+int test_r13_01_entry_retry_agreement() {
+    using r13_01::parse_strict;
+    int failures = 0;
+    const auto contract =
+        contract_for("get_weather", Json{{"city", Json{{"type", "string"}}}});
+    const std::string call = tool_call("get_weather", {{"city", "Paris"}});
+    for (const std::string& prefix : {"    x ", "\tx ", "  \tx ", "    ", "   x ", "x "}) {
+        const auto entry = parse_strict(prefix + call, contract);
+        const std::string retry_text = "The <tool_call> tag:\n" + prefix + call;
+        const auto retry = parse_strict(retry_text, contract);
+        failures += check(entry.is_tool_call_response == retry.is_tool_call_response &&
+                              same_tool_calls(entry.tool_calls, retry.tool_calls),
+                          (std::string("R13-01 J5: entry and retry verdicts diverged for prefix ") +
+                           prefix).c_str());
+    }
+    return failures;
+}
+
+// R13-08 (spec J): the trailing formatting whitespace of an indented literal line is held
+// like on every other pre-latch path, so the streaming Content equals the one-shot entry's
+// rtrimmed Content (P1) instead of carrying the line's trailing spaces/CR/TAB.
+int test_r13_08_literal_line_trailing_whitespace_parity() {
+    using r13_01::check_partitions;
+    using r13_01::parse_strict;
+    int failures = 0;
+    const auto contract =
+        contract_for("get_weather", Json{{"city", Json{{"type", "string"}}}});
+    const auto contract_ptr =
+        output_contract_for("get_weather", Json{{"city", Json{{"type", "string"}}}});
+    const std::string call = tool_call("get_weather", {{"city", "Paris"}});
+
+    // The literal line's trailing whitespace (spaces, CR, TAB, an extra blank line) must
+    // not reach the Content when a call follows.
+    for (const std::string& literal_tail : {"    code  \n", "    code\r\n", "    code\t\n\n"}) {
+        const std::string text = literal_tail + call;
+        const auto parsed = parse_strict(text, contract);
+        failures += check(parsed.is_tool_call_response && parsed.tool_calls.size() == 1 &&
+                              parsed.tool_calls.front().name == "get_weather",
+                          "R13-08: the call after the literal line did not execute");
+        failures += check(parsed.content == "    code",
+                          "R13-08: the literal line's trailing whitespace leaked into the "
+                          "one-shot Content");
+        failures += check_partitions(text, parsed, contract_ptr, false);
+    }
+    // Without a following call the Content is byte-exact (the held whitespace is published
+    // by the next visible byte or by the terminal held tail).
+    for (const std::string& text : {"    code  \nplain text", "    code  "}) {
+        const auto parsed = parse_strict(text, contract);
+        failures += check(!parsed.is_tool_call_response && parsed.tool_calls.empty() &&
+                              parsed.content == text,
+                          "R13-08: the fallback Content was not byte-exact");
+        failures += check_partitions(text, parsed, contract_ptr, false);
+    }
+    return failures;
+}
+
+// R13-09 (spec I/J): a fence closed by its final line without a trailing LF is a closed
+// fence — the unclosed-fence diagnostic (and the serve warning built on it) must not fire
+// for a properly closed fenced example at end of stream.
+int test_r13_09_fence_closed_at_eof() {
+    using r13_01::check_partitions;
+    using r13_01::parse_strict;
+    int failures = 0;
+    const auto contract =
+        contract_for("get_weather", Json{{"city", Json{{"type", "string"}}}});
+    const auto contract_ptr =
+        output_contract_for("get_weather", Json{{"city", Json{{"type", "string"}}}});
+    const std::string call = tool_call("get_weather", {{"city", "Paris"}});
+    const std::vector<std::pair<std::string, bool>> cases = {
+        {"```\n" + call + "\n```", false},        // closed at EOF
+        {"```\n" + call + "\n```  ", false},       // trailing spaces keep the close valid
+        {"```\n" + call + "\n``` y", true},        // a visible byte after the run: open
+        {"````\n" + call + "\n```", true},         // shorter run than the opener: open
+        {"~~~\n" + call + "\n```", true},          // different character: open
+        {"```\n" + call + "\n```\r", false},       // CRLF-framed close line at EOF: closed
+    };
+    for (const auto& [text, expected_unclosed] : cases) {
+        const auto parsed = parse_strict(text, contract);
+        failures += check(!parsed.is_tool_call_response && parsed.tool_calls.empty(),
+                          "R13-09: a call inside a recognized fence executed");
+        failures += check(parsed.content == text,
+                          "R13-09: the fenced input was not returned verbatim");
+        failures += check(parsed.diagnostics.fenced_markers_suppressed == 1,
+                          "R13-09: the suppressed in-fence marker was not counted exactly "
+                          "once");
+        failures += check(parsed.diagnostics.ended_in_unclosed_fence == expected_unclosed,
+                          (std::string("R13-09: the fence closed at EOF reported the wrong "
+                                       "unclosed state for ") +
+                           text)
+                              .c_str());
+        failures += check_partitions(text, parsed, contract_ptr, false);
+    }
+    return failures;
+}
+
+// R13-10 (spec J): fences opened on a list-item line are recognized; their examples never
+// execute (strict and tolerant), and the controls keep their verdicts. Case 3 is the
+// intended recovery increase: at HEAD the "  ```" line opened a new top-level fence that
+// suppressed the column-0 call; after the fix the list fence closes there.
+int test_r13_10_list_item_fences() {
+    using r13_01::check_partitions;
+    using r13_01::parse_strict;
+    using r13_01::parse_tolerant;
+    int failures = 0;
+    const auto contract =
+        contract_for("get_weather", Json{{"city", Json{{"type", "string"}}}});
+    const auto contract_ptr =
+        output_contract_for("get_weather", Json{{"city", Json{{"type", "string"}}}});
+    const std::string call = tool_call("get_weather", {{"city", "Paris"}});
+
+    // 1: the verified false-positive shape (ordered list, xml info string, closed).
+    const std::string case1 =
+        "To call the tool:\n1. ```xml\n" + r10_indent_lines(call, "   ") + "\n   ```\n";
+    // 2: unclosed unordered list fence at EOF.
+    const std::string case2 = "- ```\n" + r10_indent_lines(call, "  ");
+    // 3: closed list fence, then a column-0 call (control: the call executes).
+    const std::string case3 = "- ```\n  x\n  ```\n" + call;
+    // 4: a list item without a fence (control: the call executes).
+    const std::string case4 = "- item\n" + call;
+    // 5: no space between marker and run: not a list fence (control: the call executes).
+    const std::string case5 = "-```\n" + call;
+    // 6: a column-0 run below the list prefix width is fence content (the fence stays
+    // open and the call is suppressed).
+    const std::string case6 = "- ```\n  x\n```\n" + call;
+    // 7: the retry variant of case 1 — a failed first latch must not re-admit the fenced
+    // marker (fence precedence on retry).
+    const std::string case7 = "The <tool_call> tag:\n" + case1;
+
+    const std::vector<std::string> no_call_inputs = {case1, case2, case6, case7};
+    for (const bool tolerant : {false, true}) {
+        const auto parse = tolerant ? parse_tolerant : parse_strict;
+        for (const std::string& text : no_call_inputs) {
+            const auto parsed = parse(text, contract);
+            failures += check(!parsed.is_tool_call_response && parsed.tool_calls.empty(),
+                              (std::string("R13-10: the list-item fenced example executed "
+                                           "(tolerant=") +
+                               (tolerant ? "true" : "false") +
+                               ") for input: " + text)
+                                  .c_str());
+            failures += check(parsed.content == text,
+                              "R13-10: the fenced input was not returned verbatim");
+        }
+        const auto p1 = parse(case1, contract);
+        failures += check(p1.diagnostics.fenced_markers_suppressed == 1,
+                          "R13-10: the in-fence marker of case 1 was not counted exactly "
+                          "once");
+        const auto p2 = parse(case2, contract);
+        failures += check(p2.diagnostics.ended_in_unclosed_fence,
+                          "R13-10: the unclosed list fence of case 2 was not reported");
+        failures += check_partitions(case1, p1, contract_ptr, tolerant);
+        failures += check_partitions(case2, p2, contract_ptr, tolerant);
+        failures += check_partitions(case6, parse(case6, contract), contract_ptr, tolerant);
+        failures += check_partitions(case7, parse(case7, contract), contract_ptr, tolerant);
+    }
+    // The controls execute in both modes.
+    for (const bool tolerant : {false, true}) {
+        const auto parse = tolerant ? parse_tolerant : parse_strict;
+        for (const auto& [text, expected_content] :
+                 {std::pair<std::string, std::string>{case3, "- ```\n  x\n  ```"},
+                  {case4, "- item"},
+                  {case5, "-```"}}) {
+            const auto parsed = parse(text, contract);
+            failures += check(parsed.is_tool_call_response && parsed.tool_calls.size() == 1 &&
+                                  parsed.tool_calls.front().name == "get_weather" &&
+                                  parsed.tool_calls.front().arguments_json ==
+                                      Json{{"city", "Paris"}}.dump(),
+                              (std::string("R13-10: the control call did not execute "
+                                           "(tolerant=") +
+                               (tolerant ? "true" : "false") +
+                               ") for input: " + text)
+                                  .c_str());
+            failures += check(parsed.content == expected_content,
+                              "R13-10: the control Content before the call was wrong");
+            failures += check_partitions(text, parsed, contract_ptr, tolerant);
+        }
+    }
+    return failures;
+}
+
+// R13-11 (spec J): the tolerant recovery decision pinned by region outcome and finish
+// reason — one input per decide_tool_call_recovery row under StopToken and OutputLimit.
+// A commit is a tolerant truncation (TruncatedTail); a rejection returns the region as
+// text. The parameterized Definitive row is the reason-dependent one: the natural stop
+// commits, the deliberate cut does not.
+int test_r13_11_tolerant_decision_table() {
+    using r13_01::Reason;
+    int failures = 0;
+    const auto contract =
+        contract_for("get_weather", Json{{"city", Json{{"type", "string"}}}});
+    const std::string call_a = "<tool_call>\n<function=get_weather>\n<parameter=city>\nParis"
+                               "\n</parameter>\n</function>\n</tool_call>";
+
+    struct Case {
+        const char* label;
+        const std::string text;
+        int stop_token_calls;   // committed calls under the natural stop
+        int output_limit_calls; // committed calls under the deliberate cut
+        const char* arguments;  // the committed call's arguments_json
+    };
+    const std::string city_arguments = Json{{"city", "Paris"}}.dump();
+    const std::vector<Case> cases = {
+        // EndOfInput: cut inside a later call's open value.
+        {"EndOfInput cut inside value",
+         call_a + "\n<tool_call>\n<function=get_weather>\n<parameter=city>\nPa", 1, 1,
+         city_arguments.c_str()},
+        // EndOfInput: a partial second wrapper.
+        {"EndOfInput partial wrapper", call_a + "\n<tool_call>", 1, 1, city_arguments.c_str()},
+        // EndOfInput: A's function is closed, its wrapper close is missing.
+        {"EndOfInput missing wrapper close",
+         "<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>",
+         1, 1, city_arguments.c_str()},
+        // Definitive, a committed call has parameters: the natural stop commits, the cut
+        // does not (the tail carries no parameter closer, so only the reason decides).
+        {"Definitive parameterized trailing prose", call_a + "\nDone.", 1, 0,
+         city_arguments.c_str()},
+        // Definitive, no committed call has parameters: both commit.
+        {"Definitive parameterless trailing prose",
+         "<tool_call>\n<function=get_weather>\n</function>\n</tool_call>\nDone.", 1, 1, "{}"},
+    };
+
+    for (const Case& c : cases) {
+        const struct {
+            const char* label;
+            ninfer::FinishReason reason;
+            int calls;
+        } rows[2] = {
+            {"StopToken", ninfer::FinishReason::StopToken, c.stop_token_calls},
+            {"OutputLimit", ninfer::FinishReason::OutputLimit, c.output_limit_calls},
+        };
+        for (const auto& row : rows) {
+            const auto parsed = fi::parse_qwen_tool_call_output(
+                c.text, 64, contract, true, row.reason,
+                ninfer::ToolCallSyntaxMode::QwenWrappedNative,
+                ninfer::ToolCallAmbiguityPolicy::FailClosed,
+                ninfer::ToolCallIntentPolicy::TemplateCompatible);
+            const bool committed = row.calls > 0;
+            failures += check(
+                static_cast<int>(parsed.tool_calls.size()) == row.calls &&
+                    parsed.is_tool_call_response == committed,
+                (std::string("R13-11: ") + c.label + " under " + row.label +
+                 " committed the wrong number of calls (expected " +
+                 std::to_string(row.calls) + ", got " +
+                 std::to_string(parsed.tool_calls.size()) + ")")
+                    .c_str());
+            if (committed) {
+                failures += check(parsed.tool_calls.front().name == "get_weather" &&
+                                      parsed.tool_calls.front().arguments_json == c.arguments,
+                                  (std::string("R13-11: ") + c.label + " under " + row.label +
+                                   " committed the wrong call payload")
+                                      .c_str());
+                failures += check(parsed.diagnostics.fallback_reason == Reason::TruncatedTail,
+                                  (std::string("R13-11: ") + c.label + " under " + row.label +
+                                   " was not reported as a tolerant truncation")
+                                      .c_str());
+            } else {
+                failures += check(parsed.content == c.text,
+                                  (std::string("R13-11: ") + c.label + " under " + row.label +
+                                   " was not returned verbatim as text")
+                                      .c_str());
+            }
+        }
+    }
+    return failures;
+}
+
+// R13-12 (spec J): an exhausted Stage-2 work budget only disables Stage 2 — tolerant
+// Stage-3 recovery still commits the parameterized call after a definitive break under a
+// natural stop, and the result reports the exhaustion flag alongside the commit.
+int test_r13_12_budget_then_tolerant_commit() {
+    int failures = 0;
+    const std::string text = tool_call("get_weather", {{"city", "Paris"}}) + "\nDone.";
+    fi::ToolCallParsePolicy policy;
+    policy.max_name_length      = 64;
+    policy.tolerant             = true;
+    policy.stage2_step_budget   = 1;
+    fi::ToolCallStreamParser machine(policy);
+    machine.feed(std::string_view(text));
+    const auto term = machine.finish(ninfer::FinishReason::StopToken);
+    failures += check(term.status == fi::ToolCallStreamStatus::Complete,
+                      "R13-12: the Stage-3 commit did not survive the exhausted Stage-2 budget");
+    failures += check(term.parse_budget_exhausted,
+                      "R13-12: the exhaustion flag was not reported with the commit");
+    failures += check(term.region.calls.size() == 1 &&
+                          term.region.calls.front().name == "get_weather",
+                      "R13-12: the committed call was wrong");
+    return failures;
+}
+
 int test_grammar_header_forms_one_shot() {
     const auto contract = contract_for("write", Json{{"content", Json{{"type", "string"}}}});
     int failures = 0;
@@ -6027,6 +6524,16 @@ int main() {
     failures += test_r13_03_tolerant_recovered_missing_bracket();
     failures += test_r13_03_tolerant_recovered_undeclared_stays_text();
     failures += test_r13_03_tolerant_recovered_parity();
+    failures += test_r13_01_indented_prose_marker_not_retry_base();
+    failures += test_r13_01_tab_indented_prose_marker();
+    failures += test_r13_01_three_column_control_still_recovers();
+    failures += test_r13_01_column_zero_prose_recovers();
+    failures += test_r13_01_entry_retry_agreement();
+    failures += test_r13_08_literal_line_trailing_whitespace_parity();
+    failures += test_r13_09_fence_closed_at_eof();
+    failures += test_r13_10_list_item_fences();
+    failures += test_r13_11_tolerant_decision_table();
+    failures += test_r13_12_budget_then_tolerant_commit();
     failures += test_grammar_header_forms_one_shot();
     failures += test_streaming_recognizes_grammar_markers();
     failures += test_recovery_policy_phase3();

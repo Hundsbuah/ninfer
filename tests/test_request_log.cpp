@@ -715,6 +715,41 @@ int main() {
                                std::string::npos,
         "R10-03: the indented warning fired for a latched marker");
 
+    // R13-09: a fence closed by its final line without a trailing LF reports
+    // ended_in_unclosed_fence == false — the no-marker fence warning must stay silent for
+    // a properly closed fenced example (the false "unclosed" warning is gone).
+    GenerationOutcome closed_fence_outcome = outcome;
+    closed_fence_outcome.tool_call_parse = {
+        .marker_seen               = false,
+        .structured_call_count     = 0,
+        .fenced_markers_suppressed = 1,
+        .ended_in_unclosed_fence   = false,
+        .fallback_reason           = ninfer::ToolCallParseFallbackReason::None,
+    };
+    closed_fence_outcome.text = "```\n<tool_call>\n</tool_call>\n```";
+    const std::optional<OperationalRecord> closed_fence_rec =
+        render_tool_call_fallback(context, closed_fence_outcome);
+    failures += check(!closed_fence_rec,
+                      "R13-09: a fence closed at EOF emitted the unclosed-fence warning");
+    // The same example with a four-backtick opener (a three-backtick final line is fence
+    // content) is genuinely unclosed and keeps the Warning.
+    GenerationOutcome unclosed_fence_outcome = outcome;
+    unclosed_fence_outcome.tool_call_parse = {
+        .marker_seen               = false,
+        .structured_call_count     = 0,
+        .fenced_markers_suppressed = 1,
+        .ended_in_unclosed_fence   = true,
+        .fallback_reason           = ninfer::ToolCallParseFallbackReason::None,
+    };
+    unclosed_fence_outcome.text = "````\n<tool_call>\n</tool_call>\n```";
+    const std::optional<OperationalRecord> unclosed_fence_rec =
+        render_tool_call_fallback(context, unclosed_fence_outcome);
+    failures += check(unclosed_fence_rec &&
+                          unclosed_fence_rec->severity == OperationalSeverity::Warning &&
+                          unclosed_fence_rec->message.find("tool-call fence left unclosed") !=
+                              std::string::npos,
+                      "R13-09: a genuinely unclosed fence lost its Warning");
+
     // R12-05: the R11-F shape (a latched initial region fails, the indented retry candidate is
     // suppressed, no call commits): the generic parser-fallback warning carries the bounded
     // indented-suppression clause, and the dedicated pre-latch warning stays silent (it only

@@ -902,7 +902,7 @@ FenceDiagnostics compute_fence_diagnostics(std::string_view pre_latch,
                 shadow.consume(byte);
             }
         }
-        if (tracker.open()) { diagnostics.ended_in_unclosed_fence = true; }
+        if (tracker.open_at_end()) { diagnostics.ended_in_unclosed_fence = true; }
         diagnostics.suppressed_markers += shadow.complete();
     };
     scan(pre_latch);

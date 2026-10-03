@@ -151,9 +151,12 @@ class ChatTemplates(unittest.TestCase):
         history = [message("system", "policy"), message("user", "inspect")]
         compatible = self.render("qwen3_8", history, tools=tools)
         hardened = self.render("qwen3_8_hardened_tools", history, tools=tools)
+        # R13-02: the maintained template carries the full upstream sentence, including
+        # the "but NOT after" clause (the strict parser loses a complete call followed by
+        # visible text; the instruction is the prompt-side prevention of exactly that).
         self.assertIn(
             "You may provide optional reasoning for your function call in natural "
-            "language BEFORE the function call",
+            "language BEFORE the function call, but NOT after",
             compatible,
         )
         self.assertNotIn("emit the <tool_call> block immediately", compatible)

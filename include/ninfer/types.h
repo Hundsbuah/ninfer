@@ -630,7 +630,8 @@ struct ToolCallParseDiagnostics {
     // failure.
     std::uint32_t indented_markers_suppressed     = 0;
     bool ended_in_unclosed_fence                  = false;
-    // Round 4 (N-07): the Stage-2 work budget was exhausted; the region was returned as text.
+    // Round 4 (N-07): the Stage-2 work budget was exhausted; nothing from Stage 2 was
+    // accepted (Stage-1 acceptance and tolerant Stage-3 recovery are unaffected).
     bool parse_budget_exhausted                  = false;
     ToolCallParseFallbackReason fallback_reason   = ToolCallParseFallbackReason::None;
     // Tolerant tool-call mode turned output the strict parser rejects into structured calls.

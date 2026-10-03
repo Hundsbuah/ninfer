@@ -2329,6 +2329,70 @@ int test_reasoning_before_tool_call_keeps_intent_gate_open() {
     return failures;
 }
 
+// R13-01 (cross-layer, spec K): the whole-line retry literal rule must hold through the
+// OutputSession preview transaction. After a reasoning close, the reproducer (a prose
+// <tool_call> mention plus a complete call inside an indented example, preceded by text on
+// its line) is Content: nothing executes and the text returns verbatim. The natural stop
+// is the EOS token inside the round (the default StopPolicy carries the model default),
+// exactly as the engine feeds it: the round's budget reason stays OutputLimit.
+int test_r13_01_indented_prose_marker_session() {
+    int failures = 0;
+    const Frontend frontend = make_frontend(resources());
+
+    ninfer::ChatMessage message;
+    message.role = ninfer::ChatRole::User;
+    message.parts.push_back(
+        ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text, .text = "x", .media = {}});
+    ninfer::PromptInput input;
+    input.messages.push_back(std::move(message));
+    input.options.continuation    = ninfer::PromptContinuationMode::NewAssistantTurn;
+    input.options.enable_thinking = true;
+    const std::string weather_tool =
+        R"({"type":"function","function":{"name":"get_weather","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}})";
+    input.options.tool_jsons.push_back(weather_tool);
+    auto prompt = frontend.prepare(std::move(input));
+
+    auto session =
+        frontend.make_output_session(prompt, {}, ninfer::OutputOptions{.tool_name_max_length = 64});
+    const auto reasoning_tokens =
+        fixture_tokenizer().encode("I will show the syntax\n\074/think>\n\n");
+    const auto first = session.preview_model(
+        reasoning_tokens, static_cast<std::uint32_t>(reasoning_tokens.size()) + 1,
+        ninfer::FinishReason::OutputLimit);
+    failures += check(!first.finished(), "the reasoning-close round must stay non-terminal");
+    (void)session.commit_preview();
+
+    const std::string reproducer =
+        "Wrap every call in the <tool_call> element. An example turn, shown as an indented "
+        "code block:\n"
+        "\n"
+        "    Assistant: <tool_call>\n"
+        "    <function=get_weather>\n"
+        "    <parameter=city>\n"
+        "    Paris\n"
+        "    </parameter>\n"
+        "    </function>\n"
+        "    </tool_call>\n";
+    std::vector<ninfer::TokenId> content_tokens = fixture_tokenizer().encode(reproducer);
+    content_tokens.push_back(6); // the fixture EOS: the natural stop token inside the round
+    const auto second = session.preview_model(
+        content_tokens, static_cast<std::uint32_t>(content_tokens.size()),
+        ninfer::FinishReason::OutputLimit);
+    failures += check(second.finished() && second.finish_reason == ninfer::FinishReason::StopToken,
+                      "the reproducer round must terminalize on the natural stop");
+    const auto output = session.commit_preview();
+    const auto calls = session.take_tool_calls();
+    failures += check(calls.empty(),
+                      "R13-01: the indented prose-preceded example executed through the session");
+    failures += check(
+        channel_text(output, ninfer::OutputChannel::Content) == reproducer,
+        "R13-01: the session Content was not the verbatim reproducer");
+    failures += check(
+        session.tool_call_parse_diagnostics().indented_markers_suppressed == 1,
+        "R13-01: the session diagnostics lost the single suppressed retry candidate");
+    return failures;
+}
+
 // R7 (Round 7 §16): reasoning-channel bytes never count toward the content-start gate. After
 // the reasoning close, a Content channel carrying a latched malformed region plus a later
 // valid call must reject the later call under the hardened intent; the default intent keeps
@@ -3650,6 +3714,7 @@ int main() {
     failures += test_preview_terminal_reason_transaction();
     failures += test_finish_reason_sensitive_tool_parsing();
     failures += test_reasoning_before_tool_call_keeps_intent_gate_open();
+    failures += test_r13_01_indented_prose_marker_session();
     failures += test_r7_reasoning_plus_hardened_retry_rejection();
     failures += test_r11_post_reasoning_separator_preserves_indentation();
     failures += test_tool_marker_after_quoted_marker();
