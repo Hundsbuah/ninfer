@@ -329,15 +329,13 @@ ProgramImpl::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
         submit_range.emplace(nvtx::Name::DecodeOrdinarySubmit, nvtx::Category::Decode,
                              static_cast<std::uint64_t>(lanes.size()));
         DecodeGraphExecutable* executable = nullptr;
-        ops::CausalAttentionExecutionEnvelope envelope{
-            .min_visible_keys = maximum_frontier + 1, .max_visible_keys = maximum_frontier + 1};
+        ops::CausalAttentionExecutionEnvelope envelope{maximum_frontier + 1, maximum_frontier + 1};
         if (use_cuda_graph) {
             DecodeGraphProfile& profile =
                 select_graph_profile(ordinary_graphs, static_cast<std::uint32_t>(lanes.size()),
                                      maximum_frontier, "ordinary batch");
             executable = &install_graph_profile(ordinary_graphs, profile, "ordinary batch");
-            envelope = {.min_visible_keys = profile.min_execution_frontier + 1,
-                        .max_visible_keys = profile.max_execution_frontier + 1};
+            envelope   = {profile.min_execution_frontier + 1, profile.max_execution_frontier + 1};
         }
 
         for (std::size_t row = 0; row < lanes.size(); ++row) {
@@ -805,8 +803,7 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                              static_cast<std::uint64_t>(lanes.size()));
         DecodeGraphExecutable* executable    = nullptr;
         execution::DFlashEnvelopes envelopes = dflash_envelopes(0, maximum_frontier);
-        ops::CausalAttentionExecutionEnvelope target_envelope{
-            .min_visible_keys = 1, .max_visible_keys = maximum_target_tokens};
+        ops::CausalAttentionExecutionEnvelope target_envelope{1, maximum_target_tokens};
         if (use_cuda_graph) {
             DecodeGraphProfile& profile =
                 select_graph_profile(graph_family, static_cast<std::uint32_t>(lanes.size()),
@@ -814,11 +811,10 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
             executable = &install_graph_profile(graph_family, profile, "DFlash/ngram batch");
             envelopes =
                 dflash_envelopes(profile.min_execution_frontier, profile.max_execution_frontier);
-            target_envelope = {.min_visible_keys = 1,
-                               .max_visible_keys = static_cast<std::uint32_t>(std::min<std::uint64_t>(
-                                   capacity,
-                                   static_cast<std::uint64_t>(profile.max_execution_frontier) +
-                                       verify_drafts + 1ULL))};
+            target_envelope = {
+                1, static_cast<std::uint32_t>(std::min<std::uint64_t>(
+                       capacity, static_cast<std::uint64_t>(profile.max_execution_frontier) +
+                                     verify_drafts + 1ULL))};
         }
 
         for (std::size_t row = 0; row < lanes.size(); ++row) {

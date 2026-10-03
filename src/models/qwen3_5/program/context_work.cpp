@@ -288,7 +288,7 @@ execution::MtpCausalAttentionEnvelopes mtp_causal_attention_envelopes(std::uint3
         return static_cast<std::uint32_t>(std::min<std::uint64_t>(capacity, value));
     };
     execution::MtpCausalAttentionEnvelopes out;
-    out.target_verify = {1, visible(static_cast<std::uint64_t>(max_frontier) + k + 1ULL), k > 15};
+    out.target_verify = {1, visible(static_cast<std::uint64_t>(max_frontier) + k + 1ULL)};
     out.batch         = out.target_verify;
     for (std::uint32_t step = 0; step + 1 < next_k; ++step) {
         out.ar[step] = {1, visible(static_cast<std::uint64_t>(max_frontier) + k + step + 2ULL)};

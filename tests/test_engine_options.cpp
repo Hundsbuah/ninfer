@@ -85,26 +85,6 @@ int main() {
     const std::string nvfp4_what = construction_error(options, nvfp4_invalid);
     failures += check(nvfp4_what.find("NVFP4 KV") == std::string::npos,
                       "the original NVFP4 prefill kernel was rejected with the NVFP4 KV cache");
-    // F10: the reserved grammar-constrained decoding mode. Off (the default) passes validation
-    // and fails only on the absent artifact; ToolCallsOnly fails before any device work with the
-    // explicit not-implemented error; the rejection leaves a subsequent Off validation untouched.
-    ninfer::EngineOptions constrained;
-    failures += check(constrained.constrained_tool_decoding == ninfer::ConstrainedToolDecoding::Off,
-                      "the constrained tool decoding default is not off");
-    bool constrained_invalid = false;
-    const std::string constrained_off_what = construction_error(constrained, constrained_invalid);
-    failures += check(constrained_off_what.find("constrained-tool-decoding") == std::string::npos,
-                      "off constrained tool decoding was rejected at startup");
-    constrained.constrained_tool_decoding = ninfer::ConstrainedToolDecoding::ToolCallsOnly;
-    const std::string reserved_what = construction_error(constrained, constrained_invalid);
-    failures += check(constrained_invalid &&
-                          reserved_what == "--constrained-tool-decoding=tool-calls-only is not "
-                                           "implemented in this build; use off",
-                      "tool-calls-only constrained decoding did not fail with the expected error");
-    constrained.constrained_tool_decoding = ninfer::ConstrainedToolDecoding::Off;
-    const std::string after_what = construction_error(constrained, constrained_invalid);
-    failures += check(after_what.find("constrained-tool-decoding") == std::string::npos,
-                      "off validation changed after the reserved-mode rejection");
     std::cout << (failures == 0 ? "PASS" : "FAIL") << " Engine option validation\n";
     return failures == 0 ? 0 : 1;
 }

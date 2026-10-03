@@ -303,16 +303,14 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     const auto chunk  = static_cast<std::int32_t>(chunk_u32);
     const auto drafts = static_cast<std::int32_t>(plan.draft_window);
     const auto verify = drafts + 1;
-    const ops::CausalAttentionExecutionEnvelope text_envelope{
-        .min_visible_keys = 1, .max_visible_keys = plan.capacity};
+    const ops::CausalAttentionExecutionEnvelope text_envelope{1, plan.capacity};
     // Prefill chunks run the selected prompt kernel, whose fast NVFP4 form may split keys into
     // workspace (see execution/text.cpp).
     const ops::CausalAttentionExecutionEnvelope prefill_envelope{
         .min_visible_keys   = 1,
         .max_visible_keys   = plan.capacity,
         .fast_prompt_kernel = plan.fast_prefill_kernel};
-    const ops::CausalAttentionExecutionEnvelope verify_envelope{
-        .min_visible_keys = 1, .max_visible_keys = plan.capacity};
+    const ops::CausalAttentionExecutionEnvelope verify_envelope{1, plan.capacity};
 
     const auto matrix  = [](WorkspaceLayoutBuilder& layout, DType dtype, std::int32_t rows,
                            std::int32_t tokens) { (void)layout.alloc(dtype, {rows, tokens}); };

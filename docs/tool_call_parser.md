@@ -287,21 +287,16 @@ by a TEXT-vs-TOOL intent channel (`tool_call_intent_channel_design.md`).
 
 ## Constrained tool decoding
 
-`--constrained-tool-decoding off|tool-calls-only` (default `off`) reserves
-grammar-constrained decoding of the tool wire syntax: while a tool region is being
-generated, the token support is restricted to the wire grammar so the model cannot leave
-it.
+Grammar-constrained decoding of the tool wire syntax — restricting the token support while a
+tool region is generated so the model cannot leave the wire grammar — is not implemented, and no
+public option for it exists: the CLI, the server and the Engine API expose no flag, and there is
+no sampling integration. The CPU grammar-state core (`ToolCallGrammarConstraint`) is implemented
+and tested only as a shared CPU core: it tracks the marker trigger, advances on decoded bytes,
+and re-validates the open region with the same strict parser in prefix mode; it is exercised by
+the test suite and shares its entry scanner with the parser, but it is not wired into generation.
 
-Status in this build: `tool-calls-only` is not implemented. The CPU grammar-state core is
-implemented and tested (it tracks the marker trigger, advances on decoded bytes, and
-re-validates the open region with the same strict parser in prefix mode), but the sampling
-integration and its GPU verification are not part of the delivered scope, so malformed native tool
-syntax can still be generated: the parser is the post-generation consistency boundary, not a
-generator constraint. Selecting `tool-calls-only` therefore fails at engine startup — before any
-device work, on the CLI
-and the server alike — with
-`--constrained-tool-decoding=tool-calls-only is not implemented in this build; use off`;
-`off` is accepted and leaves the sampling path bit-identical. The design and the
+Consequently malformed native tool syntax can still be generated: the parser is the
+post-generation consistency boundary, not a generator constraint. The design and the
 acceptance gate for the sampling integration are documented in
 [new_parser_phase4_design.md](new_parser_phase4_design.md).
 

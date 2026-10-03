@@ -565,7 +565,6 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_5::DFlashDecodeState& f
 auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size, std::uint32_t k,
                               DFlashEnvelopes envelopes,
                               ops::CausalAttentionExecutionEnvelope target_envelope) {
-    target_envelope.wide_verification = state.ngram && k > 15;
     return [&state, batch_size, k, envelopes, target_envelope] {
         if (batch_size <= 0 || batch_size > static_cast<std::int32_t>(kMaximumConcurrency) ||
             k == 0 || k > kDFlashVerifyMaximumDrafts) {

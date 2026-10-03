@@ -18,9 +18,6 @@ inline constexpr std::uint32_t kCausalAttentionMaximumVisibleKeys = 1048576;
 struct CausalAttentionExecutionEnvelope {
     std::uint32_t min_visible_keys = 0;
     std::uint32_t max_visible_keys = 0;
-    // Chunked single-row verification through width 64 (R3 wide-verify). The origin/master
-    // causal_cache ignores the hint; workspace planning and execution must agree on it.
-    bool wide_verification = false;
     // Run prompt-route launches over an INT8-G64 or NVFP4-G16 cache on the fast prompt kernel
     // (each warp keeps its query rows, scores and output in registers; FP16 per-tile PV
     // accumulation; NVFP4 also decodes V in registers and runs QK on block-scaled FP4 Tensor Cores
