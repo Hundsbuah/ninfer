@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace ninfer::models::qwen3_5::frontend {
 
@@ -180,6 +181,46 @@ private:
     // R6-05 intent gate: a visible content byte was committed before a latch; under
     // RequireToolAtContentStart no later marker may latch.
     bool entry_locked_ = false;
+};
+
+// R11-01 (R11-I1/I2/I3): physical-line leading-indentation classification for tool marker
+// candidates at arbitrary positions of the full logical generated text. The Stage-1
+// retry/rebase search must apply the exact Round-10 indented-literal rule to the candidates
+// it finds (a marker may not become executable merely because the recovery search found it
+// instead of the initial entry scanner), and a candidate's physical line can begin in the
+// pre-latch content — so the classifier is built over the concatenation pre_latch + region
+// in one forward pass. One entry per physical line keeps the per-candidate query O(log
+// lines) instead of an O(line length) backward scan per candidate (which would be O(N^2)
+// over an adversarial marker-dense single line).
+//
+// A physical line begins at the stream start or at the byte immediately after an LF; a CR
+// never starts a new physical line by itself (R11-I1). A candidate marker is classified as
+// an indented literal entry exactly when (R11-I2):
+//   * its opening '<' is the first non-formatting byte of the physical line (any other
+//     byte before it on the line disqualifies it), and
+//   * the visual indentation before the '<' is at least four columns: a space advances one
+//     column, a tab to the next 4-column stop (next_tab_stop, the Round-10 rule), a CR
+//     advances none. Columns 0-3 remain eligible.
+// Fence precedence (R11-I4) is the caller's: a candidate inside a recognized fence is
+// fence-suppressed and must not be classified or counted here.
+class ToolCallLineIndentationScan {
+public:
+    // Offsets: lines are tracked in the concatenated coordinate space (pre_latch first);
+    // marker positions passed to marker_is_indented_literal are region-relative.
+    ToolCallLineIndentationScan(std::string_view pre_latch, std::string_view region) noexcept;
+
+    // True when the complete marker at region-relative marker_at (whose '<' byte the caller
+    // located, e.g. with find_tool_marker) is an indented literal entry per R11-I2.
+    [[nodiscard]] bool marker_is_indented_literal(std::size_t marker_at) const noexcept;
+
+private:
+    struct Line {
+        std::size_t start;          // concatenated index of the line's first byte
+        std::size_t first_nonspace; // first byte of the line that is not space/tab/CR
+        std::size_t column_at_first;// visual column of first_nonspace (leading indentation)
+    };
+    std::vector<Line> lines_;
+    std::size_t pre_latch_size_ = 0;
 };
 
 } // namespace ninfer::models::qwen3_5::frontend

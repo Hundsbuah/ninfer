@@ -48,6 +48,11 @@ never silently truncated.
 - The region parse produces an objective parse progress (what was recognized, where the input
   ended, whether a structural break occurred). A separate, pure recovery policy decides what
 may be committed; the parser does not decide policy.
+- The streaming decoder feeds chunks to the same incremental machine and finalizes that
+  live machine at the terminal (there is no second region-only re-parse): the terminal path
+  and the one-shot entry share one contract-aware materialization (declared-name defense in
+  depth, the ambiguity rule, schema-aware normalization), so their outcomes cannot drift.
+
 
 ## Marker entry and recovery
 
@@ -87,9 +92,12 @@ unclosed fence stays open to the end of the input (suppression is the safe direc
 tracker only sees the pre-latch content channel: once a region has latched, the region's own
 bytes are parsed by the wire grammar, which owns value bytes (a value may contain fence
 markup). The fence state is also computed over the latched region's bytes, independent of the
-chunk partition: recovery retry entries skip markers inside a recognized fence, and the
-diagnostics report `fenced_markers_suppressed` (complete markers a fence suppressed, pre-latch
-and retry) and `ended_in_unclosed_fence` (the pre-latch stream ended inside an unclosed fence).
+chunk partition: recovery retry entries skip markers inside a recognized fence (fence
+precedence). `fenced_markers_suppressed` counts complete markers a fence suppressed — the
+pre-latch content, plus the region's own markers when the region is returned as text;
+markers the recovery retry skips are not counted. `ended_in_unclosed_fence` reports the
+pre-latch stream ending inside an unclosed fence (cleared once a region latched) and, when
+the region is returned as text, the region's own unclosed fence state.
 
 ## Indented literal lines
 
@@ -108,9 +116,15 @@ CommonMark parsing:
   visible byte and does not lock the `start-of-content` intent gate: a genuine call on
   the next line at column zero still executes.
 - Once a line is literal, every byte of that line is ordinary content, held for
-  publication, and never enters the marker candidate machine. This is a pre-latch rule:
-  a marker line indented inside a latched region's parameter value is parsed by the wire
-  grammar and preserved byte-exact.
+  publication, and never enters the marker candidate machine. A marker line indented inside
+  a latched region's parameter value is parsed by the wire grammar and preserved byte-exact
+  (it is value payload, not an entry).
+- The same rule applies to recovery retry/rebase entries: a marker may not become
+  executable merely because the recovery search found it instead of the initial entry
+  scanner. A retry candidate's physical line can begin in the pre-latch content, so the
+  classification is computed over the full logical text (pre-latch plus region); a candidate
+  embedded in an open value's payload is not an entry (the value bytes are the wire
+  parser's), so the rule does not apply to it. Each skipped candidate is counted once.
 - Fence classification has precedence: a byte the fence tracker owns is fed to the fence
   shadow, never to the indentation shadow, so a marker on an indented line inside a
   recognized fence is counted as fence-suppressed only, never double-counted.
@@ -302,11 +316,17 @@ acceptance gate for the sampling integration are documented in
 - `truncated_tail`: set on a tolerant truncation that retained complete-enough calls.
 - `markup_tolerant_completion`: the structured region was resolved by the Stage-2 consistent
   completion instead of the greedy Stage-1 parse.
-- `fenced_markers_suppressed` / `ended_in_unclosed_fence`: complete markers a recognized code
-  fence suppressed (pre-latch and retry), and whether the pre-latch stream ended inside an
-  unclosed fence.
+- `fenced_markers_suppressed`: complete markers a recognized code fence suppressed — the
+  pre-latch content, plus the region's own markers when the region is returned as text.
+  Markers the recovery retry skips are not counted.
+- `ended_in_unclosed_fence`: whether the pre-latch stream ended inside an unclosed fence
+  (cleared once a region latched), or the region's own unclosed fence state when the region
+  is returned as text.
 - `indented_markers_suppressed`: complete top-level markers suppressed because their `<`
-  began on an indented literal line (visual column >= 4 outside a fence, pre-latch only).
+  began on an indented literal line (visual column >= 4 outside a fence). Applies to the
+  pre-latch entry classification and to recovery retry/rebase entries (a marker may not
+  become executable merely because the recovery search found it); a marker embedded in an
+  open value's payload is never classified here. Each skipped candidate is counted once.
   The output remains ordinary content; this is an entry-classification diagnostic, not a
   parse failure.
 - `parse_budget_exhausted`: the Stage-2 work budget was exhausted and the region was returned

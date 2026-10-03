@@ -174,7 +174,7 @@ struct DecoderState {
     std::string think_marker_pending;
     std::array<std::string, 2> stop_pending;
     bool in_reasoning              = false;
-    bool strip_content_leading     = false;
+    bool strip_post_reasoning_linebreaks = false;
     bool terminal                  = false;
     std::uint64_t decoded_bytes    = 0;
     std::uint32_t reasoning_tokens = 0;
@@ -275,13 +275,19 @@ void close_channel(DecoderState& state, OutputChannel channel, PublishedOutput& 
 
 void feed_content(DecoderState& state, std::string text, const StopPolicy& policy,
                   PublishedOutput& emitted, std::uint32_t committed_tokens, StopMatch* best_match) {
-    if (state.strip_content_leading) {
+    // R11-02: after a real reasoning close only the reasoning/content separator line breaks
+    // are stripped. The separator rule consumes CR and LF bytes and stops at the first byte
+    // that is neither — a SPACE or TAB that begins the assistant Content is content
+    // indentation (the tool-entry classification needs it, R10-I2) and is forwarded
+    // unchanged. Generic whitespace stripping (std::isspace) is forbidden here: it destroyed
+    // the 4-space/TAB indentation that marks a displayed tool call as literal.
+    if (state.strip_post_reasoning_linebreaks) {
         std::size_t begin = 0;
-        while (begin < text.size() && std::isspace(static_cast<unsigned char>(text[begin])) != 0) {
+        while (begin < text.size() && (text[begin] == '\r' || text[begin] == '\n')) {
             ++begin;
         }
         text.erase(0, begin);
-        if (!text.empty()) { state.strip_content_leading = false; }
+        if (!text.empty()) { state.strip_post_reasoning_linebreaks = false; }
     }
     feed_channel(state, OutputChannel::Content, text, policy, emitted, committed_tokens,
                  best_match);
@@ -304,8 +310,8 @@ void feed_decoded_text(DecoderState& state, std::string_view text, const StopPol
         close_channel(state, OutputChannel::Reasoning, emitted);
         std::string content = state.think_marker_pending.substr(scan.close + kThinkClose.size());
         state.think_marker_pending.clear();
-        state.in_reasoning          = false;
-        state.strip_content_leading = true;
+        state.in_reasoning                      = false;
+        state.strip_post_reasoning_linebreaks   = true;
         feed_content(state, std::move(content), policy, emitted, committed_tokens, best_match);
         return;
     }
@@ -347,8 +353,8 @@ void terminalize(DecoderState& state, const StopPolicy& policy, PublishedOutput&
             std::string content =
                 state.think_marker_pending.substr(scan.close + kThinkClose.size());
             state.think_marker_pending.clear();
-            state.in_reasoning          = false;
-            state.strip_content_leading = true;
+            state.in_reasoning                  = false;
+            state.strip_post_reasoning_linebreaks = true;
             feed_content(state, std::move(content), policy, emitted, committed_tokens, nullptr);
         } else {
             state.think_marker_pending.clear();

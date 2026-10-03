@@ -2414,6 +2414,144 @@ int test_r7_reasoning_plus_hardened_retry_rejection() {
     return failures;
 }
 
+// R11-02 (spec §5.6/§13, fixtures I/J/K/G): after a real reasoning close only the CR/LF
+// separator bytes are stripped. The SPACE/TAB indentation that begins the assistant Content
+// is genuine content — the 4-space / TAB indentation of a displayed tool call must survive
+// to the entry scanner (where it is classified as a literal line), and the generic
+// whitespace strip (std::isspace) must not destroy it.
+int test_r11_post_reasoning_separator_preserves_indentation() {
+    int failures = 0;
+    const Frontend frontend = make_frontend(resources());
+
+    ninfer::ChatMessage message;
+    message.role = ninfer::ChatRole::User;
+    message.parts.push_back(
+        ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text, .text = "x", .media = {}});
+    ninfer::PromptInput input;
+    input.messages.push_back(std::move(message));
+    input.options.continuation    = ninfer::PromptContinuationMode::NewAssistantTurn;
+    input.options.enable_thinking = true;
+    const std::string bash_tool =
+        R"({"type":"function","function":{"name":"bash","parameters":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}}})";
+    input.options.tool_jsons.push_back(bash_tool);
+    const auto prompt = frontend.prepare(std::move(input));
+
+    const std::string indented_call = "    <tool_call>\n    <function=bash>\n    <parameter=command>\n"
+                                      "echo indented\n    </parameter>\n    </function>\n    </tool_call>";
+    const std::string real_call     = "<tool_call>\n<function=bash>\n<parameter=command>\n"
+                                      "echo real\n</parameter>\n</function>\n</tool_call>";
+    const auto options = ninfer::OutputOptions{.tool_name_max_length = 64};
+
+    // I: thinking + </think> + LF/LF + a 4-space-indented call: the separator is stripped,
+    //    the indentation is preserved, and the call stays a literal line (0 calls, verbatim).
+    {
+        auto session = frontend.make_output_session(prompt, {}, options);
+        std::vector<ninfer::TokenId> first = fixture_tokens("I should inspect\n");
+        first.push_back(kFixtureThinkCloseToken);
+        const auto separator = fixture_tokens("\n\n");
+        first.insert(first.end(), separator.begin(), separator.end());
+        const auto d1 = session.preview_model(
+            first, static_cast<std::uint32_t>(first.size()) + 1, ninfer::FinishReason::OutputLimit);
+        failures += check(!d1.finished(), "the reasoning-close round must stay non-terminal");
+        const auto out1 = session.commit_preview();
+        failures += check(session.take_tool_calls().empty(), "the reasoning round committed a call");
+        failures += check(channel_text(out1, ninfer::OutputChannel::Content).empty(),
+                          "R11 I: the LF/LF separator was published instead of stripped");
+
+        const auto second = fixture_tokens(indented_call);
+        const auto d2 = session.preview_model(
+            second, static_cast<std::uint32_t>(second.size()), ninfer::FinishReason::OutputLimit);
+        failures += check(d2.finished(), "the indented-call round must terminalize on the budget cut");
+        const auto out2 = session.commit_preview();
+        const auto calls = session.take_tool_calls();
+        failures += check(calls.empty(),
+                          "R11 I: the post-reasoning strip destroyed the literal indentation (call executed)");
+        failures += check(channel_text(out2, ninfer::OutputChannel::Content) == indented_call,
+                          "R11 I: the indented call was not returned byte-exact");
+    }
+    // J: the same stream with a column-zero call: the separator is stripped and the genuine
+    //    call executes.
+    {
+        auto session = frontend.make_output_session(prompt, {}, options);
+        std::vector<ninfer::TokenId> first = fixture_tokens("I should inspect\n");
+        first.push_back(kFixtureThinkCloseToken);
+        const auto separator = fixture_tokens("\n\n");
+        first.insert(first.end(), separator.begin(), separator.end());
+        const auto d1 = session.preview_model(
+            first, static_cast<std::uint32_t>(first.size()) + 1, ninfer::FinishReason::OutputLimit);
+        (void)d1;
+        (void)session.commit_preview();
+
+        const auto second = fixture_tokens(real_call);
+        const auto d2 = session.preview_model(
+            second, static_cast<std::uint32_t>(second.size()), ninfer::FinishReason::OutputLimit);
+        (void)d2;
+        (void)session.commit_preview();
+        const auto calls = session.take_tool_calls();
+        failures += check(calls.size() == 1 && calls.front().name == "bash" &&
+                              calls.front().arguments_json == "{\"command\":\"echo real\"}",
+                          "R11 J: the genuine column-zero call after reasoning did not commit");
+    }
+    // K: the CR/LF separator and a split across the indented call's marker prefix: the
+    //    verdict (0 calls) and the byte-exact content are the same as the unsplit I.
+    {
+        auto session = frontend.make_output_session(prompt, {}, options);
+        std::vector<ninfer::TokenId> first = fixture_tokens("thinking ");
+        first.push_back(kFixtureThinkCloseToken);
+        const auto separator = fixture_tokens("\r\n");
+        first.insert(first.end(), separator.begin(), separator.end());
+        const auto d1 = session.preview_model(
+            first, static_cast<std::uint32_t>(first.size()) + 1, ninfer::FinishReason::OutputLimit);
+        (void)d1;
+        const auto out1 = session.commit_preview();
+        failures += check(channel_text(out1, ninfer::OutputChannel::Content).empty(),
+                          "R11 K: the CR/LF separator was published instead of stripped");
+
+        const std::size_t split = 10; // inside the <tool_call> marker prefix
+        const auto part_a = fixture_tokens(std::string_view(indented_call).substr(0, split));
+        const auto d2 = session.preview_model(
+            part_a, static_cast<std::uint32_t>(part_a.size()) + 1, ninfer::FinishReason::OutputLimit);
+        (void)d2;
+        const auto out2 = session.commit_preview();
+        const auto part_b = fixture_tokens(std::string_view(indented_call).substr(split));
+        const auto d3 = session.preview_model(
+            part_b, static_cast<std::uint32_t>(part_b.size()), ninfer::FinishReason::OutputLimit);
+        (void)d3;
+        const auto out3 = session.commit_preview();
+        const auto calls = session.take_tool_calls();
+        failures += check(calls.empty(),
+                          "R11 K: the split indented call latched (separator or split destroyed the rule)");
+        failures += check(channel_text(out2, ninfer::OutputChannel::Content) +
+                              channel_text(out3, ninfer::OutputChannel::Content) == indented_call,
+                          "R11 K: the split indented call was not returned byte-exact");
+    }
+    // G: after the close (confirmed by its line break), a leading SPACE is genuine Content
+    //    and must be preserved — the separator rule stops at the first non-CR/LF byte, and
+    //    the old std::isspace strip destroyed this space.
+    {
+        auto session = frontend.make_output_session(prompt, {}, options);
+        std::vector<ninfer::TokenId> first = fixture_tokens("thinking ");
+        first.push_back(kFixtureThinkCloseToken);
+        const auto separator = fixture_tokens("\n");
+        first.insert(first.end(), separator.begin(), separator.end());
+        const auto d1 = session.preview_model(
+            first, static_cast<std::uint32_t>(first.size()) + 1, ninfer::FinishReason::OutputLimit);
+        (void)d1;
+        const auto out1 = session.commit_preview();
+        failures += check(channel_text(out1, ninfer::OutputChannel::Content).empty(),
+                          "R11 G: the confirming separator was published instead of stripped");
+
+        const auto second = fixture_tokens(" answer");
+        const auto d2 = session.preview_model(
+            second, static_cast<std::uint32_t>(second.size()), ninfer::FinishReason::OutputLimit);
+        (void)d2;
+        const auto out2 = session.commit_preview();
+        failures += check(channel_text(out2, ninfer::OutputChannel::Content) == " answer",
+                          "R11 G: the leading space after the reasoning close was stripped");
+    }
+    return failures;
+}
+
 int test_reasoning_split(const Frontend& frontend) {
     ninfer::ChatMessage message;
     message.role = ninfer::ChatRole::User;
@@ -3284,6 +3422,7 @@ int main() {
     failures += test_finish_reason_sensitive_tool_parsing();
     failures += test_reasoning_before_tool_call_keeps_intent_gate_open();
     failures += test_r7_reasoning_plus_hardened_retry_rejection();
+    failures += test_r11_post_reasoning_separator_preserves_indentation();
     failures += test_tool_marker_after_quoted_marker();
     failures += test_reasoning_split(frontend);
     failures += test_reasoning_close_requires_boundary(frontend);

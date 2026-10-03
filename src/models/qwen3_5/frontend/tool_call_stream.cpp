@@ -939,6 +939,10 @@ ToolCallStreamResult ToolCallStreamParser::finish(FinishReason finish_reason) co
     // R3-06: the retry search skips markers inside a recognized fence (the fence state is
     // computed over the region bytes, independent of how they were chunked).
     const std::vector<char> fenced = fence_mask(region_);
+    // R11-01: built lazily (one allocation) when a retry search actually runs; it classifies
+    // retry candidates over the full logical text (content_ + region_) so a candidate whose
+    // physical line begins in the pre-latch content is classified against those bytes too.
+    std::optional<ToolCallLineIndentationScan> retry_indent_scan;
     // Region index: absolute parameter-closer positions, used by the Stage-1 Greedy value scan
     // (a null index in parse_region_at falls back to a linear scan).
     RegionIndex index;
@@ -1017,9 +1021,27 @@ ToolCallStreamResult ToolCallStreamParser::finish(FinishReason finish_reason) co
         // R3-04: never base + 1 — EndOfInput retries from the break offset (the open
         // value's start when a value is open, the input-end position otherwise).
         const std::size_t from = std::max(last.progress.break_offset, entry_end);
+        // R11-01 (R11-I3): a retry/rebase entry is subject to the same indented-literal rule
+        // as the initial latch — a marker may not become executable merely because the
+        // recovery search found it instead of the entry scanner. Fence precedence comes
+        // first (R11-I4): a fenced candidate is fence-suppressed and is never counted as an
+        // indented suppression. R11-I5: when the failed attempt ended in an open value, the
+        // payload bytes are owned by the wire parser (they may be the real truncated call),
+        // so an embedded marker is not an entry candidate and the entry rule does not apply
+        // to it. The search advances monotonically, so each candidate is examined once: a
+        // skipped complete candidate is counted exactly once (R11-I14), and a candidate
+        // that becomes the base is never counted.
+        auto candidate_suppressed = [&](std::size_t candidate) {
+            if (fenced[candidate]) { return true; } // R3-06
+            if (open_value) { return false; }       // R11-I5
+            if (retry_indent_scan == std::nullopt) { retry_indent_scan.emplace(content_, region_); }
+            if (!retry_indent_scan->marker_is_indented_literal(candidate)) { return false; }
+            ++result.indented_markers_suppressed;
+            return true;
+        };
         std::size_t next = find_tool_marker(region_, from, policy_.syntax);
-        while (next != std::string_view::npos && fenced[next]) {
-            next = find_tool_marker(region_, next + 1, policy_.syntax); // R3-06: skip fenced markers
+        while (next != std::string_view::npos && candidate_suppressed(next)) {
+            next = find_tool_marker(region_, next + 1, policy_.syntax);
         }
         if (next == std::string_view::npos || next <= base) { break; }
         base = next;

@@ -563,12 +563,18 @@ struct ToolCallParseDiagnostics {
     // R3-07: the structured region was resolved by Stage-2 consistent completion
     // (markup-tolerant), not by the greedy Stage-1 parse.
     bool markup_tolerant_completion               = false;
-    // R3-06: complete top-level markers a recognized code fence suppressed (pre-latch and
-    // retry), and whether the pre-latch stream ended inside an unclosed fence.
+    // R3-06/R11-05: complete top-level markers a recognized code fence suppressed — the
+    // pre-latch content, plus the region's own markers when the region is returned as text
+    // (recovery-retry skips are not counted), and whether the stream ended inside an
+    // unclosed fence (pre-latch, cleared once a region latched; plus the region's own state
+    // when the region is returned as text).
     std::uint32_t fenced_markers_suppressed       = 0;
-    // R10-03: complete top-level markers suppressed because their '<' began on an indented
-    // literal line (visual column >= 4 outside a fence, pre-latch only). The output remains
-    // ordinary content; this is an entry-classification diagnostic, not a parse failure.
+    // R10-03/R11-01: complete top-level markers suppressed because their '<' began on an
+    // indented literal line (visual column >= 4 outside a fence) — the pre-latch entry
+    // classification and recovery retry/rebase entries alike; a marker embedded in an open
+    // value's payload is never classified here. Each skipped candidate counts once. The
+    // output remains ordinary content; an entry-classification diagnostic, not a parse
+    // failure.
     std::uint32_t indented_markers_suppressed     = 0;
     bool ended_in_unclosed_fence                  = false;
     // Round 4 (N-07): the Stage-2 work budget was exhausted; the region was returned as text.

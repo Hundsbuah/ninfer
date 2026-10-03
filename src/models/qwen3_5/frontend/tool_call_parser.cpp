@@ -463,30 +463,9 @@ build_tool_call_output_contract(std::span<const std::string> tool_jsons, bool en
     return contract;
 }
 
-ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text,
-                                                 std::size_t max_tool_name_length,
-                                                 const ToolCallOutputContract& contract,
-                                                 bool tolerant,
-                                                 FinishReason finish_reason,
-                                                 ToolCallSyntaxMode syntax,
-                                                 ToolCallAmbiguityPolicy ambiguity,
-                                                 ToolCallIntentPolicy intent) {
-    ToolCallParsePolicy policy;
-    policy.max_name_length        = max_tool_name_length;
-    policy.tolerant               = tolerant;
-    policy.enforce_declared_names = contract.enforce_declared_names;
-    policy.declared_check         = declared_tool_name_check;
-    policy.contract               = &contract;
-    policy.parameter_plausible    = declared_parameter_plausible;
-    policy.syntax                 = syntax;
-    policy.ambiguity              = ambiguity;
-    policy.intent                 = intent;
-
-    // One-shot and streaming share the same incremental parser: this feeds the whole output
-    // and finishes once; the streaming decoder feeds chunks of the same machine.
-    ToolCallStreamParser machine(policy);
-    machine.feed(text);
-    const ToolCallStreamResult result = machine.finish(finish_reason);
+MaterializedToolCallResult materialize_tool_call_result(const ToolCallStreamResult& result,
+                                                        const ToolCallOutputContract& contract) {
+    MaterializedToolCallResult materialized;
     if (!result.marker_seen) {
         // R3-09: no marker was ever seen: default diagnostics (fallback None, marker_seen
         // false) — the fence fields stay visible for the operational log.
@@ -494,7 +473,8 @@ ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text,
         diagnostics.fenced_markers_suppressed = result.fenced_markers_suppressed;
         diagnostics.indented_markers_suppressed = result.indented_markers_suppressed;
         diagnostics.ended_in_unclosed_fence   = result.ended_in_unclosed_fence;
-        return fallback(text, diagnostics);
+        materialized.diagnostics = std::move(diagnostics);
+        return materialized;
     }
     const ToolCallParseFallbackReason failure = to_fallback_reason(result.failure);
     if (result.status != ToolCallStreamStatus::Complete) {
@@ -507,7 +487,8 @@ ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text,
         diagnostics.indented_markers_suppressed = result.indented_markers_suppressed;
         diagnostics.ended_in_unclosed_fence   = result.ended_in_unclosed_fence;
         diagnostics.parse_budget_exhausted      = result.parse_budget_exhausted;
-        return fallback(text, diagnostics);
+        materialized.diagnostics = std::move(diagnostics);
+        return materialized;
     }
     // R2-I5 (CR5) defense in depth: identity is a property of the output, not a side effect
     // of one parse branch. When the contract enforces declared names, no call may leave the
@@ -519,7 +500,12 @@ ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text,
                 ToolCallParseDiagnostics diagnostics;
                 diagnostics.marker_seen     = true;
                 diagnostics.fallback_reason = ToolCallParseFallbackReason::UndeclaredTool;
-                return fallback(text, diagnostics);
+                diagnostics.fenced_markers_suppressed = result.fenced_markers_suppressed;
+                diagnostics.indented_markers_suppressed = result.indented_markers_suppressed;
+                diagnostics.ended_in_unclosed_fence   = result.ended_in_unclosed_fence;
+                diagnostics.parse_budget_exhausted = result.parse_budget_exhausted;
+                materialized.diagnostics = std::move(diagnostics);
+                return materialized;
             }
         }
     }
@@ -576,30 +562,71 @@ ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text,
         diagnostics.indented_markers_suppressed = result.indented_markers_suppressed; // R10-03
         diagnostics.ended_in_unclosed_fence   = result.ended_in_unclosed_fence;     // N-06 item 3
         diagnostics.parse_budget_exhausted = result.parse_budget_exhausted;
-        return fallback(text, diagnostics);
+        materialized.diagnostics = std::move(diagnostics);
+        return materialized;
     }
 
-    ParsedToolCallOutput out;
-    out.diagnostics.marker_seen     = true;
+    materialized.accepted = true;
     // A recovered truncated tail keeps its reason for transparency without demoting the output.
-    out.diagnostics.fallback_reason = failure;
-    out.diagnostics.markup_tolerant_completion = result.markup_tolerant_completion;
-    out.diagnostics.fenced_markers_suppressed  = result.fenced_markers_suppressed;
-    out.diagnostics.indented_markers_suppressed = result.indented_markers_suppressed;
-    out.diagnostics.ended_in_unclosed_fence    = result.ended_in_unclosed_fence;
-    out.diagnostics.parse_budget_exhausted   = result.parse_budget_exhausted;
+    materialized.diagnostics.marker_seen     = true;
+    materialized.diagnostics.fallback_reason = failure;
+    materialized.diagnostics.markup_tolerant_completion = result.markup_tolerant_completion;
+    materialized.diagnostics.fenced_markers_suppressed  = result.fenced_markers_suppressed;
+    materialized.diagnostics.indented_markers_suppressed = result.indented_markers_suppressed;
+    materialized.diagnostics.ended_in_unclosed_fence    = result.ended_in_unclosed_fence;
+    materialized.diagnostics.parse_budget_exhausted   = result.parse_budget_exhausted;
 
+    materialized.calls.reserve(calls.size());
+    for (const ParsedFunctionCall& call : calls) {
+        materialized.calls.push_back(
+            normalize_parsed_tool_call(call, contract, materialized.diagnostics));
+    }
+
+    materialized.diagnostics.duplicate_parameters_repaired = legacy_repairs;
+    materialized.diagnostics.structured_call_count         =
+        static_cast<std::uint32_t>(materialized.calls.size());
+    return materialized;
+}
+
+ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text,
+                                                 std::size_t max_tool_name_length,
+                                                 const ToolCallOutputContract& contract,
+                                                 bool tolerant,
+                                                 FinishReason finish_reason,
+                                                 ToolCallSyntaxMode syntax,
+                                                 ToolCallAmbiguityPolicy ambiguity,
+                                                 ToolCallIntentPolicy intent) {
+    ToolCallParsePolicy policy;
+    policy.max_name_length        = max_tool_name_length;
+    policy.tolerant               = tolerant;
+    policy.enforce_declared_names = contract.enforce_declared_names;
+    policy.declared_check         = declared_tool_name_check;
+    policy.contract               = &contract;
+    policy.parameter_plausible    = declared_parameter_plausible;
+    policy.syntax                 = syntax;
+    policy.ambiguity              = ambiguity;
+    policy.intent                 = intent;
+
+    // One-shot and streaming share the same incremental parser: this feeds the whole output
+    // and finishes once; the streaming decoder feeds chunks of the same machine.
+    ToolCallStreamParser machine(policy);
+    machine.feed(text);
+    const ToolCallStreamResult result = machine.finish(finish_reason);
+    // R11-03: one shared contract-aware materialization for one-shot and streaming.
+    const MaterializedToolCallResult materialized =
+        materialize_tool_call_result(result, contract);
+    if (!materialized.accepted) {
+        // Fallback: the complete original text is returned verbatim (one-shot has published
+        // nothing yet).
+        return fallback(text, materialized.diagnostics);
+    }
+    ParsedToolCallOutput out;
+    out.diagnostics = materialized.diagnostics;
     // Generated prose can quote a tool-call marker before the real turn. Bytes before the
     // accepted region (prose plus any failed earlier region) stay ordinary content.
     out.content = rtrim_format_whitespace(machine.content_prefix() + result.tail);
-    out.tool_calls.reserve(calls.size());
-    for (const ParsedFunctionCall& call : calls) {
-        out.tool_calls.push_back(normalize_parsed_tool_call(call, contract, out.diagnostics));
-    }
-
-    out.diagnostics.duplicate_parameters_repaired = legacy_repairs;
-    out.diagnostics.structured_call_count         = static_cast<std::uint32_t>(out.tool_calls.size());
-    out.is_tool_call_response                     = true;
+    out.tool_calls = std::move(materialized.calls);
+    out.is_tool_call_response = true;
     return out;
 }
 
@@ -610,10 +637,20 @@ ToolCallOutputDecoder::ToolCallOutputDecoder(std::shared_ptr<const ToolCallOutpu
                                              ToolCallIntentPolicy intent)
     : contract_(std::move(contract)), max_tool_name_length_(max_tool_name_length),
       tolerant_(tolerant), syntax_(syntax), ambiguity_(ambiguity), intent_(intent) {
+    // R11-03 (R11-I6): the live machine carries the full contract-aware policy. The terminal
+    // path finalizes this same machine — there is no second, contextless region re-parse —
+    // so the entry classification and the terminal materialization run on one machine over
+    // the same text. An empty contract disables contract-awareness (null pointer).
     ToolCallParsePolicy machine_policy;
-    machine_policy.syntax = syntax_;
-    machine_policy.ambiguity = ambiguity_;
-    machine_policy.intent    = intent_;
+    machine_policy.max_name_length        = max_tool_name_length_;
+    machine_policy.tolerant               = tolerant_;
+    machine_policy.enforce_declared_names = contract_ && contract_->enforce_declared_names;
+    machine_policy.declared_check         = declared_tool_name_check;
+    machine_policy.contract               = contract_ ? contract_.get() : nullptr;
+    machine_policy.parameter_plausible    = declared_parameter_plausible;
+    machine_policy.syntax                 = syntax_;
+    machine_policy.ambiguity              = ambiguity_;
+    machine_policy.intent                 = intent_;
     machine_ = ToolCallStreamParser(machine_policy);
 }
 
@@ -629,36 +666,34 @@ ToolCallOutputDecoder::Terminal ToolCallOutputDecoder::finish(FinishReason finis
     finished_ = true;
     if (!contract_) { return {}; }
 
-    std::string region;
-    if (machine_.latched()) { region.assign(machine_.latched_region()); }
-    // R7-01b: the terminal re-parse must carry the same intent policy as the live machine;
-    // no default may silently substitute TemplateCompatible.
-    ParsedToolCallOutput parsed = parse_qwen_tool_call_output(region, max_tool_name_length_,
-                                                              *contract_, tolerant_, finish_reason,
-                                                              syntax_, ambiguity_, intent_);
-    // R3-06/R10: the entry re-parse sees only the region; the pre-latch diagnostics come
-    // from the live entry scanner (the same pre-latch bytes, deterministic over the byte
-    // stream). N-06: apply the same latch rule as the one-shot entry — a latch only happens
-    // outside a fence, so the unclosed-fence flag is not ORed in when latched, keeping
-    // streaming equal to one-shot.
-    const ToolCallEntryScanner& entry = machine_.entry();
-    parsed.diagnostics.fenced_markers_suppressed   += entry.fenced_markers_suppressed();
-    parsed.diagnostics.indented_markers_suppressed += entry.indented_markers_suppressed();
-    if (!machine_.latched()) {
-        parsed.diagnostics.ended_in_unclosed_fence |= entry.ended_in_unclosed_fence();
-    }
-    if (machine_.latched() && parsed.is_tool_call_response) {
-        // The parser reports the held bytes before the accepted structured region, which are
-        // the bytes after an earlier quoted marker that this decoder has not published yet.
-        std::string content = std::move(parsed.content);
-        return Terminal{.content     = std::move(content),
-                        .tool_calls  = std::move(parsed.tool_calls),
-                        .diagnostics = parsed.diagnostics};
+    // R11-03 (R11-I9): finalize the live machine. It already classified every entry over the
+    // full physical-line context (pre-latch bytes included) and carries the contract-aware
+    // policy; there is no second region-only re-parse. The shared materialization applies the
+    // exact one-shot boundary (declared-name defense in depth, the R3-08 ambiguity rule,
+    // schema-aware normalization), so one-shot and streaming outcomes cannot drift.
+    const ToolCallStreamResult result = machine_.finish(finish_reason);
+    const MaterializedToolCallResult materialized =
+        materialize_tool_call_result(result, *contract_);
+
+    if (materialized.accepted && machine_.latched()) {
+        // The machine's tail is the held text between the first latched marker and the
+        // accepted region — the only bytes the decoder has not published yet (everything
+        // before the first latch already left through feed()).
+        return Terminal{.content     = rtrim_format_whitespace(result.tail),
+                        .tool_calls  = std::move(materialized.calls),
+                        .diagnostics = materialized.diagnostics};
     }
 
-    std::string tail = machine_.latched() ? std::move(region) : machine_.held_tail();
-    return Terminal{
-        .content = std::move(tail), .tool_calls = {}, .diagnostics = parsed.diagnostics};
+    // Fallback: publish the held bytes verbatim. Latched-but-unparsable — or latched but
+    // rejected by the materialization boundary (the ambiguity rule) after Stage 1 accepted:
+    // the whole latched region. result.tail is the bytes before the accepted base and is
+    // empty when Stage 1 accepted at base zero, so it must not stand in for the region.
+    // Never latched: only the held candidate tail (the pre-latch content was already
+    // published through feed()).
+    const std::string tail =
+        machine_.latched() ? std::string(machine_.latched_region()) : machine_.held_tail();
+    return Terminal{.content = std::move(tail), .tool_calls = {},
+                    .diagnostics = materialized.diagnostics};
 }
 
 } // namespace ninfer::models::qwen3_5::frontend

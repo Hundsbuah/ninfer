@@ -1,4 +1,6 @@
 #include "models/qwen3_5/frontend/tool_call_entry_scan.h"
+#include <algorithm>
+
 
 namespace ninfer::models::qwen3_5::frontend {
 
@@ -297,6 +299,64 @@ ToolCallEntryScanner::FeedResult ToolCallEntryScanner::feed(std::string_view byt
         }
     }
     return out;
+}
+
+ToolCallLineIndentationScan::ToolCallLineIndentationScan(std::string_view pre_latch,
+                                                         std::string_view region) noexcept
+    : pre_latch_size_(pre_latch.size()) {
+    const std::size_t P    = pre_latch.size();
+    const std::size_t total = P + region.size();
+    auto byte_at = [P, pre_latch, region](std::size_t i) -> char {
+        return i < P ? pre_latch[i] : region[i - P];
+    };
+
+    std::size_t line_start      = 0;
+    std::size_t column          = 0;
+    std::size_t first_nonspace  = 0;
+    std::size_t column_at_first = 0;
+    bool        seen_nonspace   = false;
+
+    for (std::size_t i = 0; i <= total; ++i) {
+        const bool line_end = (i == total) || byte_at(i) == '\n';
+        if (line_end) {
+            // A line with no non-formatting byte: first_nonspace sits at the line end
+            // (outside the line's byte range), so no marker inside the line can match it.
+            lines_.push_back(Line{line_start, seen_nonspace ? first_nonspace : i,
+                                  seen_nonspace ? column_at_first : 0});
+            line_start      = i + 1;
+            column          = 0;
+            seen_nonspace   = false;
+            if (i == total) { break; }
+            continue;
+        }
+        if (seen_nonspace) { continue; }
+        const char b = byte_at(i);
+        if (b == ' ') {
+            column += 1;
+        } else if (b == '\t') {
+            column = next_tab_stop(column);
+        } else if (b != '\r') {
+            // The line's first non-formatting byte; the accumulated column is its visual
+            // indentation (the Round-10 rule).
+            seen_nonspace   = true;
+            first_nonspace  = i;
+            column_at_first = column;
+        }
+        // '\r' changes no column and is not a non-formatting byte for this rule.
+    }
+}
+
+bool ToolCallLineIndentationScan::marker_is_indented_literal(std::size_t marker_at) const noexcept {
+    if (lines_.empty()) { return false; }
+    const std::size_t full_m = pre_latch_size_ + marker_at;
+    // The line containing full_m is the last line with start <= full_m (lines are sorted by
+    // start and tile the text contiguously).
+    const auto it = std::upper_bound(
+        lines_.begin(), lines_.end(), full_m,
+        [](std::size_t value, const Line& line) { return value < line.start; });
+    if (it == lines_.begin()) { return false; }
+    const Line& line = *std::prev(it);
+    return full_m == line.first_nonspace && line.column_at_first >= 4;
 }
 
 } // namespace ninfer::models::qwen3_5::frontend
