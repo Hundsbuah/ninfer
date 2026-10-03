@@ -407,8 +407,8 @@ ops::CausalAttentionExecutionEnvelope execution_envelope(int visible, int maximu
     if (maximum != 0 && maximum < visible)
         throw std::invalid_argument("--envelope-max is smaller than the visible input");
     ops::CausalAttentionExecutionEnvelope envelope{
-        maximum == 0 ? static_cast<unsigned>(visible) : 1U,
-        static_cast<unsigned>(maximum == 0 ? visible : maximum)};
+        .min_visible_keys = maximum == 0 ? static_cast<unsigned>(visible) : 1U,
+        .max_visible_keys = static_cast<unsigned>(maximum == 0 ? visible : maximum)};
     envelope.fast_prompt_kernel = envelope_fast_prompt;
     return envelope;
 }

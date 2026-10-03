@@ -959,8 +959,6 @@ ToolCallStreamResult ToolCallStreamParser::finish(FinishReason finish_reason) co
         scan(tool_close_literal(ToolTagKind::Parameter), index.parameter_closes);
         scan(tool_close_literal(ToolTagKind::Param), index.param_closes);
     }
-    const bool natural_stop =
-        finish_reason == FinishReason::StopToken || finish_reason == FinishReason::None;
 
     // Stage 1 (R3-02/R3-04/R3-06): the greedy parse + retry chain. Only a clean Complete is
     // accepted here; every other attempt feeds Stage 2 (consistent completion) and Stage 3
@@ -999,15 +997,20 @@ ToolCallStreamResult ToolCallStreamParser::finish(FinishReason finish_reason) co
         // so the cutoff is structural (no numeric base comparison).
         if (policy_.intent == ToolCallIntentPolicy::RequireToolAtContentStart) { break; }
         // R3-02: a prose break directly after an open wrapper owns no scope (the retry may
-        // re-read from the break offset). R2-I1/R3-04: a wrapper that failed while parsing
-        // a function header owns its scope; an open value keeps its payload after a cut
-        // (the value bytes may be the real truncated call) but not after a natural stop.
+        // re-read from the break offset). R2-I1: a wrapper that failed while parsing a
+        // function header owns its scope. R12-I1 (open-value ownership): when the attempt
+        // ended in an open parameter value, every remaining byte from that value start
+        // through terminal EOF belongs to that value for recovery-entry purposes, whatever
+        // the finish reason: no nested marker in those bytes may become a new retry base,
+        // independent of finish reason, indentation, syntax family, tolerance, or ambiguity
+        // policy. This replaces the old natural-stop exception, which let an embedded marker
+        // promote into an executable entry solely because the stream ended naturally.
         const bool owned = last.progress.wrapper_at_break != ToolWrapperKind::None &&
                            !last.progress.prose_after_wrapper;
         const bool open_value =
             last.progress.termination == ToolCallRegionTermination::EndOfInput &&
             last.progress.open_value_open;
-        if (owned || (open_value && !natural_stop)) { break; }
+        if (owned || open_value) { break; }
         // The retried slice starts with the entry marker (a latched or retry-found complete
         // marker). A definitive break at the marker's own header must not re-read that same
         // marker; the search starts strictly after the failed marker's opener bytes, or at
@@ -1025,15 +1028,13 @@ ToolCallStreamResult ToolCallStreamParser::finish(FinishReason finish_reason) co
         // as the initial latch — a marker may not become executable merely because the
         // recovery search found it instead of the entry scanner. Fence precedence comes
         // first (R11-I4): a fenced candidate is fence-suppressed and is never counted as an
-        // indented suppression. R11-I5: when the failed attempt ended in an open value, the
-        // payload bytes are owned by the wire parser (they may be the real truncated call),
-        // so an embedded marker is not an entry candidate and the entry rule does not apply
-        // to it. The search advances monotonically, so each candidate is examined once: a
-        // skipped complete candidate is counted exactly once (R11-I14), and a candidate
-        // that becomes the base is never counted.
+        // indented suppression. R12-I1: an open-value attempt never reaches the search —
+        // the cutoff above stops the chain — so the value's payload is not candidate
+        // territory at all. The search advances monotonically, so each candidate is
+        // examined once: a skipped complete candidate is counted exactly once (R11-I14),
+        // and a candidate that becomes the base is never counted.
         auto candidate_suppressed = [&](std::size_t candidate) {
             if (fenced[candidate]) { return true; } // R3-06
-            if (open_value) { return false; }       // R11-I5
             if (retry_indent_scan == std::nullopt) { retry_indent_scan.emplace(content_, region_); }
             if (!retry_indent_scan->marker_is_indented_literal(candidate)) { return false; }
             ++result.indented_markers_suppressed;
@@ -1066,6 +1067,15 @@ ToolCallStreamResult ToolCallStreamParser::finish(FinishReason finish_reason) co
         for (const Attempt& attempt : chain) {
             // N-02: skip a base only when neither family carries a closer at or after it.
             if (!index.has_close_at_or_after(attempt.base)) { continue; }
+            // R12-I1 (open-value ownership): an attempt that ended in an open parameter value
+            // owns every remaining byte; consistent completion must not reinterpret the
+            // value's nested markup (an inner closer closing the open value, a later closer
+            // closing the open function) into a completion of that open function. The gate is
+            // per attempt: complete calls preceding a later broken call in an earlier chain
+            // attempt, or earlier complete calls recorded in `progress.calls` of a tolerant
+            // Stage-3 commit, are unaffected — the open call itself is never in `calls`.
+            if (attempt.progress.termination == ToolCallRegionTermination::EndOfInput &&
+                attempt.progress.open_value_open) { continue; }
             Stage2Path path;
             ToolCallParseProgress out;
             const Stage2Verdict verdict = run_stage2_base(cx, attempt.base, path, out);

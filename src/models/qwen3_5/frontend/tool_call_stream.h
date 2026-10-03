@@ -252,7 +252,8 @@ struct ToolCallStreamResult {
     bool markup_tolerant_completion = false;
     std::uint32_t fenced_markers_suppressed = 0;
     // R10-03: complete top-level markers suppressed because their '<' began on an indented
-    // literal line (visual column >= 4 outside a fence, pre-latch only).
+    // literal line (visual column >= 4 outside a fence) — pre-latch entries and recovery
+    // retry/rebase candidates (R11-I3) alike, never fenced markers.
     std::uint32_t indented_markers_suppressed = 0;
     bool ended_in_unclosed_fence = false;
 };

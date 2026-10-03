@@ -676,6 +676,29 @@ int main() {
                                 "tool-call marker suppressed in indented literal content") ==
                                std::string::npos,
         "R10-03: the indented warning fired for a latched marker");
+
+    // R12-05: the R11-F shape (a latched initial region fails, the indented retry candidate is
+    // suppressed, no call commits): the generic parser-fallback warning carries the bounded
+    // indented-suppression clause, and the dedicated pre-latch warning stays silent (it only
+    // covers the no-marker case). One bounded clause, never one per marker.
+    GenerationOutcome retry_outcome = outcome;
+    retry_outcome.tool_call_parse = {
+        .marker_seen               = true,
+        .structured_call_count     = 0,
+        .indented_markers_suppressed = 1,
+        .fallback_reason           = ninfer::ToolCallParseFallbackReason::MalformedStructure,
+    };
+    retry_outcome.text = "<function=read>\n<parameter=path>\ncut\n    <tool_call>\n    <function=bash>\n    </function>";
+    const std::optional<OperationalRecord> retry_rec =
+        render_tool_call_fallback(context, retry_outcome);
+    failures += check(retry_rec &&
+                          retry_rec->severity == OperationalSeverity::Warning &&
+                          retry_rec->message.find(" | indented_markers_suppressed=1") !=
+                              std::string::npos &&
+                          retry_rec->message.find(
+                              "tool-call marker suppressed in indented literal content") ==
+                              std::string::npos,
+                      "R12-05: the generic fallback warning lost the indented-suppression clause");
     // The snippet starts at the first marker of any Qwen marker family, not only <tool_call>.
     GenerationOutcome family_outcome = outcome;
     family_outcome.tool_call_parse = {

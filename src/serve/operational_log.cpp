@@ -413,6 +413,14 @@ std::optional<OperationalRecord> render_tool_call_fallback(const RequestLogConte
     if (outcome.tool_call_parse.parse_budget_exhausted) {
         message += " | parse budget exhausted";
     }
+    // R12-05: a retry/rebase candidate suppressed by the indented-literal rule (R11-01) is a
+    // structural diagnostic of the fallback verdict — the dedicated pre-latch warning above
+    // only covers the no-marker case (R10-03), so the generic message carries the count too.
+    // One bounded clause per record, never one per marker.
+    if (outcome.tool_call_parse.indented_markers_suppressed > 0) {
+        message += " | indented_markers_suppressed=" +
+                   std::to_string(outcome.tool_call_parse.indented_markers_suppressed);
+    }
     const std::array<std::string_view, 4> kMarkerFamilies = {"<tool_call>", "<function_calls>",
                                                              "<function=", "<invoke "};
     std::string snippet;

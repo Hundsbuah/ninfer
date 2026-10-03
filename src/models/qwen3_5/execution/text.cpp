@@ -1375,8 +1375,8 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                         Tensor next_hidden =
                             work_.alloc(DType::BF16, {dimension(config_.hidden_size), 1});
                         const auto ar_visible = static_cast<std::uint32_t>(base_i + T + i);
-                        const ops::CausalAttentionExecutionEnvelope ar_envelope{ar_visible,
-                                                                                ar_visible};
+                        const ops::CausalAttentionExecutionEnvelope ar_envelope{
+                            .min_visible_keys = ar_visible, .max_visible_keys = ar_visible};
                         mtp_forward_ar_step(prev_token, io_.mtp->ar_hidden, ar_position,
                                             ar_envelope, next_hidden, logits, next_token);
                         CUDA_CHECK(cudaMemcpyAsync(io_.mtp->ar_hidden.data, next_hidden.data,

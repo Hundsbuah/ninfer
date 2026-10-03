@@ -313,58 +313,6 @@ void run_text(const Options& options, int query_heads, int key_heads, int tokens
                 options.execution == Execution::Graph ? 32 : 1);
 }
 
-// The text profile of the two registered geometries. `split` is what every full-attention layer
-// issues today: normalize q, normalize k, rotate both. `fused` is the Op that replaces the three.
-void run_text(const Options& options, int query_heads, int key_heads, int tokens,
-              cudaStream_t stream) {
-    const auto positions_host = host_positions(tokens);
-    DeviceBuffer positions(positions_host.size() * sizeof(std::int32_t));
-    positions.copy_from_host(positions_host.data(), positions.bytes);
-    const std::size_t q_elements = static_cast<std::size_t>(kTextHeadDim) * query_heads * tokens;
-    const std::size_t k_elements = static_cast<std::size_t>(kTextHeadDim) * key_heads * tokens;
-    DeviceBuffer q               = bench::make_bf16(q_elements);
-    DeviceBuffer k               = bench::make_bf16(k_elements);
-    DeviceBuffer qn              = bench::make_bf16(q_elements);
-    DeviceBuffer kn              = bench::make_bf16(k_elements);
-    DeviceBuffer q_weight        = bench::make_bf16(kTextHeadDim);
-    DeviceBuffer k_weight        = bench::make_bf16(kTextHeadDim);
-    Tensor t_positions(positions.p, DType::I32, {tokens});
-    Tensor t_q(q.p, DType::BF16, {kTextHeadDim, query_heads, tokens});
-    Tensor t_k(k.p, DType::BF16, {kTextHeadDim, key_heads, tokens});
-    Tensor t_qn(qn.p, DType::BF16, {kTextHeadDim, query_heads, tokens});
-    Tensor t_kn(kn.p, DType::BF16, {kTextHeadDim, key_heads, tokens});
-    Tensor t_q_weight(q_weight.p, DType::BF16, {kTextHeadDim});
-    Tensor t_k_weight(k_weight.p, DType::BF16, {kTextHeadDim});
-    const auto launch = [&](cudaStream_t launch_stream) {
-        if (options.route == Route::Fused) {
-            ops::rmsnorm_rope(t_positions, t_q_weight, t_k_weight, t_q, t_k, t_qn, t_kn,
-                              launch_stream);
-            return;
-        }
-        ops::rmsnorm(t_q, t_q_weight, kTextEps, true, t_qn, launch_stream);
-        ops::rmsnorm(t_k, t_k_weight, kTextEps, true, t_kn, launch_stream);
-        ops::rope(t_positions, kTextRotaryDim, kTextRopeBase, t_qn, t_kn, launch_stream);
-    };
-    if (options.profile) {
-        for (int index = 0; index < options.warmup; ++index) launch(stream);
-        CUDA_CHECK(cudaStreamSynchronize(stream));
-        CUDA_CHECK(cudaProfilerStart());
-        launch(stream);
-        CUDA_CHECK(cudaStreamSynchronize(stream));
-        CUDA_CHECK(cudaProfilerStop());
-        return;
-    }
-    // Read in, write out, for both operands.
-    const double bytes         = 2.0 * 2.0 * static_cast<double>(q_elements + k_elements);
-    const bench::Result timing = measure(options, launch, bytes, stream);
-    std::printf("form=text route=%s Q=%d K=%d T=%d execution=%s median=%.3f us min=%.3f us "
-                "p95=%.3f us useful=%.1f GB/s graph_repetitions=%d cache=warm\n",
-                options.route == Route::Fused ? "fused" : "split", query_heads, key_heads, tokens,
-                options.execution == Execution::Graph ? "graph" : "eager", timing.median_us,
-                timing.min_us, timing.p95_us, timing.gbs,
-                options.execution == Execution::Graph ? 32 : 1);
-}
-
 } // namespace
 
 int main(int argc, char** argv) {

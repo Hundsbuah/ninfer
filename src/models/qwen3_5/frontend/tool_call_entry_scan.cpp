@@ -302,7 +302,7 @@ ToolCallEntryScanner::FeedResult ToolCallEntryScanner::feed(std::string_view byt
 }
 
 ToolCallLineIndentationScan::ToolCallLineIndentationScan(std::string_view pre_latch,
-                                                         std::string_view region) noexcept
+                                                         std::string_view region)
     : pre_latch_size_(pre_latch.size()) {
     const std::size_t P    = pre_latch.size();
     const std::size_t total = P + region.size();

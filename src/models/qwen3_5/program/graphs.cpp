@@ -345,8 +345,8 @@ void ProgramImpl::prepare_graphs() {
                 profile.max_execution_frontier = planned.max;
                 profile.topology_class =
                     planned.topology_class * ordinary_batch_limit + (batch_size - 1U);
-                const ops::CausalAttentionExecutionEnvelope envelope{planned.min + 1,
-                                                                     planned.max + 1};
+                const ops::CausalAttentionExecutionEnvelope envelope{
+                    .min_visible_keys = planned.min + 1, .max_visible_keys = planned.max + 1};
                 execution::capture_ordinary_decode_batch(ordinary_state,
                                                          static_cast<std::int32_t>(batch_size),
                                                          envelope, profile.definition);
@@ -425,9 +425,11 @@ void ProgramImpl::prepare_graphs() {
             validate_graph_profiles(planned_profiles, capacity - 1, "DFlash");
             const GraphExecutionProfile code_warm = planned_profiles.front();
             const ops::CausalAttentionExecutionEnvelope code_warm_target{
-                1,
-                static_cast<std::uint32_t>(std::min<std::uint64_t>(
-                    capacity, static_cast<std::uint64_t>(code_warm.max) + family_window + 1ULL))};
+                .min_visible_keys = 1,
+                .max_visible_keys =
+                    static_cast<std::uint32_t>(std::min<std::uint64_t>(
+                        capacity, static_cast<std::uint64_t>(code_warm.max) + family_window +
+                                                          1ULL))};
             prepare_family(code_warm.min, 1);
             device.synchronize();
             {
@@ -462,9 +464,10 @@ void ProgramImpl::prepare_graphs() {
                     profile.topology_class =
                         planned.topology_class * max_concurrency + (batch_size - 1U);
                     const ops::CausalAttentionExecutionEnvelope target_envelope{
-                        1, static_cast<std::uint32_t>(std::min<std::uint64_t>(
-                               capacity,
-                               static_cast<std::uint64_t>(planned.max) + family_window + 1ULL))};
+                        .min_visible_keys = 1,
+                        .max_visible_keys = static_cast<std::uint32_t>(std::min<std::uint64_t>(
+                            capacity,
+                            static_cast<std::uint64_t>(planned.max) + family_window + 1ULL))};
 
                     execution::capture_dflash_decode_batch(
                         dflash_state, static_cast<std::int32_t>(batch_size), family_window,

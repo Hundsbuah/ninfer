@@ -189,12 +189,16 @@ completion as unbalanced. The earliest base whose completion is balanced wins; o
 completion wins; two or more unbalanced completions make the region ambiguous
 (`ambiguous_structure`), as does a call of a declared tool that carries a synthetic argument
 (a repeated parameter name, or a non-declared name outside the first parameter of a tool with
-an unambiguous declared schema). Stage 2 is bounded by a deterministic work budget (four units
 per region byte, at least 100 000); a region that exhausts it is returned as text and records
-`parse_budget_exhausted`. The residual ambiguity is documented in the Round-3 spec §9: a bare
-(unwrapped) call whose open value contains a complete example, ended by a natural stop, commits
-the example as the turn (R3-04), and a degenerate output made only of prose and unfenced complete
-examples commits its last example in strict mode.
+`parse_budget_exhausted`. Ownership of an open value (Round 12, R12-I1): when the input ends
+while a parameter value is still open (`EndOfInput` with the value open), the region's bytes are
+not an entry and no retry may rebase on them — the region is returned as text
+(`MalformedStructure` in strict, `TruncatedTail` in tolerant), even when the open value contains
+a complete embedded example (the superseded Round-3 R3-04 natural-stop residual). A complete call
+that preceded the broken open-value call still commits in tolerant mode. A different, older
+residual remains for a complete, declared, canonical, unfenced example whose bytes are identical
+to a genuine action (see "Semantic quotation residual"): a degenerate output made only of prose
+and unfenced complete examples commits its last example in strict mode.
 
 ## Native and compatibility syntax
 

@@ -2492,38 +2492,43 @@ int test_r11_post_reasoning_separator_preserves_indentation() {
                               calls.front().arguments_json == "{\"command\":\"echo real\"}",
                           "R11 J: the genuine column-zero call after reasoning did not commit");
     }
-    // K: the CR/LF separator and a split across the indented call's marker prefix: the
-    //    verdict (0 calls) and the byte-exact content are the same as the unsplit I.
+    // K: the two-logical-break CRLF separator (four bytes) with the second CRLF split across
+    //    token rounds (its CR ends one round, its LF opens the next — the pending CR must
+    //    survive the commit): the verdict (0 calls) and the byte-exact content are the same
+    //    as the unsplit I.
     {
         auto session = frontend.make_output_session(prompt, {}, options);
         std::vector<ninfer::TokenId> first = fixture_tokens("thinking ");
         first.push_back(kFixtureThinkCloseToken);
-        const auto separator = fixture_tokens("\r\n");
-        first.insert(first.end(), separator.begin(), separator.end());
+        const auto c1 = fixture_tokens("\r\n"); // logical break one
+        first.insert(first.end(), c1.begin(), c1.end());
         const auto d1 = session.preview_model(
             first, static_cast<std::uint32_t>(first.size()) + 1, ninfer::FinishReason::OutputLimit);
         (void)d1;
         const auto out1 = session.commit_preview();
         failures += check(channel_text(out1, ninfer::OutputChannel::Content).empty(),
-                          "R11 K: the CR/LF separator was published instead of stripped");
+                          "R12 K: the first CRLF separator was published instead of stripped");
 
-        const std::size_t split = 10; // inside the <tool_call> marker prefix
-        const auto part_a = fixture_tokens(std::string_view(indented_call).substr(0, split));
+        const auto cr = fixture_tokens("\r"); // CR of logical break two, alone in a round
         const auto d2 = session.preview_model(
-            part_a, static_cast<std::uint32_t>(part_a.size()) + 1, ninfer::FinishReason::OutputLimit);
+            cr, static_cast<std::uint32_t>(cr.size()) + 1, ninfer::FinishReason::OutputLimit);
         (void)d2;
         const auto out2 = session.commit_preview();
-        const auto part_b = fixture_tokens(std::string_view(indented_call).substr(split));
+        failures += check(channel_text(out2, ninfer::OutputChannel::Content).empty(),
+                          "R12 K: the split CR of the second CRLF was published");
+
+        const std::string tail = std::string("\n") + indented_call;
+        const auto part_b = fixture_tokens(tail);
         const auto d3 = session.preview_model(
             part_b, static_cast<std::uint32_t>(part_b.size()), ninfer::FinishReason::OutputLimit);
         (void)d3;
         const auto out3 = session.commit_preview();
         const auto calls = session.take_tool_calls();
         failures += check(calls.empty(),
-                          "R11 K: the split indented call latched (separator or split destroyed the rule)");
+                          "R12 K: the split indented call latched (separator or split destroyed the rule)");
         failures += check(channel_text(out2, ninfer::OutputChannel::Content) +
                               channel_text(out3, ninfer::OutputChannel::Content) == indented_call,
-                          "R11 K: the split indented call was not returned byte-exact");
+                          "R12 K: the split indented call was not returned byte-exact");
     }
     // G: after the close (confirmed by its line break), a leading SPACE is genuine Content
     //    and must be preserved — the separator rule stops at the first non-CR/LF byte, and
@@ -2548,6 +2553,117 @@ int test_r11_post_reasoning_separator_preserves_indentation() {
         const auto out2 = session.commit_preview();
         failures += check(channel_text(out2, ninfer::OutputChannel::Content) == " answer",
                           "R11 G: the leading space after the reasoning close was stripped");
+    }
+
+    // R12-02 required tests (spec §3.6): K2 (CRLF/CRLF + genuine call), L/M (the third and
+    // fourth logical breaks are Content), N (separator split points), O (leading TAB),
+    // P (a Content stop string starting in the preserved third logical break).
+    const auto close_tokens = [&]() {
+        std::vector<ninfer::TokenId> t = fixture_tokens("thinking ");
+        t.push_back(kFixtureThinkCloseToken);
+        return t;
+    };
+    // K2: the CRLF/CRLF separator (two logical breaks, four bytes) and a column-zero call:
+    //    the genuine call still executes.
+    {
+        auto session = frontend.make_output_session(prompt, {}, options);
+        auto first   = close_tokens();
+        const auto separator = fixture_tokens("\r\n\r\n");
+        first.insert(first.end(), separator.begin(), separator.end());
+        (void)session.preview_model(first, static_cast<std::uint32_t>(first.size()) + 1,
+                                    ninfer::FinishReason::OutputLimit);
+        (void)session.commit_preview();
+        const auto second = fixture_tokens(real_call);
+        (void)session.preview_model(second, static_cast<std::uint32_t>(second.size()),
+                                    ninfer::FinishReason::OutputLimit);
+        (void)session.commit_preview();
+        const auto calls = session.take_tool_calls();
+        failures += check(calls.size() == 1 && calls.front().name == "bash" &&
+                              calls.front().arguments_json == "{\"command\":\"echo real\"}",
+                          "R12 K2: the genuine call after the CRLF/CRLF separator did not commit");
+    }
+    // L: four LF breaks after the close: the first two are framing, the next two are Content.
+    {
+        auto session = frontend.make_output_session(prompt, {}, options);
+        auto tokens  = close_tokens();
+        const auto rest = fixture_tokens("\n\n\n\nHello");
+        tokens.insert(tokens.end(), rest.begin(), rest.end());
+        (void)session.preview_model(tokens, static_cast<std::uint32_t>(tokens.size()),
+                                    ninfer::FinishReason::OutputLimit);
+        const auto output = session.commit_preview();
+        failures += check(channel_text(output, ninfer::OutputChannel::Content) == "\n\nHello",
+                          "R12 L: the third and fourth LF breaks were stripped instead of Content");
+    }
+    // M: three CRLF breaks after the close: the third CRLF is Content.
+    {
+        auto session = frontend.make_output_session(prompt, {}, options);
+        auto tokens  = close_tokens();
+        const auto rest = fixture_tokens("\r\n\r\n\r\nHello");
+        tokens.insert(tokens.end(), rest.begin(), rest.end());
+        (void)session.preview_model(tokens, static_cast<std::uint32_t>(tokens.size()),
+                                    ninfer::FinishReason::OutputLimit);
+        const auto output = session.commit_preview();
+        failures += check(channel_text(output, ninfer::OutputChannel::Content) == "\r\nHello",
+                          "R12 M: the third CRLF was stripped instead of published");
+    }
+    // N: every split point of the K stream (before the first CR, between the CR/LF of the
+    //    second CRLF, between the two logical breaks, immediately before the first Content
+    //    byte) yields the same verdict and byte-exact content as the unsplit stream.
+    {
+        const std::string stream = "thinking </think>\r\n\r\n" + indented_call;
+        const std::size_t splits[] = {std::string("thinking </think>").size(), // before CR
+                                      std::string("thinking </think>\r\n\r").size(), // CR/LF split
+                                      std::string("thinking </think>\r\n").size(), // between breaks
+                                      std::string("thinking </think>\r\n\r\n").size()}; // pre-Content
+        for (const std::size_t split : splits) {
+            auto session = frontend.make_output_session(prompt, {}, options);
+            const auto part_a = fixture_tokens(std::string_view(stream).substr(0, split));
+            (void)session.preview_model(part_a, static_cast<std::uint32_t>(part_a.size()) + 1,
+                                        ninfer::FinishReason::OutputLimit);
+            (void)session.commit_preview();
+            const auto part_b = fixture_tokens(std::string_view(stream).substr(split));
+            (void)session.preview_model(part_b, static_cast<std::uint32_t>(part_b.size()),
+                                        ninfer::FinishReason::OutputLimit);
+            const auto output = session.commit_preview();
+            const auto calls  = session.take_tool_calls();
+            const std::string n_message =
+                "R12 N: split at " + std::to_string(split) + " diverged from the unsplit stream";
+            failures += check(calls.empty() &&
+                                  channel_text(output, ninfer::OutputChannel::Content) ==
+                                      indented_call,
+                              n_message.c_str());
+        }
+    }
+    // O: a leading TAB after the separator is content indentation, not separator framing.
+    {
+        auto session = frontend.make_output_session(prompt, {}, options);
+        auto tokens  = close_tokens();
+        const auto rest = fixture_tokens("\n\n\tanswer");
+        tokens.insert(tokens.end(), rest.begin(), rest.end());
+        (void)session.preview_model(tokens, static_cast<std::uint32_t>(tokens.size()),
+                                    ninfer::FinishReason::OutputLimit);
+        const auto output = session.commit_preview();
+        failures += check(channel_text(output, ninfer::OutputChannel::Content) == "\tanswer",
+                          "R12 O: the leading TAB after the reasoning close was stripped");
+    }
+    // P: a Content stop string whose first byte is the preserved third logical break still
+    //    matches (the bounded strip never eats stop-string bytes) and yields StopString.
+    {
+        ninfer::StopPolicy stop = {.include_model_defaults = false};
+        stop.strings.push_back(ninfer::StopString{.text = std::string("\nHello")});
+        auto session = frontend.make_output_session(prompt, stop, options);
+        auto tokens  = close_tokens();
+        const auto rest = fixture_tokens("\n\n\nHello");
+        tokens.insert(tokens.end(), rest.begin(), rest.end());
+        const auto decision =
+            session.preview_model(tokens, static_cast<std::uint32_t>(tokens.size()),
+                                  ninfer::FinishReason::OutputLimit);
+        const auto output = session.commit_preview();
+        failures += check(decision.finished() &&
+                              decision.finish_reason == ninfer::FinishReason::StopString,
+                          "R12 P: the stop string starting in the third logical break did not match");
+        failures += check(channel_text(output, ninfer::OutputChannel::Content).empty(),
+                          "R12 P: bytes after the stripped framing leaked before the stop match");
     }
     return failures;
 }
@@ -2589,6 +2705,119 @@ int test_reasoning_split(const Frontend& frontend) {
                       "content channel did not strip the post-thinking separator");
     failures += check(session.reasoning_tokens() == 2,
                       "reasoning token usage did not count accepted reasoning tokens exactly");
+    return failures;
+}
+
+// R12-03 (R12-I3): the presentation layer (reasoning close + channel split) and the
+// prefix-execution identity tracker must decide on the SAME shared reasoning-boundary
+// grammar. Cross-layer parity (spec §4.6): for every input form, the presentation close
+// verdict and the prefix-execution split must agree with the table; split-marker and
+// CR/LF-split streams must reach the same verdict and logical boundary as their unsplit
+// form. The resulting prefix identity (rewrite_execution_frontiers behavior) is covered by
+// test_runtime_mechanisms (append_generated with a split frontier equals the rebuilt
+// history), which consumes exactly the frontier this test records.
+int test_r12_reasoning_boundary_parity(const Frontend& frontend) {
+    int failures = 0;
+    ninfer::ChatMessage message;
+    message.role = ninfer::ChatRole::User;
+    message.parts.push_back(
+        ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text, .text = "x", .media = {}});
+    ninfer::PromptInput input;
+    input.messages.push_back(std::move(message));
+    input.options.continuation    = ninfer::PromptContinuationMode::NewAssistantTurn;
+    input.options.enable_thinking = true;
+    const auto prompt             = frontend.prepare(std::move(input));
+    auto session = [&prompt, &frontend]() { return frontend.make_output_session(prompt, {}); };
+
+    // One byte-token per byte: a boundary at decoded offset N falls on token frontier N.
+    // `</think>` is eight bytes; the presentation close is pinned by the reasoning channel
+    // (the bytes before the confirmed marker, or the whole text when quoted) and the empty
+    // content channel (the bounded framing is stripped).
+    struct Case {
+        const char* name;
+        const char* text; // the bytes after `thought` (the reasoning prefix)
+        const char* reasoning; // the expected reasoning channel for the whole stream
+        bool        prefix_split;
+        std::uint32_t split_after = 0; // token frontier of the split (if prefix_split)
+    };
+    const std::vector<Case> cases = {
+        {"canonical LF", "\n</think>\n\n", "thought\n", true, 18},
+        {"CRLF before and after", "\r\n</think>\r\n\r\n", "thought\r\n", true, 21},
+        {"CRLF after only", "</think>\r\n\r\n", "thought", true, 19},
+        {"quoted space", "</think> tag", "thought</think> tag", false, 0},
+        {"quoted quote", "</think>;', then more", "thought</think>;', then more", false, 0},
+    };
+    for (const Case& c : cases) {
+        auto s            = session();
+        const std::string full = std::string("thought") + c.text;
+        const auto tokens      = fixture_tokens(full);
+        const auto decision    =
+            s.preview_model(tokens, static_cast<std::uint32_t>(tokens.size() + 1U),
+                            ninfer::FinishReason::OutputLimit);
+        const auto output = s.commit_preview();
+        const bool close = channel_text(output, ninfer::OutputChannel::Reasoning) == c.reasoning &&
+                           channel_text(output, ninfer::OutputChannel::Content).empty();
+        const bool split = decision.prefix_execution_split_after.has_value();
+        const std::string parity_message =
+            std::string("R12 parity ") + c.name + ": presentation close and prefix-execution "
+                                              "split disagree";
+        failures += check(close && split == c.prefix_split &&
+                              (!c.prefix_split ||
+                               *decision.prefix_execution_split_after == c.split_after),
+                          parity_message.c_str());
+    }
+    // Marker split across a token boundary: `thought</thi` | `nk>\n\n` — the logical boundary
+    // (end of the second round's last token) matches the unsplit canonical frontier; the
+    // split is recorded round-locally (token index within the accepted round span).
+    {
+        auto s               = session();
+        const auto part_a    = fixture_tokens("thought</thi");
+        const auto decision_a =
+            s.preview_model(part_a, static_cast<std::uint32_t>(part_a.size() + 1U),
+                            ninfer::FinishReason::OutputLimit);
+        const auto output_a  = s.commit_preview();
+        const auto part_b    = fixture_tokens("nk>\n\n");
+        const auto decision_b =
+            s.preview_model(part_b, static_cast<std::uint32_t>(part_b.size() + 1U),
+                            ninfer::FinishReason::OutputLimit);
+        const auto output_b  = s.commit_preview();
+        failures += check(!decision_a.prefix_execution_split_after &&
+                              decision_b.prefix_execution_split_after ==
+                                  static_cast<std::uint32_t>(part_b.size()) &&
+                              channel_text(output_a, ninfer::OutputChannel::Reasoning) +
+                                  channel_text(output_b, ninfer::OutputChannel::Reasoning) ==
+                                  "thought" &&
+                              channel_text(output_a, ninfer::OutputChannel::Content) +
+                                  channel_text(output_b, ninfer::OutputChannel::Content) == "",
+                          "R12 parity marker-split: the split-marker stream diverged from the "
+                          "unsplit logical boundary");
+    }
+    // CR split from LF: `thought</think>\r` | `\n\n` — the CRLF confirms the close across the
+    // round boundary; the logical boundary (end of the second round's last token) matches the
+    // unsplit CRLF-after frontier, recorded round-locally.
+    {
+        auto s               = session();
+        const auto part_a    = fixture_tokens("thought</think>\r");
+        const auto decision_a =
+            s.preview_model(part_a, static_cast<std::uint32_t>(part_a.size() + 1U),
+                            ninfer::FinishReason::OutputLimit);
+        const auto output_a  = s.commit_preview();
+        const auto part_b    = fixture_tokens("\n\n");
+        const auto decision_b =
+            s.preview_model(part_b, static_cast<std::uint32_t>(part_b.size() + 1U),
+                            ninfer::FinishReason::OutputLimit);
+        const auto output_b  = s.commit_preview();
+        failures += check(!decision_a.prefix_execution_split_after &&
+                              decision_b.prefix_execution_split_after ==
+                                  static_cast<std::uint32_t>(part_b.size()) &&
+                              channel_text(output_a, ninfer::OutputChannel::Reasoning) +
+                                  channel_text(output_b, ninfer::OutputChannel::Reasoning) ==
+                                  "thought" &&
+                              channel_text(output_a, ninfer::OutputChannel::Content) +
+                                  channel_text(output_b, ninfer::OutputChannel::Content) == "",
+                          "R12 parity CR/LF-split: the split close diverged from the unsplit "
+                          "logical boundary");
+    }
     return failures;
 }
 
@@ -3425,6 +3654,7 @@ int main() {
     failures += test_r11_post_reasoning_separator_preserves_indentation();
     failures += test_tool_marker_after_quoted_marker();
     failures += test_reasoning_split(frontend);
+    failures += test_r12_reasoning_boundary_parity(frontend);
     failures += test_reasoning_close_requires_boundary(frontend);
     failures += test_reasoning_close_resolves_at_terminal(frontend);
     failures += test_thinking_budget_control(frontend);

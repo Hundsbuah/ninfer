@@ -101,36 +101,46 @@ std::size_t longest_suffix_prefix(std::string_view text, std::string_view marker
     return 0;
 }
 
-// The model serializes its reasoning close as "\n</think>\n\n", so only a line break confirms a
-// marker. Prose that quotes the marker ("the </think> tag") continues on the same line.
-constexpr bool is_close_separator(char byte) noexcept { return byte == '\r' || byte == '\n'; }
-
-struct ReasoningCloseScan {
-    std::size_t close = std::string::npos;
-    std::size_t hold  = 0;
-};
-
-// Generated prose can quote the close marker while discussing the protocol, so a marker counts as
-// the reasoning close only when it is followed by a line break, or by the implicit end of the
-// turn. A marker inside quoted text is followed by a space, punctuation or an escaped newline and
-// stays in the reasoning channel. Markers at the end of the available bytes stay pending until their
-// following byte arrives, which keeps a quoted marker from closing the channel across a token
-// round.
-ReasoningCloseScan scan_reasoning_close(std::string_view text, bool implicit_end) {
-    std::size_t search = 0;
-    for (;;) {
-        const std::size_t marker = text.find(kThinkClose, search);
-        if (marker == std::string_view::npos) { break; }
-        const std::size_t after = marker + kThinkClose.size();
-        if (after == text.size()) {
-            if (implicit_end) { return ReasoningCloseScan{.close = marker}; }
-            return ReasoningCloseScan{.hold = text.size() - marker};
-        }
-        if (is_close_separator(text[after])) { return ReasoningCloseScan{.close = marker}; }
-        search = after;
+// R12-I2: the bounded post-reasoning separator. After a CONFIRMED reasoning close, at most two
+// logical line breaks are channel framing: an LF, a CRLF (a CR followed by an LF counts once),
+// or a bare CR (a directly following LF is the same break). After two logical breaks are
+// consumed, or on the first non-break byte, the separator is disarmed: the third logical line
+// break is Content and is forwarded unchanged. The state persists across token rounds and byte
+// splits (a CR at a round end pairs with an LF at the next round start as one break), and only
+// CR/LF bytes are ever framing — a SPACE or TAB that begins the assistant Content is content
+// indentation and disables the separator immediately (R10-I2), so generic whitespace stripping
+// is forbidden here.
+struct PostReasoningSeparator {
+    [[nodiscard]] static PostReasoningSeparator armed() noexcept {
+        return PostReasoningSeparator{.breaks_remaining = 2, .pending_cr = false};
     }
-    return ReasoningCloseScan{.hold = longest_suffix_prefix(text, kThinkClose, true)};
-}
+    [[nodiscard]] bool active() const noexcept { return breaks_remaining != 0 || pending_cr; }
+    // Consumes one byte of the post-close stream. True while the byte is separator framing;
+    // false when the byte is Content (the separator finished or was never armed).
+    [[nodiscard]] bool consume(char byte) noexcept {
+        if (!active()) { return false; }
+        if (byte == '\n') {
+            if (pending_cr) {
+                pending_cr = false; // the same logical break (a CRLF split across bytes)
+                return true;
+            }
+            if (breaks_remaining == 0) { return false; } // the third logical break is Content
+            --breaks_remaining;
+            return true;
+        }
+        if (byte == '\r') {
+            if (breaks_remaining == 0) { return false; } // the third logical break is Content
+            --breaks_remaining;
+            pending_cr = true; // a directly following LF is the same break
+            return true;
+        }
+        breaks_remaining = 0;
+        pending_cr = false;
+        return false;
+    }
+    std::uint8_t breaks_remaining = 0;
+    bool pending_cr = false;
+};
 
 template <std::size_t Size>
 consteval std::array<std::size_t, Size> make_prefix_failure_table(std::string_view pattern) {
@@ -146,27 +156,177 @@ consteval std::array<std::size_t, Size> make_prefix_failure_table(std::string_vi
     return failure;
 }
 
-struct PrefixExecutionTracker {
-    static constexpr std::string_view kBoundary = fi::kCanonicalReasoningCloseSerialization;
-    static constexpr auto kFailure = make_prefix_failure_table<kBoundary.size()>(kBoundary);
+constexpr auto kThinkCloseFailure =
+    make_prefix_failure_table<kThinkClose.size()>(kThinkClose);
 
-    // Returns the byte offset immediately after the first completed boundary in this token.
-    [[nodiscard]] std::optional<std::size_t> feed(std::string_view bytes) noexcept {
-        if (!tracking) { return std::nullopt; }
-        for (std::size_t offset = 0; offset < bytes.size(); ++offset) {
-            const char byte = bytes[offset];
-            while (matched != 0 && byte != kBoundary[matched]) { matched = kFailure[matched - 1U]; }
-            if (byte == kBoundary[matched]) { ++matched; }
-            if (matched != kBoundary.size()) { continue; }
-            tracking = false;
-            matched  = 0;
-            return offset + 1U;
+// R12-I3: one reasoning-boundary grammar shared by the presentation decoder (close
+// confirmation, channel split, quoted-marker hold) and the prefix-execution identity tracker
+// (the logical reasoning/content execution boundary). The close is the marker confirmed by a
+// logical line break (LF, CRLF, or a bare CR) — prose that quotes the marker ("the </think>
+// tag") continues on the same line and stays reasoning — or by the implicit end of the turn.
+// The confirmed close carries the bounded R12-I2 framing separator (at most two logical line
+// breaks). The logical execution boundary is the end of the framing: after the second logical
+// break, directly before the first Content byte that disables the framing, or at the implicit
+// end of the turn. The canonical LF serialization "\n</think>\n\n" therefore ends exactly at
+// the boundary, as the previous LF-only byte pattern did; the two layers may not use different
+// grammars (R12-I3).
+class ReasoningBoundaryScanner {
+public:
+    // Feeds one decoded byte; the turn's decoded bytes are fed in order, exactly once.
+    void feed_byte(char byte) {
+        const std::uint64_t position = consumed_;
+        if (!settled_) {
+            switch (phase_) {
+            case Phase::Searching: {
+                while (matched_ != 0 && byte != kThinkClose[matched_]) {
+                    matched_ = kThinkCloseFailure[matched_ - 1U];
+                }
+                if (byte == kThinkClose[matched_]) { ++matched_; }
+                if (matched_ == kThinkClose.size()) {
+                    marker_start_ = position + 1U - kThinkClose.size();
+                    phase_        = Phase::Confirm;
+                }
+                break;
+            }
+            case Phase::Confirm: {
+                separator_ = PostReasoningSeparator::armed();
+                if (separator_.consume(byte)) {
+                    // A logical line break confirms the close and is framing break one.
+                    phase_       = Phase::Framing;
+                    framing_end_ = position + 1U;
+                } else {
+                    // A quoted marker: it stays reasoning text; the search resumes on this
+                    // byte itself (it may start the next candidate).
+                    phase_   = Phase::Searching;
+                    matched_ = byte == '<' ? 1 : 0;
+                }
+                break;
+            }
+            case Phase::Framing: {
+                if (separator_.consume(byte)) {
+                    framing_end_ = position + 1U;
+                    if (!separator_.active()) {
+                        // The second logical break completed the framing.
+                        boundary_ = position + 1U;
+                        settled_  = true;
+                    }
+                } else {
+                    // The first Content byte disables the framing; the boundary stands after
+                    // the framing consumed so far.
+                    boundary_ = framing_end_;
+                    settled_  = true;
+                }
+                break;
+            }
+            }
         }
-        return std::nullopt;
+        ++consumed_;
     }
 
-    std::size_t matched = 0;
-    bool tracking       = false;
+    // The close is a fact only once the confirming byte (a logical break) has been consumed:
+    // a marker at the end of the fed bytes is still awaiting its confirmation and must be
+    // held, not treated as a close.
+    [[nodiscard]] bool close_confirmed() const noexcept {
+        return phase_ == Phase::Framing || settled_;
+    }
+
+    // The offset after the marker that opens the first confirmed close, or npos.
+    [[nodiscard]] std::size_t close_marker_start() const noexcept {
+        if (!close_confirmed() && phase_ != Phase::Confirm) { return std::string::npos; }
+        return marker_start_;
+    }
+
+    // A complete marker awaits its confirming byte at the end of the fed bytes.
+    [[nodiscard]] bool marker_awaiting_confirmation() const noexcept {
+        return phase_ == Phase::Confirm;
+    }
+
+    // Trailing bytes to keep pending (buffer scans only): a partial marker (searching) or a
+    // complete marker that still awaits its confirming byte (confirm). The marker's bytes
+    // must not be published as reasoning before the following byte has decided.
+    [[nodiscard]] std::size_t hold_suffix() const noexcept {
+        if (phase_ == Phase::Confirm) { return kThinkClose.size(); }
+        return phase_ == Phase::Searching ? matched_ : 0;
+    }
+
+    // The offset after the boundary's last byte, once the logical boundary has completed.
+    [[nodiscard]] std::optional<std::size_t> boundary_after() const noexcept {
+        if (!settled_) { return std::nullopt; }
+        return static_cast<std::size_t>(boundary_);
+    }
+
+    // The logical boundary at the implicit end of the turn: a marker awaiting its
+    // confirmation (the implicit close), or the framing consumed so far, ends the stream.
+    [[nodiscard]] std::optional<std::size_t> terminal_boundary() const noexcept {
+        if (settled_) { return boundary_after(); }
+        if (phase_ != Phase::Confirm && phase_ != Phase::Framing) { return std::nullopt; }
+        return static_cast<std::size_t>(consumed_);
+    }
+
+    [[nodiscard]] std::uint64_t bytes_consumed() const noexcept { return consumed_; }
+
+private:
+    enum class Phase : std::uint8_t { Searching, Confirm, Framing };
+
+    Phase phase_            = Phase::Searching;
+    std::size_t matched_    = 0; // KMP match over the marker
+    std::size_t marker_start_ = 0; // valid once a marker matched
+    PostReasoningSeparator separator_;
+    std::uint64_t framing_end_ = 0; // offset after the last framing byte
+    std::uint64_t boundary_    = 0; // offset after the boundary's last byte
+    std::uint64_t consumed_    = 0;
+    bool settled_          = false;
+};
+
+struct ReasoningCloseScan {
+    std::size_t close = std::string::npos;
+    std::size_t hold  = 0;
+};
+
+// Generated prose can quote the close marker while discussing the protocol, so the shared
+// reasoning-boundary grammar decides (R12-I3): a marker counts as the reasoning close only when
+// it is followed by a logical line break, or by the implicit end of the turn. A marker at the
+// end of the available bytes stays pending until its following byte arrives, which keeps a
+// quoted marker from closing the channel across a token round.
+ReasoningCloseScan scan_reasoning_close(std::string_view text, bool implicit_end) {
+    ReasoningBoundaryScanner scanner;
+    for (const char byte : text) { scanner.feed_byte(byte); }
+    ReasoningCloseScan result;
+    if (scanner.close_confirmed() ||
+        (implicit_end && scanner.marker_awaiting_confirmation())) {
+        result.close = scanner.close_marker_start();
+    } else {
+        result.hold = scanner.hold_suffix();
+    }
+    return result;
+}
+
+struct PrefixExecutionTracker {
+    // R12-I3: the shared reasoning-boundary grammar. `feed` is called once per model token and
+    // reports the logical boundary (cumulative decoded-byte offset) when it completes in this
+    // token's bytes; the caller records the split when the boundary falls on a token frontier.
+    // `terminalize` covers the implicit end of the turn (a close confirmed by the stream end).
+    [[nodiscard]] std::optional<std::size_t> feed(std::string_view bytes) noexcept {
+        if (!tracking) { return std::nullopt; }
+        for (const char byte : bytes) { scanner_.feed_byte(byte); }
+        const std::optional<std::size_t> boundary = scanner_.boundary_after();
+        if (boundary) { tracking = false; }
+        return boundary;
+    }
+
+    [[nodiscard]] std::uint64_t stream_position() const noexcept {
+        return scanner_.bytes_consumed();
+    }
+
+    [[nodiscard]] bool terminalize() noexcept {
+        if (!tracking) { return false; }
+        if (!scanner_.terminal_boundary()) { return false; }
+        tracking = false;
+        return true;
+    }
+
+    ReasoningBoundaryScanner scanner_;
+    bool tracking = false;
 };
 
 struct DecoderState {
@@ -174,7 +334,7 @@ struct DecoderState {
     std::string think_marker_pending;
     std::array<std::string, 2> stop_pending;
     bool in_reasoning              = false;
-    bool strip_post_reasoning_linebreaks = false;
+    PostReasoningSeparator post_reasoning_separator;
     bool terminal                  = false;
     std::uint64_t decoded_bytes    = 0;
     std::uint32_t reasoning_tokens = 0;
@@ -275,20 +435,19 @@ void close_channel(DecoderState& state, OutputChannel channel, PublishedOutput& 
 
 void feed_content(DecoderState& state, std::string text, const StopPolicy& policy,
                   PublishedOutput& emitted, std::uint32_t committed_tokens, StopMatch* best_match) {
-    // R11-02: after a real reasoning close only the reasoning/content separator line breaks
-    // are stripped. The separator rule consumes CR and LF bytes and stops at the first byte
-    // that is neither — a SPACE or TAB that begins the assistant Content is content
-    // indentation (the tool-entry classification needs it, R10-I2) and is forwarded
-    // unchanged. Generic whitespace stripping (std::isspace) is forbidden here: it destroyed
-    // the 4-space/TAB indentation that marks a displayed tool call as literal.
-    if (state.strip_post_reasoning_linebreaks) {
-        std::size_t begin = 0;
-        while (begin < text.size() && (text[begin] == '\r' || text[begin] == '\n')) {
-            ++begin;
-        }
-        text.erase(0, begin);
-        if (!text.empty()) { state.strip_post_reasoning_linebreaks = false; }
+    // R12-I2: after a real reasoning close at most two logical line breaks (LF, CRLF, or a bare
+    // CR with a directly following LF) are separator framing; the bounded separator state is
+    // disarmed by the third logical break or by the first non-break byte, which is then
+    // forwarded unchanged. A SPACE or TAB that begins the assistant Content is content
+    // indentation (the tool-entry classification needs it, R10-I2). Generic whitespace
+    // stripping (std::isspace) is forbidden here: it destroyed the 4-space/TAB indentation
+    // that marks a displayed tool call as literal.
+    std::size_t framing = 0;
+    for (std::size_t index = 0; index < text.size(); ++index) {
+        if (!state.post_reasoning_separator.consume(text[index])) { break; }
+        ++framing;
     }
+    if (framing != 0) { text.erase(0, framing); }
     feed_channel(state, OutputChannel::Content, text, policy, emitted, committed_tokens,
                  best_match);
 }
@@ -310,8 +469,8 @@ void feed_decoded_text(DecoderState& state, std::string_view text, const StopPol
         close_channel(state, OutputChannel::Reasoning, emitted);
         std::string content = state.think_marker_pending.substr(scan.close + kThinkClose.size());
         state.think_marker_pending.clear();
-        state.in_reasoning                      = false;
-        state.strip_post_reasoning_linebreaks   = true;
+        state.in_reasoning                  = false;
+        state.post_reasoning_separator       = PostReasoningSeparator::armed();
         feed_content(state, std::move(content), policy, emitted, committed_tokens, best_match);
         return;
     }
@@ -354,7 +513,7 @@ void terminalize(DecoderState& state, const StopPolicy& policy, PublishedOutput&
                 state.think_marker_pending.substr(scan.close + kThinkClose.size());
             state.think_marker_pending.clear();
             state.in_reasoning                  = false;
-            state.strip_post_reasoning_linebreaks = true;
+            state.post_reasoning_separator      = PostReasoningSeparator::armed();
             feed_content(state, std::move(content), policy, emitted, committed_tokens, nullptr);
         } else {
             state.think_marker_pending.clear();
@@ -512,9 +671,18 @@ runtime::OutputDecision OutputSession::preview_model(std::span<const TokenId> to
         const TokenId token                = tokens[index];
         const fi::DecodedTokenView decoded = impl_->tokenizer->decoded_token(token);
 
-        if (const auto boundary = impl_->preview_prefix_execution.feed(decoded.bytes);
-            boundary && *boundary == decoded.bytes.size()) {
-            impl_->preview_execution_split_after = count;
+        if (const auto boundary = impl_->preview_prefix_execution.feed(decoded.bytes)) {
+            // R12-I3: the logical boundary completes when the shared framing grammar settles
+            // on a decoded byte. It is an execution frontier exactly when it falls at the end
+            // of this token, or at the end of the previous token (a bare framing CR resolved
+            // by this token's first Content byte).
+            const std::uint64_t stream_end   = impl_->preview_prefix_execution.stream_position();
+            const std::uint64_t previous_end = stream_end - decoded.bytes.size();
+            const std::uint32_t frontier =
+                *boundary == stream_end              ? count
+                : (count != 0 && *boundary == previous_end) ? count - 1
+                                                            : 0;
+            if (frontier != 0) { impl_->preview_execution_split_after = frontier; }
         }
 
         if (impl_->preview_state.in_reasoning) { ++impl_->preview_state.reasoning_tokens; }
@@ -556,6 +724,9 @@ runtime::OutputDecision OutputSession::preview_model(std::span<const TokenId> to
                 impl_->preview_output = std::move(before_output);
             }
             terminalize(impl_->preview_state, impl_->policy, impl_->preview_output, count);
+            if (impl_->preview_prefix_execution.terminalize()) {
+                impl_->preview_execution_split_after = count;
+            }
             return complete(count, FinishReason::StopToken);
         }
     }
@@ -563,6 +734,9 @@ runtime::OutputDecision OutputSession::preview_model(std::span<const TokenId> to
     const auto count = static_cast<std::uint32_t>(tokens.size());
     if (tokens.size() == total_budget_remaining) {
         terminalize(impl_->preview_state, impl_->policy, impl_->preview_output, count);
+        if (impl_->preview_prefix_execution.terminalize()) {
+            impl_->preview_execution_split_after = count;
+        }
         return complete(count, limit_reason);
     }
     if (impl_->preview_semantic.in_reasoning && impl_->preview_semantic.budget &&
@@ -626,9 +800,18 @@ runtime::OutputDecision OutputSession::preview_control(std::span<const TokenId> 
     for (std::size_t index = 0; index < tokens.size(); ++index) {
         const TokenId token                = tokens[index];
         const fi::DecodedTokenView decoded = impl_->tokenizer->decoded_token(token);
-        if (const auto boundary = impl_->preview_prefix_execution.feed(decoded.bytes);
-            boundary && *boundary == decoded.bytes.size()) {
-            impl_->preview_execution_split_after = static_cast<std::uint32_t>(index + 1U);
+        if (const auto boundary = impl_->preview_prefix_execution.feed(decoded.bytes)) {
+            // R12-I3: the control span ends with the canonical serialization, so the logical
+            // boundary completes at its final token frontier; the previous-token case covers a
+            // bare framing CR resolved by the span's first Content byte.
+            const std::uint64_t stream_end   = impl_->preview_prefix_execution.stream_position();
+            const std::uint64_t previous_end = stream_end - decoded.bytes.size();
+            const std::uint32_t count        = static_cast<std::uint32_t>(index + 1U);
+            const std::uint32_t frontier =
+                *boundary == stream_end                     ? count
+                : (count != 0 && *boundary == previous_end) ? count - 1
+                                                            : 0;
+            if (frontier != 0) { impl_->preview_execution_split_after = frontier; }
         }
         if (impl_->preview_state.in_reasoning) { ++impl_->preview_state.reasoning_tokens; }
         feed_semantic_thinking(impl_->preview_semantic, decoded.bytes);

@@ -29,6 +29,17 @@ int fail(const std::string& message) {
 
 int check(bool condition, const std::string& message) { return condition ? 0 : fail(message); }
 
+// R12-06: strict tool-call equality for one-shot/streaming corpora — count, name and exact
+// arguments_json bytes (count alone cannot catch argument drift).
+bool same_tool_calls(std::span<const ninfer::GeneratedToolCall> a,
+                     std::span<const ninfer::GeneratedToolCall> b) {
+    if (a.size() != b.size()) { return false; }
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        if (a[i].name != b[i].name || a[i].arguments_json != b[i].arguments_json) { return false; }
+    }
+    return true;
+}
+
 std::string tool_definition(const std::string& tool_name, Json properties,
                             Json required = Json::array()) {
     Json parameters{{"type", "object"}, {"properties", std::move(properties)}};
@@ -1578,8 +1589,9 @@ int test_nested_and_cross_nested_wrappers_rejected() {
 }
 
 // F7: the recovery retry enters only at a later top-level wrapper. A function nested inside a
-// failed region never becomes a new executable call, and a compatibility bare marker after a
-// failed region is not re-read (it stays content).
+// failed region never becomes a new executable call, a compatibility bare marker after a
+// failed region is not re-read (it stays content). The R12-I1 open-value ownership invariant
+// is pinned in test_r12_open_value_ownership_matrix (contract declaring both tools).
 int test_recovery_retry_entry_policy() {
     const auto contract = output_contract_for(
         "bash", Json{{"command", Json{{"type", "string"}}}, {"x", Json{{"type", "string"}}}});
@@ -1591,6 +1603,11 @@ int test_recovery_retry_entry_policy() {
     failures += check(!nested.is_tool_call_response && nested.tool_calls.empty(),
                       "a function nested inside a failed region became executable");
     // A compatibility bare function before a real wrapper: the turn recovers at the wrapper.
+    // This contract declares only `bash`: `read` is undeclared, so the state machine breaks
+    // definitively at the undeclared function name — before any parameter value opens. The
+    // retry at the later wrapper is the ordinary R3-02 recovery, not an open-value escape.
+    // The declared-name variant (`read` declared too — the open-value ownership case) is
+    // pinned by test_r12_open_value_ownership_matrix.
     const std::string bare_before = "<function=read>\n<parameter=path>\ncut\n" +
                                     tool_call("bash", {{"command", "echo ok"}});
     const auto bare = fi::parse_qwen_tool_call_output(bare_before, 64, *contract, true);
@@ -1690,7 +1707,7 @@ int check_round2_region(const std::string& text, const fi::ToolCallOutputContrac
             }
             auto terminal = decoder.finish(reason);
             failures += check(
-                terminal.tool_calls.size() == parsed.tool_calls.size() &&
+                same_tool_calls(terminal.tool_calls, parsed.tool_calls) &&
                     visible + terminal.content == parsed.content,
                 (std::string("streaming diverged from one-shot: ") + std::string(message))
                     .c_str());
@@ -1749,7 +1766,7 @@ int check_round2_region(const std::string& text, const fi::ToolCallOutputContrac
                  visible += decoder.feed(std::string_view(text).substr(offset, chunk));
              }
              auto terminal = decoder.finish(reason);
-             failures += check(terminal.tool_calls.size() == parsed.tool_calls.size() &&
+             failures += check(same_tool_calls(terminal.tool_calls, parsed.tool_calls) &&
                                    visible + terminal.content == parsed.content &&
                                    terminal.diagnostics == parsed.diagnostics,
                                (std::string("streaming diverged from one-shot: ") +
@@ -3696,22 +3713,27 @@ int test_round3_spec_corpus() {
         failures += as_text("R3 R6: the trailing closer echo keeps the region text",
                             r6, r6_text, Reason::TrailingContent);
     }
-    // R3-04: the natural-stop retry re-reads the quoted example; the cut never does.
+    // R3-04 superseded by R12-I1 (open-value ownership): the open `content` value owns the
+    // quoted example's bytes for every finish reason — the example never becomes executable
+    // (the old natural-stop re-read is the fail-open behavior R12 removes).
     {
         const std::string p_a_text =
             "<function=write>\n<parameter=path>\nd.md\n</parameter>\n<parameter=content>\nExample:\n" + E;
-        const std::string p_a_args = "{\"command\":\"rm -rf x\"}";
         for (const bool tolerant : {false, true}) {
-            const auto st = fi::parse_qwen_tool_call_output(p_a_text, 64, c, tolerant,
-                                                            ninfer::FinishReason::StopToken);
-            failures += one_call(tolerant ? "R3 P-A StopToken tolerant: the example call"
-                                          : "R3 P-A StopToken: the example call",
-                                 st, "bash", p_a_args);
-            const auto ol = fi::parse_qwen_tool_call_output(p_a_text, 64, c, tolerant,
-                                                            ninfer::FinishReason::OutputLimit);
-            failures += as_text(tolerant ? "R3 P-A OutputLimit tolerant: text" : "R3 P-A OutputLimit: text",
-                                ol, p_a_text,
-                                tolerant ? Reason::TruncatedTail : Reason::MalformedStructure);
+            for (const auto reason : {ninfer::FinishReason::StopToken,
+                                      ninfer::FinishReason::StopString,
+                                      ninfer::FinishReason::OutputLimit,
+                                      ninfer::FinishReason::ContextCapacity,
+                                      ninfer::FinishReason::Cancelled,
+                                      ninfer::FinishReason::None}) {
+                const auto p_a = fi::parse_qwen_tool_call_output(p_a_text, 64, c, tolerant,
+                                                                 reason);
+                failures += as_text(tolerant ? "R12 P-A tolerant: the open value owns the example"
+                                             : "R12 P-A strict: the open value owns the example",
+                                    p_a, p_a_text,
+                                    tolerant ? Reason::TruncatedTail : Reason::MalformedStructure);
+            }
+            failures += stream_equals_one_shot("R12 P-A streaming", p_a_text, tolerant, true);
         }
     }
     // P-A3: an embedded example inside a closed value never executes.
@@ -5427,7 +5449,7 @@ int test_r11_retry_indent_bypass() {
             }
             const auto terminal = decoder.finish(ninfer::FinishReason::None);
             failures += check(
-                terminal.tool_calls.size() == parsed.tool_calls.size() &&
+                same_tool_calls(terminal.tool_calls, parsed.tool_calls) &&
                     visible + terminal.content == parsed.content &&
                     terminal.diagnostics == parsed.diagnostics,
                 (std::string("R11 F/G: split ") + std::to_string(split) +
@@ -5584,7 +5606,7 @@ int test_r11_undeclared_and_ambiguous_equivalence() {
             }
             const auto terminal = decoder.finish(ninfer::FinishReason::None);
             failures += check(
-                terminal.tool_calls.size() == parsed.tool_calls.size() &&
+                same_tool_calls(terminal.tool_calls, parsed.tool_calls) &&
                     visible + terminal.content == parsed.content &&
                     terminal.diagnostics == parsed.diagnostics,
                 (std::string("R11 L/M: split ") + std::to_string(split) +
@@ -5641,7 +5663,7 @@ int test_r11_one_shot_streaming_equivalence_corpus() {
             }
             const auto terminal = decoder.finish(ninfer::FinishReason::None);
             failures += check(
-                terminal.tool_calls.size() == parsed.tool_calls.size() &&
+                same_tool_calls(terminal.tool_calls, parsed.tool_calls) &&
                     visible + terminal.content == parsed.content &&
                     terminal.diagnostics == parsed.diagnostics,
                 (std::string("R11 §12: split ") + std::to_string(split) +
@@ -5660,7 +5682,7 @@ int test_r11_one_shot_streaming_equivalence_corpus() {
             }
             const auto terminal = decoder.finish(ninfer::FinishReason::None);
             failures += check(
-                terminal.tool_calls.size() == parsed.tool_calls.size() &&
+                same_tool_calls(terminal.tool_calls, parsed.tool_calls) &&
                     visible + terminal.content == parsed.content &&
                     terminal.diagnostics == parsed.diagnostics,
                 (std::string("R11 §12: chunk ") + std::to_string(chunk) +
@@ -5670,8 +5692,176 @@ int test_r11_one_shot_streaming_equivalence_corpus() {
     return failures;
 }
 
+// R12-01 (R12-I1) adversarial matrix (spec §2.7): a bare function/invoke entry, or a
+// function_calls sequence, whose parameter value is open owns every remaining byte. An
+// embedded marker — a wrapped call at column 0, a 4-space-indented wrapped call, a
+// TAB-indented wrapped call, a truncated bare compatibility call, a wrapped call inside a
+// function_calls sequence — never becomes a retry base: under strict and tolerant, for every
+// finish reason and ambiguity policy, tool_calls = 0 and content is the exact original bytes.
+// (A complete bare embedded call cannot be an open-value fixture: its closer greedily closes
+// the outer value and the embedded marker stays inert payload — pinned by the S1 family.)
+// In native mode the initial bare marker never latches, so the open value does not exist:
+// a column-zero embedded wrapped call is the entry itself and executes; indented and bare
+// embedded calls are not native entries at all. One-shot == streaming at every split point
+// and with 1/2/3/5/7-byte chunks, comparing calls by name and exact arguments_json and the
+// complete diagnostics.
+int test_r12_open_value_ownership_matrix() {
+    using FinishReason = ninfer::FinishReason;
+    using Reason      = ninfer::ToolCallParseFallbackReason;
+    using Syntax      = ninfer::ToolCallSyntaxMode;
+    using Ambiguity   = ninfer::ToolCallAmbiguityPolicy;
+    int failures      = 0;
+    const auto contract = contract_from_definitions({
+        tool_definition("read", Json{{"path", Json{{"type", "string"}}}}),
+        tool_definition("bash", Json{{"command", Json{{"type", "string"}}}})});
+    const std::string wrapped = tool_call("bash", {{"command", "echo ok"}});
+    const std::string bare    = "<function=bash>\n<parameter=command>\necho ok";
+    const std::vector<std::pair<std::string, std::string>> fixtures = {
+        {"col0", "<function=read>\n<parameter=path>\ncut\n" + wrapped},
+        {"4sp",  "<function=read>\n<parameter=path>\ncut\n    " + wrapped},
+        {"tab",  "<function=read>\n<parameter=path>\ncut\n\t" + wrapped},
+        {"invoke", "<invoke=read>\n<parameter=path>\ncut\n" + wrapped},
+        {"bare_call", "<function=read>\n<parameter=path>\ncut\n" + bare},
+        {"fc",   "<function_calls>\n<function=read>\n<parameter=path>\ncut\n" + wrapped},
+    };
+    const std::vector<FinishReason> reasons = {
+        FinishReason::StopToken,    FinishReason::None,         FinishReason::StopString,
+        FinishReason::OutputLimit,  FinishReason::ContextCapacity, FinishReason::Cancelled};
+    for (const auto& [name, text] : fixtures) {
+        const std::string label = std::string("R12 matrix ") + name;
+        // Compatibility: 0 calls and the exact original bytes, whatever the finish reason,
+        // tolerance or ambiguity policy.
+        for (const bool tolerant : {false, true}) {
+            for (const Ambiguity ambiguity : {Ambiguity::FailClosed, Ambiguity::PayloadFidelity}) {
+                for (const FinishReason reason : reasons) {
+                    const auto parsed =
+                        fi::parse_qwen_tool_call_output(text, 64, *contract, tolerant, reason,
+                                                        Syntax::Compatibility, ambiguity);
+                    failures += check(!parsed.is_tool_call_response && parsed.tool_calls.empty(),
+                                      label + " (compat) executed a call");
+                    failures += check(parsed.content == text, label + " (compat) lost bytes");
+                    failures += check(
+                        parsed.diagnostics.fallback_reason ==
+                            (tolerant ? Reason::TruncatedTail : Reason::MalformedStructure),
+                        label + " (compat) wrong fallback reason");
+                }
+            }
+        }
+        // Native: the initial bare marker never latches, so the open value does not exist.
+        // A column-zero embedded wrapped call is the native entry itself: the bare prefix
+        // stays content and the embedded call executes. Indented and bare embedded calls are
+        // not native entries at all, so the raw fixture is content.
+        for (const bool tolerant : {false, true}) {
+            const auto parsed = fi::parse_qwen_tool_call_output(
+                text, 64, *contract, tolerant, FinishReason::None, Syntax::QwenWrappedNative);
+            const std::string* prefix = nullptr;
+            static const std::string col0_prefix = "<function=read>\n<parameter=path>\ncut";
+            static const std::string invoke_prefix = "<invoke=read>\n<parameter=path>\ncut";
+            static const std::string fc_prefix = "<function_calls>\n<function=read>\n<parameter=path>\ncut";
+            if (name == "col0") { prefix = &col0_prefix; }
+            if (name == "invoke") { prefix = &invoke_prefix; }
+            if (name == "fc") { prefix = &fc_prefix; }
+            if (prefix != nullptr) {
+                failures += check(parsed.is_tool_call_response && parsed.tool_calls.size() == 1 &&
+                                      parsed.tool_calls.front().name == "bash" &&
+                                      parsed.tool_calls.front().arguments_json ==
+                                          "{\"command\":\"echo ok\"}" &&
+                                      parsed.content == *prefix,
+                                  label + " (native) did not execute the column-zero wrapper");
+            } else {
+                failures += check(!parsed.is_tool_call_response && parsed.tool_calls.empty() &&
+                                      parsed.content == text,
+                                  label + " (native) was not plain content");
+            }
+        }
+        // One-shot == streaming: every split point and the fixed chunk partitions, in
+        // compatibility and native, strict and tolerant.
+        for (const Syntax syntax : {Syntax::Compatibility, Syntax::QwenWrappedNative}) {
+            for (const bool tolerant : {false, true}) {
+                const auto one = fi::parse_qwen_tool_call_output(
+                    text, 64, *contract, tolerant, FinishReason::None, syntax);
+                for (std::size_t split = 0; split <= text.size(); ++split) {
+                    fi::ToolCallOutputDecoder decoder(contract, 64, tolerant, syntax);
+                    std::string visible;
+                    if (split == text.size()) {
+                        visible += decoder.feed(text);
+                    } else {
+                        visible += decoder.feed(text.substr(0, split));
+                        visible += decoder.feed(text.substr(split));
+                    }
+                    const auto terminal = decoder.finish(FinishReason::None);
+                    failures += check(
+                        same_tool_calls(terminal.tool_calls, one.tool_calls) &&
+                            visible + terminal.content == one.content &&
+                            terminal.diagnostics == one.diagnostics,
+                        label + " streaming split diverged from one-shot");
+                }
+                for (const std::size_t chunk : {std::size_t{1}, std::size_t{2}, std::size_t{3},
+                                                std::size_t{5}, std::size_t{7}}) {
+                    fi::ToolCallOutputDecoder decoder(contract, 64, tolerant, syntax);
+                    std::string visible;
+                    for (std::size_t offset = 0; offset < text.size(); offset += chunk) {
+                        visible += decoder.feed(text.substr(offset, chunk));
+                    }
+                    const auto terminal = decoder.finish(FinishReason::None);
+                    failures += check(
+                        same_tool_calls(terminal.tool_calls, one.tool_calls) &&
+                            visible + terminal.content == one.content &&
+                            terminal.diagnostics == one.diagnostics,
+                        label + " streaming chunks diverged from one-shot");
+                }
+            }
+        }
+    }
+    // Spec §2.5 control: a complete call preceding a later broken open-value call must not
+    // be rejected by the ownership gate — tolerant mode commits the complete call with the
+    // truncated-tail transparency reason; strict mode keeps the all-or-nothing fallback.
+    {
+        const std::string control = tool_call("bash", {{"command", "echo real"}}) +
+                                   "\n<function=read>\n<parameter=path>\ncut";
+        for (const bool tolerant : {false, true}) {
+            const auto parsed = fi::parse_qwen_tool_call_output(control, 64, *contract,
+                                                                tolerant, FinishReason::None);
+            if (tolerant) {
+                failures += check(parsed.is_tool_call_response && parsed.tool_calls.size() == 1 &&
+                                      parsed.tool_calls.front().name == "bash" &&
+                                      parsed.tool_calls.front().arguments_json ==
+                                          "{\"command\":\"echo real\"}" &&
+                                      parsed.content.empty() &&
+                                      parsed.diagnostics.fallback_reason == Reason::TruncatedTail,
+                                  "R12 control (tolerant): the complete call before the broken "
+                                  "open-value call was rejected by the gate");
+            } else {
+                failures += check(!parsed.is_tool_call_response && parsed.tool_calls.empty() &&
+                                      parsed.content == control &&
+                                      parsed.diagnostics.fallback_reason ==
+                                          Reason::MalformedStructure,
+                                  "R12 control (strict): the all-or-nothing fallback changed");
+            }
+            for (std::size_t split = 0; split <= control.size(); ++split) {
+                fi::ToolCallOutputDecoder d(contract, 64, tolerant);
+                std::string v;
+                if (split == control.size()) {
+                    v += d.feed(control);
+                } else {
+                    v += d.feed(control.substr(0, split));
+                    v += d.feed(control.substr(split));
+                }
+                const auto terminal = d.finish(FinishReason::None);
+                failures += check(
+                    same_tool_calls(terminal.tool_calls, parsed.tool_calls) &&
+                        v + terminal.content == parsed.content &&
+                        terminal.diagnostics == parsed.diagnostics,
+                    "R12 control: streaming split diverged from one-shot");
+            }
+        }
+    }
+    return failures;
+}
+
 int main() {
     int failures = 0;
+    failures += test_r12_open_value_ownership_matrix();
     failures += test_r5_syntax_mode_native_vs_compatibility();
     failures += test_r5_ambiguity_policy_write_payload();
     failures += test_duplicate_parameter_keeps_last_value();

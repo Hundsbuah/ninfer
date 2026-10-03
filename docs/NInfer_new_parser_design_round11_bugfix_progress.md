@@ -232,3 +232,9 @@ verified by the new frontend sub-cases I/J/K/G (all passing).
   target, not a dependency of the test targets).
 - Throwaway artifacts from the round (`build-windows/r11_repro.*`,
   `build-windows/r11_debug_g.cpp`) were deleted.
+
+## 7. Supersession note (added in Round 12)
+
+Round 11 passed its stated implementation gate at 2c7aa184, but Round-12 adversarial
+cross-layer review found additional issues R12-01 … R12-06. Round 12 supersedes the prior
+"complete" release sign-off.

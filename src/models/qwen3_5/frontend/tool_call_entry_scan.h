@@ -206,8 +206,10 @@ private:
 class ToolCallLineIndentationScan {
 public:
     // Offsets: lines are tracked in the concatenated coordinate space (pre_latch first);
-    // marker positions passed to marker_is_indented_literal are region-relative.
-    ToolCallLineIndentationScan(std::string_view pre_latch, std::string_view region) noexcept;
+    // marker positions passed to marker_is_indented_literal are region-relative. Not noexcept:
+    // the line vector allocates, and a bad_alloc must reach NInfer's host-OOM recovery instead
+    // of std::terminate (R12-04).
+    ToolCallLineIndentationScan(std::string_view pre_latch, std::string_view region);
 
     // True when the complete marker at region-relative marker_at (whose '<' byte the caller
     // located, e.g. with find_tool_marker) is an indented literal entry per R11-I2.

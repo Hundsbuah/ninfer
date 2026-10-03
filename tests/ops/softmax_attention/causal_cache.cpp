@@ -1786,8 +1786,9 @@ int run_a1_case(const Geometry& geometry, KvCacheStorage storage, const Attentio
     for (std::int32_t token = 0; token < test_case.tokens; ++token) {
         positions[static_cast<std::size_t>(token)] = test_case.base + token;
     }
-    ops::CausalAttentionExecutionEnvelope envelope{static_cast<std::uint32_t>(total),
-                                                   test_case.envelope_max};
+    ops::CausalAttentionExecutionEnvelope envelope{.min_visible_keys =
+                                                       static_cast<std::uint32_t>(total),
+                                                   .max_visible_keys = test_case.envelope_max};
     envelope.fast_prompt_kernel = test_case.fast_prompt_kernel;
 
     const HostCache initial = make_cache(geometry, storage, max_context, test_case.seed + 10u,
@@ -1910,8 +1911,9 @@ int run_a3_case(const Geometry& geometry, KvCacheStorage storage, const Attentio
     for (std::int32_t token = 0; token < test_case.tokens; ++token) {
         positions[static_cast<std::size_t>(token)] = test_case.base + token;
     }
-    ops::CausalAttentionExecutionEnvelope envelope{static_cast<std::uint32_t>(total),
-                                                   test_case.envelope_max};
+    ops::CausalAttentionExecutionEnvelope envelope{.min_visible_keys =
+                                                       static_cast<std::uint32_t>(total),
+                                                   .max_visible_keys = test_case.envelope_max};
     envelope.fast_prompt_kernel = test_case.fast_prompt_kernel;
 
     const HostCache cache_host = make_cache(geometry, storage, max_context, test_case.seed + 10u,
@@ -2036,8 +2038,8 @@ int run_batch_case(const Geometry& geometry, KvCacheStorage storage,
     for (const auto limit : graph_limits)
         envelope_max = std::max(envelope_max, static_cast<int>(limit));
     ops::CausalAttentionExecutionEnvelope envelope{
-        test_case.graph_replay ? 1U : static_cast<unsigned>(maximum_visible),
-        static_cast<unsigned>(std::max(maximum_visible, envelope_max))};
+        .min_visible_keys = test_case.graph_replay ? 1U : static_cast<unsigned>(maximum_visible),
+        .max_visible_keys = static_cast<unsigned>(std::max(maximum_visible, envelope_max))};
     envelope.fast_prompt_kernel = test_case.fast_prompt_kernel;
     const std::size_t q_column_elements  = std::size_t(kHeadDim) * geometry.q_heads,
                       kv_column_elements = std::size_t(kHeadDim) * geometry.kv_heads;
@@ -2578,7 +2580,8 @@ int run_k8v4_cases() {
 
 int verify_workspace_capacity_contract(KvCacheStorage storage) {
     int failures = 0;
-    constexpr ops::CausalAttentionExecutionEnvelope envelope{1, 1025};
+    constexpr ops::CausalAttentionExecutionEnvelope envelope{
+        .min_visible_keys = 1, .max_visible_keys = 1025};
     constexpr ops::AttentionHeadGeometry geometry{kHeadDim, 16, 2};
     const std::size_t interval = ops::causal_softmax_attention_workspace_capacity_bytes(
         geometry, storage, envelope, 1, 1, 17);
@@ -2596,7 +2599,8 @@ int verify_workspace_capacity_contract(KvCacheStorage storage) {
         // Prefill split counts can decrease as query width grows. The interval
         // query must still cover every supported point, including before a drop.
         for (const auto& item : kGeometries) {
-            constexpr ops::CausalAttentionExecutionEnvelope prefill_envelope{1, 131072};
+            constexpr ops::CausalAttentionExecutionEnvelope prefill_envelope{
+                .min_visible_keys = 1, .max_visible_keys = 131072};
             std::size_t largest = 0;
             for (int width = 17; width <= 1025; ++width)
                 largest = std::max(
